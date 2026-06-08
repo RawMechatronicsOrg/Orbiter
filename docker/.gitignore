@@ -1,0 +1,5 @@
+# Real env (secrets / per-host endpoints) — copy from .env.example
+.env
+
+# Bind-mounted storage for the server + COLMAP. Created on first run.
+data/

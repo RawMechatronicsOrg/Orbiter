@@ -1,0 +1,31 @@
+# Keep the build context tiny. The container only needs the Dockerfile,
+# the shell wrapper, and the Python converter.
+
+# Docs and meta
+README.md
+LICENSE
+*.md
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Python build artefacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Local data dumps (if anyone ever stages scans here for testing)
+data/
+*.ply
+*.bin
+*.db

@@ -1,0 +1,53 @@
+menu "Orbiter Configuration"
+
+    config ORBITER_WIFI_SSID
+        string "WiFi SSID"
+        default "your-ssid"
+        help
+            The SSID of the Wi-Fi network the device should join.
+
+    config ORBITER_WIFI_PASSWORD
+        string "WiFi password"
+        default "your-password"
+        help
+            Password for the Wi-Fi network. Leave empty for an open network.
+
+    config ORBITER_WIFI_MAX_RETRY
+        int "WiFi max retry count"
+        default 10
+        help
+            Number of reconnect attempts before backing off and waiting.
+
+    config ORBITER_HTTP_PORT
+        int "HTTP server port"
+        default 80
+        help
+            Port for the HTTP server.
+
+    config ORBITER_EL_MIN_DEG
+        int "Elevation min (deg)"
+        default -25
+        help
+            Lower limit of the elevation axis, in degrees. Hard-enforced by /move and /spin.
+
+    config ORBITER_EL_MAX_DEG
+        int "Elevation max (deg)"
+        default 90
+        help
+            Upper limit of the elevation axis, in degrees.
+
+    config ORBITER_ENCODER_SPI_TRACE
+        bool "Verbose AS5048A SPI trace (UART)"
+        default n
+        help
+            Log every 16-bit SPI frame at INFO (tx/rx, MISO bytes, parity, EF).
+            Angle reads also log rsp1/rsp2 summary per attempt. Rebuild after change.
+
+    config ORBITER_AS5600_I2C_TRACE
+        bool "Verbose AS5600 I2C trace (UART)"
+        default n
+        help
+            Log every I2C register read on the AS5600 (AZ encoder) at INFO,
+            including retry attempts and error codes. Rebuild after change.
+
+endmenu

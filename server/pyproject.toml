@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orbiter-server"
+version = "0.1.0"
+description = "FastAPI service for the Orbiter two-axis camera turntable."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Orbiter contributors" }]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "httpx>=0.27",
+    "pillow>=10",
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "pytransform3d>=3.5",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "websockets>=12.0",
+    "python-multipart>=0.0.9",
+    "aiofiles>=23.2",
+    "trimesh>=4.0",
+    "zeroconf>=0.130",
+    # OpenCV with the aruco/ChArUco module (in main package since 4.7).
+    # `-headless` variant skips Qt GUI deps — server runs headless anyway.
+    "opencv-python-headless>=4.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+orbiter-server = "orbiter_server.app:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["orbiter_server*"]

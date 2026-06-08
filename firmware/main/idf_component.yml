@@ -1,0 +1,14 @@
+## IDF Component Manager Manifest File
+dependencies:
+  espressif/esp_wifi_remote:
+    version: ">=0.10,<2.0"
+    rules:
+      - if: "target in [esp32p4, esp32h2]"
+  espressif/esp_hosted:
+    version: "~2"
+    rules:
+      - if: "target in [esp32p4, esp32h2]"
+  # Lets the device advertise itself as `orbiter.local` + an `_orbiter._tcp`
+  # service on port 80 so the server can find it via mDNS without a hardcoded
+  # IP. See start_mdns() in orbiter_main.c.
+  espressif/mdns: "^1.4.0"

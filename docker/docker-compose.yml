@@ -1,0 +1,62 @@
+# Orbiter v0.1 — Compose stack
+#
+# Default 'docker compose up' brings up server + ui.
+# 'docker compose --profile colmap up' (or run) opts in to the COLMAP container.
+#
+# Storage lives in ./data and is shared by the server (RW) and COLMAP (RW).
+# Override env via a sibling .env (copy from .env.example) or your shell.
+
+services:
+  server:
+    build:
+      context: ../server
+      dockerfile: Dockerfile
+    image: orbiter/server:dev
+    container_name: orbiter-server
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+    environment:
+      ORBITER_STORAGE_DIR: /data
+      ESP32_IP: ${ESP32_IP:-}
+      CAMERA_URL: ${CAMERA_URL:-}
+    restart: unless-stopped
+
+  ui:
+    build:
+      context: ../ui
+      dockerfile: Dockerfile
+    image: orbiter/ui:dev
+    container_name: orbiter-ui
+    ports:
+      - "5173:80"
+    depends_on:
+      - server
+    restart: unless-stopped
+
+  colmap:
+    build:
+      context: ../colmap
+      dockerfile: Dockerfile
+    image: orbiter/colmap:dev
+    container_name: orbiter-colmap
+    profiles:
+      - colmap
+    volumes:
+      - ./data:/data
+    # GPU passthrough — only effective when the host has the NVIDIA Container
+    # Toolkit installed (Linux native, or Windows via WSL2 + nvidia-docker).
+    # The deploy stanza is honoured by 'docker compose up' since Compose v2.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Default to an interactive shell; the run_colmap_session.sh script
+    # is on PATH inside /usr/local/bin so you can invoke it directly.
+    command: ["bash"]
+    stdin_open: true
+    tty: true

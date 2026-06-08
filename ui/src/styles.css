@@ -1,0 +1,47 @@
+@import "tailwindcss";
+
+/* Design tokens — engineering / Linear-style dark palette:
+   near-black background, neutral zinc cards, thin borders, indigo accent.
+   Exposed as Tailwind colour utilities (bg-card, border-cardline, …). */
+@theme {
+  --color-app: #08080a;
+  --color-stage: #0c0c0e;
+  --color-card: #111114;
+  --color-cardline: #1f1f24;
+  --color-barline: #18181b;
+  --color-ink: #fafafa;
+  --color-inkdim: #d4d4d8;
+  --color-inkmute: #71717a;
+  --color-field: #0d0d10;
+  --color-fieldline: #27272a;
+  --color-accent: #818cf8;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background: var(--color-app);
+  color: var(--color-ink);
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  overflow: hidden;
+}
+
+/* Slim, muted scrollbars (carried over from the legacy stylesheet). */
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #27272a;
+  border-radius: 6px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3f3f46;
+}

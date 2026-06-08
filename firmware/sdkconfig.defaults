@@ -1,0 +1,32 @@
+# Orbiter — quiet defaults (UART not flooded; SPI per-frame trace off).
+# SPI trace: menuconfig → Orbiter Configuration → Verbose AS5048A SPI trace
+
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_EQUALS_DEFAULT=y
+CONFIG_LOG_DEFAULT_LEVEL=3
+CONFIG_LOG_MAXIMUM_LEVEL=3
+
+# CONFIG_ORBITER_ENCODER_SPI_TRACE is not set
+# CONFIG_ORBITER_AS5600_I2C_TRACE is not set
+
+# Required for /ws/log streaming firmware events to the browser UI.
+CONFIG_HTTPD_WS_SUPPORT=y
+
+# ESP-IDF v6 no longer calls the URI handler on the WebSocket handshake GET
+# (httpd_uri.c: "do not call the uri->handler"). /ws/log registers each
+# connected client from a post-handshake callback instead — see log_bus.c.
+CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT=y
+
+# stepper.c uses ESP_TIMER_ISR for jitter-free microstep timing — that
+# enum value is gated behind this Kconfig (default n in ESP-IDF v6).
+CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD=y
+
+# UI polls /state every 250 ms; browsers open 4-6 parallel keep-alive
+# sockets per origin. Default LWIP_MAX_SOCKETS=10 leaves only 7 for httpd
+# (3 reserved internally), which we exhaust under load. Bumped from 16
+# to 20 after sweep runs were dying with `httpx.ReadError("")` mid-loop:
+# httpd.max_open_sockets=12 + browser keep-alive pool (4-6) + /ws/log
+# clients + python /state pool + retry attempts could spike to ~18 and
+# trigger ENOBUFS on the next accept(). 20 is the maximum the LWIP
+# layer is happy with on ESP32 without bigger heap pressure.
+CONFIG_LWIP_MAX_SOCKETS=20

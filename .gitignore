@@ -1,0 +1,82 @@
+# =========================================================================
+# Orbiter v0.1 — .gitignore
+#
+# Per-subsystem .gitignore files in subdirs:
+#   docker/.gitignore — .env, ./data/
+# =========================================================================
+
+# ── Python ───────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+*.cover
+
+# Virtualenvs (any conventional name, anywhere in the tree)
+.venv/
+venv/
+env/
+ENV/
+
+# ── Node / Vite (ui/) ────────────────────────────────────────────────────
+node_modules/
+.vite/
+*-debug.log*
+
+# ── ESP-IDF (firmware/) ──────────────────────────────────────────────────
+firmware/build/
+firmware/managed_components/
+# sdkconfig contains Wi-Fi credentials baked in at build time — never commit.
+# sdkconfig.defaults IS committed (default values applied to a fresh sdkconfig
+# by menuconfig).
+firmware/sdkconfig
+firmware/sdkconfig.old
+
+# ── Build artifacts (catches python build/, vite dist/, anything build/) ─
+build/
+dist/
+
+# ── colmap-quick lab utility (tools/colmap-quick/) ───────────────────────
+# Generated reconstruction workspaces: staged image copies, database.db,
+# sparse/, dense/ and the fused .ply — all regenerable, never commit.
+*_recon/
+
+# ── Server-local dev artifacts ───────────────────────────────────────────
+# rig_model.py hardcodes _DEFAULT_GLB to server/Orbiter.glb. The canonical
+# file lives in cad/assembly/Orbiter.glb; this copy is a dev-machine
+# workaround until path resolution is fixed.
+server/Orbiter.glb
+# Scan-session storage (manifests, captures, persisted ModelState).
+server/data/
+
+# ── IDE ──────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── OS ───────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Logs / temp ──────────────────────────────────────────────────────────
+*.log
+*.tmp
+
+# ── Env files (docker/.env is handled by docker/.gitignore) ──────────────
+/.env
+/.env.local
+.env.*.local
+# Per-deployment server config with real IPs/URLs — copy server/.env.example
+# to server/.env. The template (.env.example) IS committed.
+server/.env

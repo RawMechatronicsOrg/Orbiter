@@ -1,0 +1,22 @@
+idf_component_register(
+    SRCS
+        "orbiter_main.c"
+        "stepper.c"
+        "encoder.c"
+        "enc_as5600.c"
+        "motion.c"
+        "motion_runner.c"
+        "http_handlers.c"
+        "log_bus.c"
+    INCLUDE_DIRS "."
+    PRIV_REQUIRES
+        esp_wifi
+        nvs_flash
+        esp_http_server
+        esp_netif
+        esp_timer
+        esp_ringbuf
+        esp_driver_gpio
+        esp_driver_spi
+        esp_driver_i2c
+)

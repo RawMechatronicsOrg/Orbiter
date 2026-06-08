@@ -1,0 +1,26 @@
+# Build artifacts and dependency installs — Docker rebuilds them from scratch.
+node_modules
+dist
+.vite
+
+# Editor / VCS noise that has no business in the image.
+.git
+.gitignore
+.DS_Store
+*.log
+
+# Local dev-only files.
+.env
+.env.*
+!.env.example
+
+# IDE caches.
+.vscode
+.idea
+
+# Docker meta itself (avoids self-referential layer inclusion).
+Dockerfile
+.dockerignore
+
+# Documentation isn't needed at build time.
+README.md
