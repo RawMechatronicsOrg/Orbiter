@@ -2,12 +2,22 @@ import asyncio
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
+from pydantic import BaseModel
 
 import scan_task
 import storage
 from models import CreateScanReq, Manifest, ScanSummary
+from orbiter_model import model
+from sfm_export import write_sfm_priors
 
 router = APIRouter(prefix="/scans", tags=["scans"])
+
+
+class ScanPatch(BaseModel):
+    """PATCH /scans/{id} body — only the user-editable catalog fields."""
+
+    notes: str | None = None
+    tags: list[str] | None = None
 
 
 @router.post("", response_model=Manifest)
@@ -35,6 +45,31 @@ def get_scan(scan_id: str) -> Manifest:
         return storage.read_manifest(scan_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"scan {scan_id} not found")
+
+
+@router.patch("/{scan_id}", response_model=Manifest)
+def patch_scan(scan_id: str, patch: ScanPatch) -> Manifest:
+    """Update the user-editable catalog fields (notes / tags) of a scan.
+
+    409 while the scan is the device's active session — this is a whole-
+    document read-modify-write that could drop a capture appended in
+    between; the Scaner tab edits the active session's notes instead."""
+    if model.current_scan_id == scan_id:
+        raise HTTPException(
+            status_code=409,
+            detail=f"scan {scan_id} is the active session — "
+                   "edit its notes in the Scaner tab instead",
+        )
+    try:
+        manifest = storage.read_manifest(scan_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"scan {scan_id} not found")
+    update = patch.model_dump(exclude_none=True)
+    if update:
+        manifest = manifest.model_copy(update=update)
+        storage.write_manifest(manifest)
+        manifest = storage.read_manifest(scan_id)  # pick up the stamped `updated`
+    return manifest
 
 
 @router.get("/{scan_id}/download")
@@ -83,17 +118,23 @@ async def delete_scan(scan_id: str) -> dict:
 
 @router.post("/{scan_id}/sfm_priors")
 def export_sfm_priors(scan_id: str) -> dict:
-    """Export SfM priors for the given scan as `sfm_priors.json`.
+    """Export SfM priors for the given scan as `sfm_priors.json` and stage
+    the session for COLMAP.
 
     Reads the scan manifest, computes per-photo camera poses (Hamilton
     quaternion + translation in mm, world->camera direction, COLMAP
-    convention) and writes the result next to the manifest. See
+    convention) and writes the result next to the manifest. Also
+    materializes the capture originals into ``scans/<id>/photos/`` — the
+    layout `colmap/run_colmap_session.sh` (and the masks tool) read. See
     `docs/COLMAP.md` for the schema.
     """
-    from sfm_export import write_sfm_priors
-
     try:
+        photos = storage.materialize_scan_photos(scan_id)
         path = write_sfm_priors(scan_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"scan {scan_id} not found")
-    return {"path": str(path)}
+    return {
+        "path": str(path),
+        "photos_ready": photos.ready,
+        "photos_missing": photos.missing,
+    }

@@ -72,4 +72,4 @@ These are baked into the firmware at build time. `sdkconfig` is gitignored
 by default — your creds won't end up in version control.
 
 If you'd rather provision at runtime (BLE / captive portal / SmartConfig),
-you'll need to add it. Out of scope for v0.1.
+you'll need to add it. Out of scope for this kit.

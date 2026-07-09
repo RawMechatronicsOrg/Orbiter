@@ -1,4 +1,4 @@
-# Orbiter v0.1
+# Orbiter v0.2
 
 A two-axis camera turntable for taking calibrated photo sets of small objects,
 controlled over Wi-Fi from a browser. Think of it as a **bench-top hemisphere
@@ -30,7 +30,7 @@ authoritative when you need depth.
 13. [Docker stack](#13-docker-stack)
 14. [COLMAP integration](#14-colmap-integration)
 15. [Troubleshooting](#15-troubleshooting)
-16. [What's out of scope in v0.1](#16-whats-out-of-scope-in-v01)
+16. [What's out of scope](#16-whats-out-of-scope)
 17. [License](#17-license)
 18. [Repository map](#18-repository-map)
 
@@ -40,7 +40,7 @@ authoritative when you need depth.
 
 Orbiter is a bench-top hemisphere camera rig: an object sits on a rotating platform (azimuth axis), a camera arm sweeps over it (elevation axis), and a host server records each photo together with the (az, el) pose at the moment of capture. The output is a folder of photos with extrinsics, suitable for feeding straight into COLMAP as SfM priors.
 
-v0.1 is a **lab kit**, not a finished product. Expect rough edges; the pieces work — we use them — but they were extracted from an active research project rather than polished for distribution. Issues and PRs welcome.
+Orbiter is a **lab kit**, not a finished product. Expect rough edges; the pieces work — we use them — but they were extracted from an active research project rather than polished for distribution. Issues and PRs welcome.
 
 ### What you get
 
@@ -104,7 +104,7 @@ Three tiers; the browser never talks to the ESP32 directly.
 
 **Server-side scene graph (Viser pattern).** The server is the source of truth for scene state and geometry. It holds the model (current AZ/EL, motors, scan session, captures), computes camera poses from `(az, el, arm_radius, base_height, camera_offset)`, proxies every firmware call, and writes images + manifests to disk. The browser is a thin viewer over a scene-graph diff protocol — the server pushes `scene_snapshot` then `scene_update` messages with added/updated/removed typed nodes; the browser maps `NodeType` → three.js objects and renders. Commands flow back as named operations (`move`, `take_shot`, `save_scan`, …).
 
-**Why.** Off-by-unit / off-by-frame 3D math bugs compound very fast when two ends of a WebSocket disagree on whether they're in millimetres or metres, or which axis is up. Keeping the math on the server, and never letting it leak to the browser, killed that whole class of bugs. It's why the v0.1 codebase is small enough to extract and ship.
+**Why.** Off-by-unit / off-by-frame 3D math bugs compound very fast when two ends of a WebSocket disagree on whether they're in millimetres or metres, or which axis is up. Keeping the math on the server, and never letting it leak to the browser, killed that whole class of bugs. It's why the kit codebase is small enough to extract and ship.
 
 **Subsystem boundaries:**
 
@@ -369,7 +369,7 @@ Write down the IP — the server needs it.
 | `ORBITER_EL_MIN_DEG`    | Lower limit on EL                        | -25           |
 | `ORBITER_EL_MAX_DEG`    | Upper limit on EL                        | 90            |
 
-Credentials are baked in at build time. `sdkconfig` is gitignored by default. For runtime provisioning (captive portal, BLE, SmartConfig) you'll need to add it — out of scope for v0.1.
+Credentials are baked in at build time. `sdkconfig` is gitignored by default. For runtime provisioning (captive portal, BLE, SmartConfig) you'll need to add it — out of scope for this kit.
 
 ### 10.3 First-run encoder calibration
 
@@ -516,7 +516,7 @@ The capture pool is **immutable** — once `captures/<id>/original.jpg` exists, 
 
 ## 12. UI
 
-Vite + React + react-three-fiber + zustand + Radix Tabs. Two tabs: **Scaner** (live 3D, motion controls, motion planner, scan-session controls) and **Library** (saved scans, per-scan **Export SfM priors**, a placeholder **Run COLMAP** button reserved for v0.2).
+Vite + React + react-three-fiber + zustand + Radix Tabs. Two tabs: **Scaner** (live 3D, motion controls, motion planner, scan-session controls) and **Library** (saved scans, per-scan **Export SfM priors** — which also stages `photos/` for the COLMAP container — and a placeholder **Run COLMAP** button reserved for a future release).
 
 ### 12.1 Dev / build
 
@@ -530,8 +530,8 @@ npx tsc --noEmit     # type-check without building
 Production (Docker, two-stage `node:20-alpine` build → `nginx:alpine` serve on port 80):
 
 ```bash
-docker build -t orbiter-v0.1-ui .
-docker run --rm -p 8080:80 orbiter-v0.1-ui
+docker build -t orbiter-ui .
+docker run --rm -p 8080:80 orbiter-ui
 ```
 
 ### 12.2 Tabs
@@ -626,9 +626,11 @@ docker compose --profile colmap run --rm colmap \
     run_colmap_session.sh <session-id> --dry-run   # print command plan, no work
 ```
 
-Output ends up in `<storage>/scans/<sid>/colmap/`. Progress is streamed back to the UI.
+Output ends up in `<storage>/scans/<sid>/colmap/`.
 
-**Option B — hand-off.** UI → Library → session → **Export → SfM priors** writes `<storage>/scans/<sid>/sfm_priors.json`. Feed it to your own COLMAP install; the conversion logic is in `server/orbiter_server/sfm_export.py`.
+Before the first run, hit **Export → SfM priors** on the session (UI → Library) — besides writing `sfm_priors.json` it materializes the capture originals into `scans/<sid>/photos/`, the layout the runner reads.
+
+**Option B — hand-off.** The same **Export → SfM priors** leaves a self-contained session (`photos/` + `sfm_priors.json`) you can feed to your own COLMAP install; the conversion logic is in `server/orbiter_server/sfm_export.py` and `colmap/sfm_priors_to_colmap.py`.
 
 ### 14.2 `sfm_priors.json` schema
 
@@ -636,23 +638,28 @@ Output ends up in `<storage>/scans/<sid>/colmap/`. Progress is streamed back to 
 {
   "schema": "orbiter.sfm_priors.v1",
   "camera_intrinsics": {
-    "model": "PINHOLE",
-    "width":  1920, "height": 1080,
-    "fx": 1500, "fy": 1500,
-    "cx":  960, "cy":  540
+    "model": "PINHOLE",               // "OPENCV" once calibrated with distortion
+    "width":  4080, "height": 3060,   // stored-photo pixels, not a guess
+    "fx": 3122.9, "fy": 3122.1,
+    "cx": 2039.5, "cy": 1529.5
   },
   "images": [
     {
-      "file": "c_001/photo.jpg",
+      "file": "photos/001_az000_el+15.jpg",
       "qw":  0.707, "qx": 0, "qy": 0.707, "qz": 0,   // Hamilton quaternion
       "tx":   220,  "ty": 0, "tz":  45               // translation in mm
     }
     // ...
-  ]
+  ],
+  "turntable": {                      // present once the rig is calibrated
+    "axis_xy_mm": [1.8, 0.0],         // AZ rotation axis in world XY
+    "board": { "rvec": [/*…*/], "t": [/*…*/],
+               "width_mm": 288, "height_mm": 288 }   // nominal board pose
+  }
 }
 ```
 
-Quaternion convention: **Hamilton** (w, x, y, z). Translations in **millimetres** in the world frame from [§4](#4-coordinate-system--data-model). The transform takes world points into camera space (COLMAP's convention).
+Quaternion convention: **Hamilton** (w, x, y, z). Translations in **millimetres** in the world frame from [§4](#4-coordinate-system--data-model). The transform takes world points into camera space (COLMAP's convention). Intrinsics come from the ChArUco solve when the rig is calibrated (rotated to match the stored-pixel orientation); otherwise a scaled IP-Webcam guess. The optional `turntable` block feeds the mask tool's geometry stamps ([§14.5](#145-object-masks-optional)).
 
 ### 14.3 Container pipeline
 
@@ -660,15 +667,15 @@ The wrapper executes seven steps, halting on the first error:
 
 | # | Step                              | Notes                                                  |
 |--:|-----------------------------------|--------------------------------------------------------|
-| 1 | `sfm_priors_to_colmap.py`         | Convert priors JSON → COLMAP text model.               |
-| 2 | `colmap feature_extractor`        | SIFT; `--gpu` enables `SiftExtraction.use_gpu`.        |
-| 3 | `colmap exhaustive_matcher`       | Pairwise match.                                        |
+| 1 | `colmap feature_extractor`        | Camera model + params pinned from the priors; picks up `masks/` automatically ([§14.5](#145-object-masks-optional)); `--gpu` → `FeatureExtraction.use_gpu`. |
+| 2 | `colmap exhaustive_matcher`       | Pairwise match.                                        |
+| 3 | `sfm_priors_to_colmap.py --database` | Priors JSON → COLMAP text model, image/frame ids synced to the database; also fills the `pose_priors` table and emits `rigs.txt`/`frames.txt` for COLMAP ≥ 3.13. |
 | 4 | `colmap point_triangulator`       | Uses the prior sparse as input.                        |
 | 5 | `colmap image_undistorter`        | Sparse → dense workspace.                              |
 | 6 | `colmap patch_match_stereo`       | Per-image depth maps (slow on CPU; huge GPU speedup).  |
 | 7 | `colmap stereo_fusion`            | Depth maps → fused `.ply` point cloud.                 |
 
-Output layout under `<storage>/scans/<sid>/colmap/`: `sparse_priors/`, `database.db`, `sparse/0/`, `dense/{images,sparse,stereo,fused.ply}`.
+Each step is wrapped in `[PROFILE]` start/end markers with durations, so a slow run tells you where it went. Output layout under `<storage>/scans/<sid>/colmap/`: `sparse_priors/`, `database.db`, `sparse/0/`, `dense/{images,sparse,stereo,fused.ply}`.
 
 ### 14.4 How accurate are the priors?
 
@@ -679,7 +686,31 @@ With a calliper-measured arm and the standard AS5600 / AS5048A encoder pair:
 | Per-shot rotation error | 0.5° – 1.5° |
 | Per-shot position error | 2 – 10 mm  |
 
-Not enough for "feature-free" reconstruction, but plenty as a warm start — COLMAP's bundle adjustment will polish them. Camera intrinsics are guessed from the IP Webcam stream by default; override in **Camera config** before exporting if you've calibrated separately.
+Not enough for "feature-free" reconstruction, but plenty as a warm start — COLMAP's bundle adjustment will polish them. Run the ChArUco calibration (**Machine config → Calibrate from board**) and both improve: the solve refines the machine geometry *and* embeds the solved camera intrinsics (with distortion) into the priors; without it a scaled IP-Webcam guess is used — override in **Camera config** if you've calibrated separately.
+
+### 14.5 Object masks (optional)
+
+Static surroundings — table, walls, the rig frame — are identical in every frame, so COLMAP matches features on them and drifts toward reconstructing the *room* instead of the object. The [`colmap/masks/`](colmap/masks/) tool suppresses them with per-image masks COLMAP honours via `--ImageReader.mask_path` (white = keep features, black = ignore). Everything that **rotates with the platform** — object, board, disc — stays white; the static room goes black.
+
+Three methods, from zero-dependency up:
+
+| Method      | Needs                          | Idea                                                                 |
+|-------------|--------------------------------|----------------------------------------------------------------------|
+| `motion`    | nothing extra (in-container)   | Within one elevation ring the camera is physically static (AZ spins the *platform*), so a per-pixel temporal median over the ring reconstructs the empty scene — no empty-table shots — and `‖frame − plate‖` is the moving assembly. The most robust method on this rig. |
+| `geometric` | nothing extra (in-container)   | Projects the calibrated working volume through each pose — coarse silhouette, pure geometry. |
+| `sam2`      | torch + SAM 2.1 weights (host) | Pixel-accurate segmentation, prompted and clamped by the projected geometry. Also sharpens `motion` edges when available (`--edge-refine`). |
+
+```bash
+docker compose --profile colmap run --rm colmap \
+    generate_colmap_masks \
+        --images  /data/scans/<sid>/photos \
+        --masks   /data/scans/<sid>/masks \
+        --poses   /data/scans/<sid>/sfm_priors.json \
+        --preview /data/scans/<sid>/masks_preview \
+        --method  motion
+```
+
+`run_colmap_session.sh` auto-detects the session `masks/` directory and adds the flag for you, and the server serves each frame's mask and overlay at `/scans/<sid>/photos/<idx>/mask` and `…/mask_preview` for eyeballing. Parameters and tuning: [`colmap/masks/README.md`](colmap/masks/README.md).
 
 ---
 
@@ -706,16 +737,16 @@ For deeper firmware problems: the firmware log is verbose by design — watch it
 
 ---
 
-## 16. What's out of scope in v0.1
+## 16. What's out of scope
 
-The full Orbiter project (in the parent repo) includes more — left out of v0.1 on purpose:
+The full Orbiter project (in the parent repo) includes more — left out of the kit on purpose:
 
 - **Laser-stripe scanner + live triangulator.** Needs a line laser and a separately calibrated camera; the parent project couples both tightly to its own optical stack.
-- **Photogrammetry job orchestration.** Beyond the single-session COLMAP wrapper that ships here.
+- **Photogrammetry job orchestration.** Beyond the single-session COLMAP wrapper and the standalone mask tool that ship here.
 
-ChArUco hand-eye geometry calibration *is* shipped here — see [§5](#5-bill-of-materials) for the board and the **Machine config → Calibrate from board** flow in the UI. Per-shot residuals reach ~0.5°/few mm with a calliper-printed board.
+ChArUco hand-eye geometry calibration *is* shipped here — the **Machine config → Calibrate from board** flow in the UI. The default board spec is an 8×8 ChArUco, `DICT_5X5_100`, 36 mm squares / 26.64 mm markers (generate one at [calib.io](https://calib.io/pages/camera-calibration-pattern-generator), print, **measure a square with a ruler** and set the real size in Machine config → Board — a 20 % size error biases every solved distance by the same 20 %). The v0.2 solver resolves the flat-board pose ambiguity, refines the EL-axis tilt and reports per-view residuals; per-shot errors land well under a degree / a few mm.
 
-The architecture leaves clean seams where these can plug back in — the server already speaks in terms of `Manifest`, `MotionPlan`, `Pose`. The UI's Library tab carries a disabled **Run COLMAP** button reserved for v0.2.
+The architecture leaves clean seams where these can plug back in — the server already speaks in terms of `Manifest`, `MotionPlan`, `Pose`. The UI's Library tab carries a disabled **Run COLMAP** button reserved for a future release.
 
 ---
 

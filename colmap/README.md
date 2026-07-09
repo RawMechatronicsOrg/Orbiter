@@ -1,4 +1,4 @@
-# Orbiter v0.1 — COLMAP container
+# Orbiter — COLMAP container
 
 A thin layer on top of the official **`colmap/colmap:latest`** image that
 makes it trivial to run a full SfM + MVS reconstruction on a single
@@ -8,7 +8,8 @@ Orbiter scan session, using the per-image poses from the scan as priors.
 colmap/
 ├── Dockerfile                  ← base image + Python + scripts
 ├── run_colmap_session.sh       ← end-to-end wrapper (CPU/GPU)
-├── sfm_priors_to_colmap.py     ← sfm_priors.json -> cameras.txt + images.txt
+├── sfm_priors_to_colmap.py     ← sfm_priors.json -> COLMAP text model
+├── masks/                      ← object-mask tool (own README)
 ├── .dockerignore
 └── README.md                   ← this file
 ```
@@ -18,9 +19,10 @@ colmap/
 | Tool                          | Where                                            |
 |-------------------------------|--------------------------------------------------|
 | `colmap` (CUDA build)         | inherited from `colmap/colmap:latest`            |
-| `python3`                     | `apt` package                                    |
+| `python3` + OpenCV + NumPy    | `apt` / `pip` packages                           |
 | `run_colmap_session.sh`       | `/usr/local/bin/run_colmap_session.sh` (on PATH) |
 | `sfm_priors_to_colmap.py`     | `/usr/local/bin/sfm_priors_to_colmap.py` (on PATH)|
+| `generate_colmap_masks`       | `/usr/local/bin/…` (on PATH) → `/opt/orbiter/masks` |
 
 ### Why the official COLMAP image as the base
 
@@ -41,7 +43,7 @@ this) — pin the digest in production.
 ### Via Compose (recommended)
 
 ```bash
-cd OrbiterV0.1/docker
+cd docker
 
 # CPU SIFT (default)
 docker compose --profile colmap run --rm colmap \
@@ -60,7 +62,7 @@ docker compose --profile colmap run --rm colmap \
 
 ```bash
 # Build once
-docker build -t colmap-orbiter OrbiterV0.1/colmap
+docker build -t colmap-orbiter colmap/
 
 # Run
 docker run --rm \
@@ -87,13 +89,17 @@ The wrapper executes seven steps, halting on the first error:
 
 | # | Step                              | Notes                                                  |
 |---|-----------------------------------|--------------------------------------------------------|
-| 1 | `sfm_priors_to_colmap.py`         | Converts the Orbiter priors JSON to COLMAP text model. |
-| 2 | `colmap feature_extractor`        | SIFT features. `--gpu` enables `SiftExtraction.use_gpu`.|
-| 3 | `colmap exhaustive_matcher`       | Pairwise match across all images.                      |
+| 1 | `colmap feature_extractor`        | Camera model/params pinned from the priors; adds `--ImageReader.mask_path` automatically when the session has `masks/` (see `masks/README.md`); `--gpu` enables `FeatureExtraction.use_gpu`. |
+| 2 | `colmap exhaustive_matcher`       | Pairwise match across all images.                      |
+| 3 | `sfm_priors_to_colmap.py --database` | Priors JSON -> COLMAP text model, image/frame ids synced to the database; also fills `pose_priors` and emits `rigs.txt`/`frames.txt` (COLMAP >= 3.13). |
 | 4 | `colmap point_triangulator`       | Uses the prior sparse as input, triangulates points.   |
 | 5 | `colmap image_undistorter`        | Sparse -> dense workspace, undistorted images.         |
 | 6 | `colmap patch_match_stereo`       | Per-image depth maps (slow; benefits hugely from GPU). |
 | 7 | `colmap stereo_fusion`            | Depth maps -> single fused `.ply` point cloud.         |
+
+Each step prints `[PROFILE]` start/end markers with durations. Frames are
+read from the session's `photos/` dir — `POST /scans/<sid>/sfm_priors`
+materializes it alongside the priors.
 
 ### CPU vs GPU notes
 
@@ -112,11 +118,13 @@ The wrapper executes seven steps, halting on the first error:
 ```
 /data/scans/<sid>/
 ├── sfm_priors.json                          (input, written by the server)
-├── c_001/photo.jpg, c_002/photo.jpg, ...    (input, captured by the rig)
+├── photos/001_az000_el+15.jpg, ...          (input, materialized by the export)
+├── masks/                                   (optional — masks/README.md)
 └── colmap/                                  (created by this script)
     ├── sparse_priors/
-    │   ├── cameras.txt                      (one shared PINHOLE camera)
+    │   ├── cameras.txt                      (one shared camera, model from priors)
     │   ├── images.txt                       (priors quat/translation per image)
+    │   ├── rigs.txt, frames.txt             (COLMAP >= 3.13 bindings)
     │   └── points3D.txt                     (empty)
     ├── database.db                          (SIFT features + matches)
     ├── sparse/0/                            (triangulated sparse model)

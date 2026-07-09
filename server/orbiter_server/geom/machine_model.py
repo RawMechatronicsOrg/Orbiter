@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .pose import GeomParams, MountTransform, camera_pose_at
-from .transforms import Quat, Vec3, quat_from_unit_vectors, rotvec_to_matrix
+from .transforms import Quat, Vec3, quat_from_unit_vectors
 
 # Fixed yoke half-length along the EL axis (mm), from MachineModel.tsx.
 YOKE_HALF = 160.0
@@ -42,10 +42,6 @@ class RigKinematics:
     seg2: Cylinder | None          # joint -> arm-tip
     stem: Cylinder | None          # arm-tip -> camera body
     stem_start: Vec3 | None
-    # ── computed-rocker rendering (set only when machine_geometry is given)
-    el_pivot: Vec3 | None = None         # el-axis centre, in math frame at az_vis=0
-    rocker_eccentricity: Cylinder | None = None  # az-axis -> el-pivot (when offset)
-    yoke_bar: Cylinder | None = None     # the cross-bar along the el-axis
 
 
 def compute_rig(
@@ -56,14 +52,9 @@ def compute_rig(
     camera_pan_deg: float,
     extrinsic: MountTransform | None,
     turntable_axis: tuple[float, float] | None,
-    machine_geometry: dict | None = None,
+    rocker: MountTransform | None = None,
 ) -> RigKinematics:
-    """Compute the moving rig geometry at the static visual frame (az = 0).
-
-    `machine_geometry` is kept in the signature for source compatibility with
-    callers that may pass a precomputed two-link rocker decomposition; v0.1
-    callers always pass None and the stylised L-arm is rendered.
-    """
+    """Compute the moving rig geometry at the static visual frame (az = 0)."""
     has_geom = arm_radius_mm > 0 or extrinsic is not None
 
     # Arm-tip: +X rotated by elevation only (az_vis = 0).
@@ -79,6 +70,7 @@ def compute_rig(
         camera_tilt=camera_tilt_deg,
         camera_pan=camera_pan_deg,
         turntable_axis=turntable_axis,
+        rocker=rocker,
     )
     pose = camera_pose_at(0.0, el_deg, geom)
     camera_quat = pose.camera_quat or (0.0, 0.0, 0.0, 1.0)
@@ -139,52 +131,6 @@ def compute_rig(
             )
             stem_start = arm_end
 
-    # ── computed-rocker overlay (when machine_geometry is available) ──
-    el_pivot: Vec3 | None = None
-    rocker_eccentricity: Cylinder | None = None
-    yoke_bar: Cylinder | None = None
-    if machine_geometry and machine_geometry.get("ok"):
-        rocker_t = np.asarray(machine_geometry["rocker"]["t"], dtype=float)
-        rocker_rvec = np.asarray(machine_geometry["rocker"]["rvec"], dtype=float)
-        R_rocker = rotvec_to_matrix(rocker_rvec)
-
-        # el-pivot in the math frame at az_vis=0. machine_geometry's rocker.t
-        # is already expressed in this frame.
-        el_pivot = (float(rocker_t[0]), float(rocker_t[1]), float(rocker_t[2]))
-
-        # Horizontal eccentricity: a short cylinder from the az axis (at the
-        # same height as the pivot) to the pivot itself. Drawn only when the
-        # offset is large enough to be visible — < 0.5 mm reads as noise.
-        ecc_base = np.array([0.0, 0.0, rocker_t[2]])
-        ecc_vec  = rocker_t - ecc_base
-        ecc_len  = float(np.linalg.norm(ecc_vec))
-        if ecc_len >= 0.5:
-            mid = ecc_base + ecc_vec * 0.5
-            d = ecc_vec / ecc_len
-            rocker_eccentricity = Cylinder(
-                mid=(float(mid[0]), float(mid[1]), float(mid[2])),
-                quat=quat_from_unit_vectors((0.0, 1.0, 0.0),
-                                            (float(d[0]), float(d[1]), float(d[2]))),
-                length=ecc_len,
-            )
-
-        # Yoke cross-bar — runs along the rotated el-axis through the pivot.
-        # rig.transforms.el_matrix rotates about -Y, so the el-axis direction
-        # in the rocker frame is (0, -1, 0); in the math frame it's R_rocker
-        # applied to that.
-        yhalf = float(machine_geometry.get("rocker", {}).get("yoke_half", YOKE_HALF))
-        if yhalf <= 0:
-            yhalf = YOKE_HALF
-        el_axis_dir = R_rocker @ np.array([0.0, -1.0, 0.0])
-        yoke_bar = Cylinder(
-            mid=el_pivot,
-            quat=quat_from_unit_vectors(
-                (0.0, 1.0, 0.0),
-                (float(el_axis_dir[0]), float(el_axis_dir[1]), float(el_axis_dir[2])),
-            ),
-            length=2.0 * yhalf,
-        )
-
     return RigKinematics(
         has_geom=has_geom,
         arm_end=arm_end,
@@ -196,7 +142,4 @@ def compute_rig(
         seg2=seg2,
         stem=stem,
         stem_start=stem_start,
-        el_pivot=el_pivot,
-        rocker_eccentricity=rocker_eccentricity,
-        yoke_bar=yoke_bar,
     )

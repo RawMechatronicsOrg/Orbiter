@@ -76,6 +76,29 @@ def roll_about_lens_quat(roll_deg: float) -> Quat:
     return (0.0, 0.0, -s, c)
 
 
+def stored_pixel_quat(q: Quat, cw_quarter_turns: int) -> Quat:
+    """Re-express a SENSOR-frame camera quaternion in the STORED-pixel frame
+    after the image pixels were rotated `cw_quarter_turns` x 90 deg clockwise
+    (the `camera_preset` orientation policy, e.g. sm22 -> 1 turn).
+
+    Rotating the pixels 90 deg CW relabels the camera's local axes: the new
+    image +u axis is the old camera +Y, the new -v (image up) is the old -X.
+    In the three.js object frame that relabeling is a +90 deg rotation about
+    local +Z per turn, post-multiplied (body frame):
+
+        q_stored = q_sensor o Rz_local(+90 deg x turns)
+
+    Keeping `camera_quat` in the stored-pixel frame is the manifest invariant:
+    frustum renderers use it with the stored aspect, and the SfM exporter maps
+    it straight to COLMAP poses for the stored (already-rotated) JPEGs.
+    """
+    turns = cw_quarter_turns % 4
+    if turns == 0:
+        return q
+    half = math.radians(90.0 * turns) * 0.5
+    return quat_mul(q, (0.0, 0.0, math.sin(half), math.cos(half)))
+
+
 # ── rig rotations ───────────────────────────────────────────────────────────
 
 def el_matrix(el_deg: float) -> np.ndarray:

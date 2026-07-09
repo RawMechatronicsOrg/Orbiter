@@ -50,7 +50,7 @@ Open `idf.py menuconfig` → **Orbiter Configuration**:
 
 The Wi-Fi credentials are baked into the firmware at build time. If you want
 runtime configuration (a captive portal, BLE provisioning, etc.) you'll need
-to add it — out of scope for v0.1.
+to add it — out of scope for this kit.
 
 > **2.4 GHz only.** The ESP32 radio doesn't support 5 GHz. If your router
 > exposes both bands under split SSIDs (`<name>` and `5G-<name>`), pick the

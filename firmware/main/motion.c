@@ -50,15 +50,23 @@ static const char *TAG = "motion";
 #define CL_IN_TOL_TICKS     3       /* consecutive in-tol ticks → settled     */
 #define CL_HZ_MIN           60u     /* crawl step rate near the target        */
 #define CL_HZ_SLEW          70u     /* max step-rate change per tick (accel)  */
-#define CL_HZ_MAX_AZ        1050u   /* AZ top speed — light axis              */
-#define CL_HZ_MAX_EL        175u    /* EL top speed — carries the whole arm
-                                       (was 525; cut 3× per operator request
-                                       — calibration sweeps were over-shooting
-                                       and the AF lock had no chance to settle
-                                       at the original speed)              */
+#define CL_HZ_MAX_AZ        2100u   /* AZ top speed — light axis. Doubled from
+                                       1050 per operator request (2026-06).   */
+#define CL_HZ_MAX_EL        350u    /* EL top speed — carries the whole arm.
+                                       Doubled from 175 per operator request
+                                       (2026-06); still well under the original
+                                       525 that over-shot calibration sweeps
+                                       before the AF lock could settle.
+                                       These two are the DEFAULTS — the server
+                                       may override per-/move via az_hz_max /
+                                       el_hz_max (UI speed knobs).             */
 #define CL_KP_AZ            130.0f  /* AZ gain: Hz of step rate per ° of error */
 #define CL_KP_EL            70.0f   /* EL gain                                 */
 #define CL_HARD_CAP_MS      60000u  /* ceiling when caller passes timeout_ms=0 */
+#define CL_HZ_OVERRIDE_MAX  5000u   /* hard ceiling for a server-supplied per-move
+                                       speed cap — sanity clamp on az_hz_max /
+                                       el_hz_max so a stray value can't command an
+                                       absurd step rate (the UI clamps tighter). */
 
 /* ── State ──────────────────────────────────────────────────────────────── */
 static motion_state_t  s_state = MOTION_IDLE;
@@ -460,10 +468,16 @@ static esp_err_t cl_tick_axis(axis_loop_t *a, stepper_axis_t sax, float current_
     if (want < CL_HZ_MIN)  want = CL_HZ_MIN;
     if (want > a->hz_max)  want = a->hz_max;
 
-    /* Slew-limit the commanded rate — trapezoidal accel, no cold-start stall. */
-    if (a->cur_hz + CL_HZ_SLEW < want)       a->cur_hz += CL_HZ_SLEW;
-    else if (a->cur_hz > want + CL_HZ_SLEW)  a->cur_hz -= CL_HZ_SLEW;
-    else                                     a->cur_hz  = want;
+    /* Slew-limit ACCELERATION only. A stepper stalls if commanded to speed up
+     * faster than the rotor can follow, so ramp-UP is capped at CL_HZ_SLEW.
+     * Slowing DOWN is always safe, and snapping straight onto the proportional
+     * law is exactly how the loop avoids overshoot: `want = kp·err` IS the
+     * deceleration plan. The old SYMMETRIC slew throttled the downward step
+     * too, so a raised hz_max couldn't bleed cur_hz onto the plan before the
+     * target — it sailed past. `want` falls smoothly as err shrinks
+     * (≈ kp·v·dt per tick), so tracking it down is a smooth glide, not a snap. */
+    if (a->cur_hz + CL_HZ_SLEW < want)  a->cur_hz += CL_HZ_SLEW;  /* accel: capped  */
+    else                                a->cur_hz  = want;         /* decel: on plan */
     if (a->cur_hz < CL_HZ_MIN) a->cur_hz = CL_HZ_MIN;
 
     /* delta ≥ 0 → DIR_CCW (the only sign mapping; see COORDINATES.md §6). */
@@ -481,8 +495,19 @@ static esp_err_t cl_tick_axis(axis_loop_t *a, stepper_axis_t sax, float current_
     return ESP_OK;
 }
 
+/* Resolve a per-move speed cap: 0 → compiled default; otherwise clamp the
+ * server-supplied value to [CL_HZ_MIN, CL_HZ_OVERRIDE_MAX]. */
+static uint32_t effective_hz_max(uint32_t override_hz, uint32_t fallback)
+{
+    if (override_hz == 0)                 return fallback;
+    if (override_hz < CL_HZ_MIN)          return CL_HZ_MIN;
+    if (override_hz > CL_HZ_OVERRIDE_MAX) return CL_HZ_OVERRIDE_MAX;
+    return override_hz;
+}
+
 esp_err_t motion_move(float az_deg, float el_deg,
                       bool has_az, bool has_el,
+                      uint32_t az_hz_max, uint32_t el_hz_max,
                       uint32_t timeout_ms,
                       motion_pos_t *out)
 {
@@ -494,22 +519,29 @@ esp_err_t motion_move(float az_deg, float el_deg,
     stepper_enable();
     s_motors_enabled = true;
 
+    /* Per-axis top step rate: server-supplied knob value, or the compiled
+     * default when 0. effective_hz_max clamps to a safe band. */
+    uint32_t hz_max_az = effective_hz_max(az_hz_max, CL_HZ_MAX_AZ);
+    uint32_t hz_max_el = effective_hz_max(el_hz_max, CL_HZ_MAX_EL);
+
     axis_loop_t az = {
         .active = has_az, .target = az_deg,
-        .hz_max = CL_HZ_MAX_AZ, .kp = CL_KP_AZ,
+        .hz_max = hz_max_az, .kp = CL_KP_AZ,
     };
     axis_loop_t el = {
         .active = has_el, .target = el_deg,
-        .hz_max = CL_HZ_MAX_EL, .kp = CL_KP_EL,
+        .hz_max = hz_max_el, .kp = CL_KP_EL,
     };
 
     uint64_t t_start  = esp_timer_get_time() / 1000;
     uint32_t hard_cap = (timeout_ms > 0) ? timeout_ms : CL_HARD_CAP_MS;
     esp_err_t result  = ESP_OK;
 
-    LOGX_EMIT_I(TAG, "move (closed-loop) — AZ %s%.2f° | EL %s%.2f°",
+    LOGX_EMIT_I(TAG, "move (closed-loop) — AZ %s%.2f° | EL %s%.2f° "
+                "(hz_max az=%lu el=%lu)",
                 has_az ? "→" : "skip ", (double)az_deg,
-                has_el ? "→" : "skip ", (double)el_deg);
+                has_el ? "→" : "skip ", (double)el_deg,
+                (unsigned long)hz_max_az, (unsigned long)hz_max_el);
 
     for (;;) {
         /* Read both encoders; keep last value on a failed read. */

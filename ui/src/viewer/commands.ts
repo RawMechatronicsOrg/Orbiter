@@ -37,6 +37,10 @@ export interface Commands {
    *  (fast ≈ 9 poses, normal ≈ 24, full ≈ 32). */
   calibrateGeometry(preset: 'fast' | 'normal' | 'full'): void;
   setMotionPlan(plan: Record<string, unknown>): void;
+  /** Set the per-axis closed-loop top step rate (Hz) — the Machine-config
+   *  speed knobs. Either or both axes; the server clamps to a safe band and
+   *  forwards the value to the firmware with the next /move. */
+  setMoveSpeed(azHzMax?: number, elHzMax?: number): void;
   setRenderPref(prefs: Record<string, boolean>): void;
   takeShot(): void;
   /** Delete one capture from the active scan session by its `capture_id`.
@@ -52,6 +56,9 @@ export interface Commands {
   startScan(plan?: Record<string, unknown>): void;
   /** Ask the running scan to abort at the next iteration. */
   stopScan(): void;
+  /** Load a STORED scan into the 3D view (review frustums); `null` unloads.
+   *  Stays on the device service — it reads manifests via orbiter_core. */
+  setActiveSession(scanId: string | null): void;
   raw(name: string, args?: Record<string, unknown>): void;
 }
 
@@ -75,6 +82,12 @@ export function makeCommands(client: WsClient): Commands {
       client.sendCommand('calibrate_geometry', { apply: true, preset }),
     setMotionPlan: (plan) =>
       client.sendCommand('set_motion_plan', { motion_plan: plan }),
+    setMoveSpeed: (azHzMax, elHzMax) => {
+      const args: Record<string, number> = {};
+      if (azHzMax !== undefined) args.az_hz_max = Math.round(azHzMax);
+      if (elHzMax !== undefined) args.el_hz_max = Math.round(elHzMax);
+      client.sendCommand('set_move_speed', args);
+    },
     setRenderPref: (prefs) => client.sendCommand('set_render_pref', prefs),
     takeShot: () => client.sendCommand('take_shot'),
     deleteCapture: (captureId) =>
@@ -85,6 +98,8 @@ export function makeCommands(client: WsClient): Commands {
     startScan: (plan) =>
       client.sendCommand('start_scan', plan ? { motion_plan: plan } : {}),
     stopScan: () => client.sendCommand('stop_scan'),
+    setActiveSession: (scanId) =>
+      client.sendCommand('set_active_session', { scan_id: scanId }),
     raw: (name, args = {}) => client.sendCommand(name, args),
   };
 }

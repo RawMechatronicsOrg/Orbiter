@@ -38,7 +38,17 @@ PERSISTED_FIELDS: frozenset[str] = frozenset({
     # Set True once a ChArUco geometry calibration has been applied; the UI
     # keys a "not calibrated" warning off it.
     "calibrated", "calib_extrinsic", "calib_board_world",
+    # One-shot first-boot encoder zeroing (see encoder_init.py).
+    "encoder_zero_initialized",
+    # EL-axis correction (tilt + transverse offset) from the hand-eye refine.
+    "rocker_correction",
+    # AZ-encoder first-harmonic correction [a_c, a_s] (deg) from the refine.
+    "az_encoder_correction",
+    # EL encoder scale k (el_true = k·el) from the refine.
+    "el_encoder_scale",
     "motion_plan",
+    # Per-axis closed-loop top step rate (Hz) — the UI speed knobs.
+    "move_hz_max_az", "move_hz_max_el",
     "show_axes", "scan_preview", "hide_back_facing", "mirror_photo_on_frustum",
 })
 
@@ -73,17 +83,17 @@ class ModelState:
     runner: dict[str, Any] | None = None
     # Firmware-reported encoder zero offsets (az/el raw degrees).
     encoder_zero: dict[str, float] = field(default_factory=dict)
-    # Phone IMU (from IP Webcam /sensors.json). Both pitches are angles of
-    # a phone axis above the world horizon — same quaternion, different
-    # reference axis:
-    #   * phone_pitch_deg   — device-Y tilt, shifted by a ~90° mount offset
-    #     into the rig EL frame (see phone_sensor._PITCH_MOUNT_OFFSET_DEG).
-    #     For the navball, where it is compared against `el`.
-    #   * phone_lens_pitch_deg — device -Z (back-camera optical axis), raw.
-    #     Used by `align_el_to_phone` so rig.el == 0 ⇒ lens horizontal.
-    # Roll is the bank around the lens axis. All None while the sensor
-    # stream is silent or the camera URL isn't set.
-    phone_pitch_deg: float | None = None
+    # Phone IMU (from IP Webcam /sensors.json), published by phone_sensor:
+    #   * phone_el_deg — the phone's estimate of the RIG ELEVATION, already in
+    #     the rig EL frame (= lens_pitch + 90 for this lens-⊥-arm mount; see
+    #     phone_sensor.LENS_TO_EL_OFFSET_DEG). Drives the navball phone marker;
+    #     the UI must NOT re-derive it. (It is a redundant indicator only —
+    #     EL zeroing is done manually via the firmware Zero EL command.)
+    #   * phone_lens_pitch_deg — raw elevation of the back-camera optical
+    #     axis (device -Z) above the world horizon (diagnostic).
+    #   * phone_roll_deg — bank around the lens axis (live frustum bank).
+    # All None while the sensor stream is silent or the camera URL isn't set.
+    phone_el_deg: float | None = None
     phone_lens_pitch_deg: float | None = None
     phone_roll_deg: float | None = None
     phone_sensor_online: bool = False
@@ -118,17 +128,22 @@ class ModelState:
     # OpenCV distortion: (k1, k2, p1, p2, k3). Zero = no distortion model.
     camera_distortion: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0, 0.0, 0.0])
     # ── ChArUco calibration board geometry ──
-    # Defaults: A4-printable 5×7 board, 30 mm squares, 15 mm markers,
-    # DICT_4X4_50. Regenerate at https://calib.io/pages/camera-calibration-pattern-generator
-    charuco_squares_x: int = 5
-    charuco_squares_y: int = 7
-    charuco_square_length_mm: float = 30.0
-    charuco_marker_length_mm: float = 15.0
-    # ArUco dictionary id (cv2.aruco.DICT_* int constant; 0 = DICT_4X4_50, the
+    # Defaults match the physical board taped to the rig: 8×8 ChArUco,
+    # DICT_5X5_100, measured square = 36 mm (printed at 1.2× of a 30 mm
+    # source), marker = 26.64 mm (= 36 × 22.2/30, keeping the source's 74 %
+    # marker/square ratio). MEASURE your printed board with a ruler and set
+    # these (Machine config → Board) — a 20 % size error biases every distance
+    # the solver reports (camera mount, board placement) by the same 20 %.
+    # Regenerate at https://calib.io/pages/camera-calibration-pattern-generator
+    charuco_squares_x: int = 8
+    charuco_squares_y: int = 8
+    charuco_square_length_mm: float = 36.0
+    charuco_marker_length_mm: float = 26.64
+    # ArUco dictionary id (cv2.aruco.DICT_* int constant; 5 = DICT_5X5_100, the
     # default printed board). Persisted so the board spec is fully data-driven
     # — together with the square/marker sizes it is the ONLY user input the
     # photo-based calibration needs (intrinsics and axis are solved from photos).
-    aruco_dict_id: int = 0
+    aruco_dict_id: int = 5    # DICT_5X5_100
     # True once a ChArUco geometry calibration has been applied (set by
     # calibration.apply_result). Persisted so the UI can show a "not
     # calibrated" warning on a fresh rig that has never been solved.
@@ -138,8 +153,27 @@ class ModelState:
     # Z_ref, each as {"rvec": [...], "t": [...]}. None until a calibration runs.
     calib_extrinsic: dict[str, Any] | None = None
     calib_board_world: dict[str, Any] | None = None
+    # EL-axis correction solved by the hand-eye refine: the real elevation
+    # axis is tilted / offset relative to the ideal Rz·Ry model. Stored as
+    # {"rvec": [rx, 0, rz], "t": [px, 0, pz]} and inserted before the EL
+    # rotation in every FK chain (rig.build_rig_graph). None = ideal axis.
+    rocker_correction: dict[str, Any] | None = None
+    # AZ-encoder first-harmonic correction [a_c, a_s] in degrees:
+    # az_true = az + a_c·sin(az) + a_s·cos(az) (AS5600 magnet eccentricity).
+    # Applied by every FK consumer via calibration.az_encoder_corrected.
+    # None = encoder taken as exact.
+    az_encoder_correction: list[float] | None = None
+    # EL encoder scale k (el_true = k·el) from the refine. Also absorbs a
+    # linear camera-bracket sag about the EL axis (identical signature).
+    # None = exact (1.0).
+    el_encoder_scale: float | None = None
     # Last "Test accuracy" result — a human string for the UI (runtime only).
     calib_test_msg: str = ""
+    # True once the encoder zeros have been initialized for this rig — by the
+    # first-boot auto-zero (encoder_init.py: AZ at current position, EL from
+    # the phone IMU) or by a manual zero/align from the UI. Until then the
+    # encoders may report arbitrary angles and absolute moves are unsafe.
+    encoder_zero_initialized: bool = False
     # Operator-tunable EL correction (deg) added to `model.el` in every
     # pose/kinematic calculation. Lets the operator dial out a constant EL
     # encoder zero bias without re-running the firmware encoder-zero op
@@ -149,6 +183,14 @@ class ModelState:
     # (platform_spin in scene_graph). A miscalibrated AZ zero rotates the
     # whole accumulated cloud by a constant.
     az_kinematic_offset_deg: float = 0.0
+
+    # ── motion speed (persisted) ───────────────────────────────────────────
+    # Per-axis closed-loop top step rate (Hz) sent to the firmware with every
+    # /move as az_hz_max / el_hz_max. The firmware clamps and falls back to its
+    # compiled defaults (CL_HZ_MAX_AZ/EL) when these are 0. Operator-tunable via
+    # the Machine-config speed knobs; defaults match the doubled firmware caps.
+    move_hz_max_az: int = 2100
+    move_hz_max_el: int = 350
 
     # ── scan plan + progress ───────────────────────────────────────────────
     # The MotionPlanner — the active scan-loop plan (discrete sweep).
@@ -165,8 +207,15 @@ class ModelState:
     # The manifest.json is written by the explicit Save command or the
     # debounced autosave; `scan_dirty` flags changes not yet on disk.
     scan_notes: str = ""
+    # True once notes were edited in the Scaner UI this session — only then
+    # does the manifest write take notes from the model; otherwise the
+    # on-disk value (possibly edited via the library service) is kept.
+    scan_notes_edited: bool = False
     scan_dirty: bool = False
     scan_saved_at: str | None = None
+    # Points the scan loop skipped after exhausting retries — JSON-able
+    # dicts persisted as manifest `failed_points` (see scan_task).
+    scan_failed_points: list[dict[str, Any]] = field(default_factory=list)
     # Captures of the active/just-finished scan — JSON-able Capture dicts
     # (pose + thumbnail URLs). Rendered as frustums by the scene builder.
     captures: list[dict[str, Any]] = field(default_factory=list)
@@ -175,7 +224,8 @@ class ModelState:
     # rotating platform (the live/loaded split).
     loaded_captures: list[dict[str, Any]] = field(default_factory=list)
     loaded_scan_id: str | None = None
-    # Scan summaries for the browser panel — refreshed on demand.
+    # Scan summaries for the browser panel — refreshed on demand
+    # (scan_task.publish_scan_list).
     scans: list[dict[str, Any]] = field(default_factory=list)
 
     # ── render preferences (persisted) ─────────────────────────────────────

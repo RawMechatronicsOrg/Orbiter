@@ -1,4 +1,4 @@
-# Orbiter v0.1 — Compose stack
+# Orbiter — Compose stack
 #
 # Default 'docker compose up' brings up server + ui.
 # 'docker compose --profile colmap up' (or run) opts in to the COLMAP container.
@@ -45,6 +45,16 @@ services:
       - colmap
     volumes:
       - ./data:/data
+    environment:
+      # COLMAP needs QT_QPA_PLATFORM=offscreen when running headless — even
+      # CLI-only sub-commands go looking for an X server otherwise.
+      QT_QPA_PLATFORM: offscreen
+      # Tuning knobs read by run_colmap_session.sh (see docker/.env.example).
+      ORBITER_COLMAP_GPU_INDEX: ${ORBITER_COLMAP_GPU_INDEX:-0}
+      ORBITER_COLMAP_MAX_IMAGE_SIZE: ${ORBITER_COLMAP_MAX_IMAGE_SIZE:-3200}
+    # Feature extraction on 4000-px phone frames eats shared memory; the
+    # 64 MB docker default stalls large databases.
+    shm_size: "8gb"
     # GPU passthrough — only effective when the host has the NVIDIA Container
     # Toolkit installed (Linux native, or Windows via WSL2 + nvidia-docker).
     # The deploy stanza is honoured by 'docker compose up' since Compose v2.

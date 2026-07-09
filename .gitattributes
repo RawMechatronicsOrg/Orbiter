@@ -1,0 +1,20 @@
+# Line-ending policy. Shell scripts MUST stay LF — they are COPY'd from the
+# working tree into Linux containers (colmap/Dockerfile), and a CRLF checkout
+# on Windows would ship a script bash cannot run ('\r': command not found).
+* text=auto
+*.sh text eol=lf
+*.py text
+*.ts text
+*.tsx text
+*.c text
+*.h text
+*.md text
+
+# Binary assets — never normalize.
+*.png binary
+*.jpg binary
+*.ico binary
+*.glb binary
+*.fbx binary
+*.stl binary
+*.pdf binary

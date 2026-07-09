@@ -11,11 +11,14 @@ import io
 import json
 import os
 import secrets
+import shutil
 import tempfile
+import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-import camera_adapter
+import camera_adapter  # noqa: F401 — re-exported for callers
 from camera_adapter import (
     THUMB_TIERS,
     PresetName,
@@ -104,6 +107,26 @@ def write_manifest(manifest: Manifest) -> None:
     _scan_dir(stamped.scan_id).mkdir(parents=True, exist_ok=True)
     _atomic_write_json(_manifest_path(stamped.scan_id),
                        stamped.model_dump(mode="json"))
+
+
+# Serialises append_capture's read-modify-write of a manifest within this
+# process, so two concurrent photo uploads can't lose a capture. Cross-process
+# safety still rests on the atomic manifest replace (last writer wins).
+_append_lock = threading.Lock()
+
+
+def append_capture(scan_id: str, capture: Capture) -> Manifest:
+    """Append one Capture to a scan's manifest and persist it.
+
+    Read manifest → append → ``write_manifest`` under a process-wide lock.
+    Raises ``FileNotFoundError`` if the scan does not exist."""
+    with _append_lock:
+        manifest = read_manifest(scan_id)
+        manifest = manifest.model_copy(
+            update={"captures": [*manifest.captures, capture]},
+        )
+        write_manifest(manifest)
+        return manifest
 
 
 def list_scans() -> list[Manifest]:
@@ -242,6 +265,59 @@ def delete_capture_media(capture_id: str) -> bool:
     return True
 
 
+def delete_scan_capture(scan_id: str, capture_id: str) -> Manifest:
+    """Remove a single capture from a stored scan and clean up related files.
+
+    The REST mirror of the device service's ``delete_capture`` command, but
+    for a scan in the catalog rather than the live session. Steps:
+
+      1. drop the matching entry from the manifest and persist it,
+      2. delete the capture's pool dir (original + thumbs + meta),
+      3. remove the materialized ``scans/<id>/photos/<basename>`` link and any
+         mask/preview derived from it,
+      4. delete the stale ``sfm_priors.json`` (poses changed — the next COLMAP
+         run regenerates it).
+
+    Raises ``FileNotFoundError`` when the scan or the capture is missing.
+    """
+    manifest = read_manifest(scan_id)
+    victim = next((c for c in manifest.captures if c.capture_id == capture_id), None)
+    if victim is None:
+        raise FileNotFoundError(f"capture {capture_id} in scan {scan_id}")
+
+    remaining = [c for c in manifest.captures if c.capture_id != capture_id]
+    manifest = manifest.model_copy(update={"captures": remaining})
+    write_manifest(manifest)
+
+    # Pool files (idempotent / OSError-tolerant).
+    delete_capture_media(capture_id)
+
+    sdir = _scan_dir(scan_id)
+    basename = _photo_filename(victim)
+    stem = basename[:-4]  # strip ".jpg"
+
+    # Materialized photo hard-link + this frame's mask/preview (written by
+    # colmap/masks/generate_colmap_masks.py next to the session).
+    doomed = [
+        sdir / "photos" / basename,
+        sdir / "masks" / f"{basename}.png",
+        sdir / "masks_preview" / f"{stem}_overlay.jpg",
+    ]
+    for p in doomed:
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+    # Poses changed → priors are stale; the next COLMAP run rewrites them.
+    try:
+        (sdir / "sfm_priors.json").unlink()
+    except OSError:
+        pass
+
+    return manifest
+
+
 def capture_path(capture_id: str, kind: str) -> Path:
     """kind ∈ {'full', 'thumb', 'thumb_small', 'thumb_tiny', 'meta'}."""
     if kind == "full":
@@ -266,6 +342,49 @@ def _photo_filename(capture: Capture) -> str:
     ``camera_adapter.photo_basename`` — keep this thin wrapper so the
     rest of storage.py reads naturally."""
     return photo_basename(capture.index, capture.az_deg, capture.el_deg)
+
+
+@dataclass(frozen=True)
+class PhotoMaterializeResult:
+    """Outcome of ``materialize_scan_photos``."""
+
+    linked: int
+    already_present: int
+    missing: int
+
+    @property
+    def ready(self) -> int:
+        return self.linked + self.already_present
+
+
+def materialize_scan_photos(scan_id: str) -> PhotoMaterializeResult:
+    """Link or copy capture originals into ``scans/<id>/photos/``.
+
+    Scans keep photos in the global ``captures/`` pool; COLMAP expects a
+    ``photos/*.jpg`` tree next to the session manifest (same layout as the
+    scan ZIP export). Hard-links when possible, copies as a fallback."""
+    manifest = read_manifest(scan_id)
+    photos_dir = _scan_dir(scan_id) / "photos"
+    photos_dir.mkdir(parents=True, exist_ok=True)
+    linked = already = missing = 0
+    for cap in manifest.captures:
+        dest = photos_dir / _photo_filename(cap)
+        if dest.is_file() and dest.stat().st_size > 0:
+            already += 1
+            continue
+        try:
+            src = capture_path(cap.capture_id, "full")
+        except FileNotFoundError:
+            missing += 1
+            continue
+        if dest.exists():
+            dest.unlink()
+        try:
+            os.link(src, dest)
+        except OSError:
+            shutil.copy2(src, dest)
+        linked += 1
+    return PhotoMaterializeResult(linked=linked, already_present=already, missing=missing)
 
 
 def build_scan_archive(scan_id: str) -> bytes:
@@ -326,3 +445,35 @@ def photo_path(scan_id: str, idx: int, kind: str) -> Path:
     if cap is None:
         raise FileNotFoundError(f"capture {idx} in scan {scan_id}")
     return capture_path(cap.capture_id, kind)
+
+
+def _masks_file(scan_id: str, idx: int, *, preview: bool) -> Path:
+    """File of one capture produced by the masks tool (mask PNG or overlay).
+
+    The tool writes next to the session — ``scans/<sid>/masks`` and
+    ``scans/<sid>/masks_preview`` — mirroring the materialized photo names
+    (see colmap/masks/README.md)."""
+    manifest = read_manifest(scan_id)
+    cap = next((c for c in manifest.captures if c.index == idx), None)
+    if cap is None:
+        raise FileNotFoundError(f"capture {idx} in scan {scan_id}")
+    basename = _photo_filename(cap)
+    sdir = _scan_dir(scan_id)
+    if preview:
+        p = sdir / "masks_preview" / f"{basename[:-4]}_overlay.jpg"
+    else:
+        p = sdir / "masks" / (basename + ".png")
+    if not p.is_file():
+        raise FileNotFoundError(str(p))
+    return p
+
+
+def photo_mask_path(scan_id: str, idx: int) -> Path:
+    """COLMAP mask PNG for one capture (white = features kept), if the masks
+    tool produced it."""
+    return _masks_file(scan_id, idx, preview=False)
+
+
+def photo_mask_preview_path(scan_id: str, idx: int) -> Path:
+    """Debug overlay JPEG (mask painted over the frame) for one capture."""
+    return _masks_file(scan_id, idx, preview=True)

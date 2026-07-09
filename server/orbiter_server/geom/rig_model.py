@@ -23,6 +23,7 @@ lengths etc. without round-tripping through the browser.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from functools import lru_cache
@@ -199,14 +200,29 @@ class RigModel:
 
 # ── module-level cache ──────────────────────────────────────────────────
 
-# Default path — sibling of the storage-api directory; override with
-# `ORBITER_RIG_GLB` env var if running from elsewhere.
-_DEFAULT_GLB = Path(__file__).resolve().parent.parent.parent / "Orbiter.glb"
+# Candidate locations for the CAD export, first hit wins. Override with the
+# `ORBITER_RIG_GLB` env var when running against a different export.
+_PKG_DIR = Path(__file__).resolve().parent.parent
+_GLB_CANDIDATES = (
+    _PKG_DIR / "assets" / "Orbiter.glb",                       # packaged asset
+    _PKG_DIR.parent / "Orbiter.glb",                           # server/ dev copy
+    _PKG_DIR.parent.parent / "cad" / "assembly" / "Orbiter.glb",  # repo checkout
+)
+
+
+def _default_glb() -> Path:
+    for p in _GLB_CANDIDATES:
+        if p.is_file():
+            return p
+    # Report the canonical location in the error — it exists in any checkout.
+    return _GLB_CANDIDATES[-1]
 
 
 @lru_cache(maxsize=2)
-def load_rig(glb_path: str | Path = _DEFAULT_GLB) -> RigModel:
+def load_rig(glb_path: str | Path | None = None) -> RigModel:
     """Cached loader. Call without args to use the bundled `Orbiter.glb`."""
+    if glb_path is None:
+        glb_path = os.environ.get("ORBITER_RIG_GLB") or _default_glb()
     path = Path(glb_path).resolve()
     if not path.is_file():
         raise FileNotFoundError(f"rig GLB not found: {path}")

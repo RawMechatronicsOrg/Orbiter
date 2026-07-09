@@ -48,6 +48,8 @@ typedef struct {
             float    el_deg;
             bool     has_az;
             bool     has_el;
+            uint32_t az_hz_max;     /* per-move AZ top step rate; 0 = fw default */
+            uint32_t el_hz_max;     /* per-move EL top step rate; 0 = fw default */
             uint32_t timeout_ms;
         } move;
         struct {

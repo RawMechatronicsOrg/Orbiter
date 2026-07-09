@@ -56,6 +56,22 @@ class MountTransform:
         """4x4 homogeneous transform."""
         return homogeneous(rotvec_to_matrix(self.rvec), self.t)
 
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "MountTransform | None":
+        """Build from the persisted `{"rvec": [...], "t": [...]}` form the
+        model stores (calib_extrinsic / rocker_correction / board_world).
+        None / malformed → None, so callers can fall back gracefully."""
+        if not d:
+            return None
+        try:
+            t = tuple(float(v) for v in d["t"])
+            rvec = tuple(float(v) for v in d["rvec"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if len(t) != 3 or len(rvec) != 3:
+            return None
+        return cls(t=t, rvec=rvec)  # type: ignore[arg-type]
+
 
 class RigGraph:
     """Thin query wrapper around a `TransformManager`. Every accessor takes a
@@ -97,18 +113,31 @@ def build_rig_graph(
     mount: MountTransform,
     turntable_axis: tuple[float, float] | None = None,
     board: MountTransform | None = None,
+    rocker: MountTransform | None = None,
 ) -> RigGraph:
     """Build the rig frame graph at a given encoder pose.
 
     `turntable_axis` offsets the azimuth rotation axis; `board`, when given,
     adds a `board` frame at its world placement so board-relative queries work.
+
+    `rocker` is the EL-axis correction solved by the hand-eye refine: the real
+    elevation axis is neither exactly horizontal nor through the AZ axis, so a
+    constant transform is inserted BEFORE the elevation rotation:
+    `T_el<-az = T_rocker · Ry(-el)`. Its observable DOF are the out-of-
+    horizontal tilt (rvec = (rx, 0, 0)) and the radial offset (t = (px, 0, 0)).
+    Everything else is degenerate: rotation about Z / translation along Z
+    commute with the azimuth spin and are absorbed by the board placement;
+    ry is an EL-zero shift and py lies along the EL axis — both absorbed by
+    the camera mount. None = the ideal axis (legacy behaviour, exact).
     """
     tm = TransformManager(strict_check=False)
 
     tm.add_transform(FRAME_AZ, FRAME_WORLD,
                      _az_about_axis(az_deg, turntable_axis or (0.0, 0.0)))
-    tm.add_transform(FRAME_EL, FRAME_AZ,
-                     homogeneous(el_matrix(el_deg), (0.0, 0.0, 0.0)))
+    el_edge = homogeneous(el_matrix(el_deg), (0.0, 0.0, 0.0))
+    if rocker is not None:
+        el_edge = rocker.as_matrix() @ el_edge
+    tm.add_transform(FRAME_EL, FRAME_AZ, el_edge)
     tm.add_transform(FRAME_CAMERA, FRAME_EL, mount.as_matrix())
     tm.add_transform(FRAME_CAMERA_OBJ, FRAME_CAMERA,
                      homogeneous(RX180, (0.0, 0.0, 0.0)))

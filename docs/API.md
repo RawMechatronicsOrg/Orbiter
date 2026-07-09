@@ -82,6 +82,8 @@ held open until both axes are within tolerance, or `timeout_ms` elapses.
 | `azimuth_deg` | float | no | unchanged | Any value. Firmware picks the shortest path on the circle. |
 | `elevation_deg` | float | no | unchanged | Must be in `[−25, +90]`. Out of range → 400. |
 | `timeout_ms` | int | no | 15000 | Returns `408` if not reached in time. |
+| `az_hz_max` | int | no | 0 | Per-move AZ top step rate (Hz). `0`/absent = compiled default; clamped to a safe band in firmware. The UI speed knobs flow in here. |
+| `el_hz_max` | int | no | 0 | Per-move EL top step rate (Hz). Same semantics as `az_hz_max`. |
 
 Omitting an axis leaves it at its current position.
 

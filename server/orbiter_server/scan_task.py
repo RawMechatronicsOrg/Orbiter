@@ -14,14 +14,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, TypeVar
 
-import camera_io
 import storage
+from camera_adapter import get_preset
+from config import settings
 from geom.pose import GeomParams, camera_pose_at
+from geom.rig import MountTransform
 from geom.scan_path import plan_scan_path
-from geom.transforms import quat_mul, roll_about_lens_quat
+from geom.transforms import (
+    quat_mul,
+    roll_about_lens_quat,
+    stored_pixel_quat,
+)
 from models import (
     Capture,
     CaptureMeta,
@@ -36,6 +43,7 @@ from models import (
     ScanSummary,
     Vec3,
 )
+import camera_io
 from orbiter_model import model
 
 log = logging.getLogger("orbiter.scan")
@@ -57,16 +65,52 @@ def scan_lock() -> asyncio.Lock:
 #: camera's auto-exposure a beat so flash frames are not stale.
 _ACTION_SETTLE_S = 0.2
 
+# Transient-failure policy: a phone/ESP hiccup must
+# not kill a 30-minute sweep. Each move/capture gets `_OP_ATTEMPTS` tries
+# with growing backoff; a point that still fails is RECORDED (manifest
+# `failed_points`) and skipped. Only `_MAX_CONSECUTIVE_FAILED_POINTS` points
+# failing in a row — the rig genuinely down, retrying the rest is pointless
+# wear — aborts the scan.
+_OP_ATTEMPTS = 3
+_OP_BACKOFF_S = (1.0, 3.0)
+_MAX_CONSECUTIVE_FAILED_POINTS = 3
+
+_T = TypeVar("_T")
+
+
+async def _with_retries(op_name: str, fn: Callable[[], Awaitable[_T]]) -> _T:
+    """Run ``fn`` with the transient-failure policy; raises the LAST error
+    after `_OP_ATTEMPTS` tries."""
+    for attempt in range(1, _OP_ATTEMPTS + 1):
+        try:
+            return await fn()
+        except Exception as exc:  # noqa: BLE001 — every failure mode retries
+            if attempt == _OP_ATTEMPTS:
+                raise
+            delay = _OP_BACKOFF_S[min(attempt - 1, len(_OP_BACKOFF_S) - 1)]
+            log.warning("%s failed (attempt %d/%d): %s — retrying in %.0fs",
+                        op_name, attempt, _OP_ATTEMPTS, exc, delay)
+            await asyncio.sleep(delay)
+    raise AssertionError("unreachable")
+
 
 def _geom_params() -> GeomParams:
+    # Calibrated mount X + rocker when available — capture poses (and the
+    # SfM priors built from them) must come from the same calibrated chain
+    # the solver verified, not the manual fallback model.
     return GeomParams(
-        extrinsic=None,
+        extrinsic=MountTransform.from_dict(getattr(model, "calib_extrinsic", None)),
         arm_radius=max(model.arm_radius_mm, 1.0),
         camera_offset=model.camera_offset_mm,
         # Tilt zeroed — see scene_graph._geom_params for the rationale.
         camera_tilt=0.0,
         camera_pan=model.camera_pan_deg,
         turntable_axis=getattr(model, "turntable_axis", None),
+        rocker=MountTransform.from_dict(getattr(model, "rocker_correction", None)),
+        az_harm=(tuple(model.az_encoder_correction)
+                 if settings.az_harmonic_enabled
+                 and getattr(model, "az_encoder_correction", None) else None),
+        el_scale=getattr(model, "el_encoder_scale", None),
     )
 
 
@@ -91,15 +135,25 @@ async def _capture_at(
     pose = camera_pose_at(az_act, el_act, geom)
     raw = await camera_io.fetch_photo(el_deg=el_act)
 
-    # Bank the stored camera orientation by the live bracket roll — the slight
-    # ~5° tilt of the non-rigid mount about the optical axis — so the capture
-    # reflects the camera's TRUE attitude. Uses the SAME helper as the live
-    # frustum bank, so a captured frustum lands on the live camera exactly
-    # (position + orientation). Honest for SfM too. Skipped if the IMU is offline.
+    # Bank the stored camera orientation by the live bracket roll — ONLY on
+    # the manual-model path. The calibrated mount X already carries the
+    # phone's real roll (it is part of the solved orientation); banking on
+    # top of it would rotate the stored pose ~2× off the truth (the same
+    # double-counting that put the live frustum 90° off the camera body).
     cam_quat = pose.camera_quat
     roll = model.phone_roll_deg
-    if cam_quat is not None and model.phone_sensor_online and roll is not None:
+    if (geom.extrinsic is None and cam_quat is not None
+            and model.phone_sensor_online and roll is not None):
         cam_quat = quat_mul(cam_quat, roll_about_lens_quat(roll))
+
+    # The solved pose lives in the SENSOR frame, but original.jpg is saved
+    # AFTER the preset's quarter-turn rotation (e.g. sm22 -> 90 deg CW).
+    # Re-express the quaternion in the stored-pixel frame so the manifest
+    # matches the pixels — frustum renderers and the SfM priors exporter
+    # both rely on that invariant.
+    preset = get_preset(model.camera_preset)
+    if cam_quat is not None:
+        cam_quat = stored_pixel_quat(cam_quat, preset.extra_cw_quarter_turns)
 
     meta = CaptureMeta(
         index=index,
@@ -109,6 +163,7 @@ async def _capture_at(
         look_at_xyz_mm=_vec3(pose.look_at_xyz_mm),
         optical_axis_unit=_vec3(pose.optical_axis_unit),
         camera_quat=list(cam_quat) if cam_quat else None,
+        quat_frame="stored" if cam_quat else None,
         timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         planned_az_deg=planned_az,
         planned_el_deg=planned_el,
@@ -212,13 +267,22 @@ def _now() -> str:
 def _build_manifest() -> Manifest:
     """The active scan's manifest: the on-disk base (created / path / params /
     geometry / motion_plan — fixed at scan creation) with the live captures
-    and notes merged in."""
+    and failed points merged in.
+
+    Fields this session did not touch stay as they are on disk — notes/tags
+    can be edited concurrently through the REST catalog routes, and a
+    wholesale overwrite from memory is a lost-update bug. ``notes`` is taken
+    from the model only when it was actually edited in the Scaner UI this
+    session."""
     base = storage.read_manifest(model.current_scan_id)
-    return base.model_copy(update={
+    update: dict[str, Any] = {
         "machine_captured": model.machine_captured,
         "captures": [Capture.model_validate(c) for c in model.captures],
-        "notes": model.scan_notes,
-    })
+        "failed_points": list(model.scan_failed_points),
+    }
+    if model.scan_notes_edited:
+        update["notes"] = model.scan_notes
+    return base.model_copy(update=update)
 
 
 def _write_active_manifest() -> None:
@@ -245,11 +309,28 @@ def _mark_dirty() -> None:
         _dirty_event.set()
 
 
+async def _persist_capture_now() -> None:
+    """Write-through: make the just-appended capture durable immediately.
+
+    The debounce-only manifest left a ≤4 s crash window in which pool bytes
+    existed but their manifest records did not (the orphaned-captures class
+    of bugs). A manifest rewrite is a few-ms `to_thread`
+    write at our rates — do it per capture; the debounced autosave stays for
+    notes typing. On failure fall back to marking dirty (the autosave loop
+    retries)."""
+    try:
+        await asyncio.to_thread(_write_active_manifest)
+        model.update(scan_dirty=False, scan_saved_at=_now())
+    except Exception:  # noqa: BLE001 — never let persistence kill the sweep
+        log.exception("write-through manifest save failed — autosave will retry")
+        _mark_dirty()
+
+
 def publish_scan_list() -> None:
     """Refresh ``model.scans`` (the Library's ONLY data source) from the
     on-disk scans. Nothing else populates it, so without this saved scans
     never appear in the Library even though they ARE on disk. Cheap — one
-    ``list_scans`` — call at startup and after any scan-list mutation
+    ``list_scans`` call — at startup and after any scan-list mutation
     (save / new / delete / archive)."""
     summaries = [
         ScanSummary(
@@ -294,6 +375,8 @@ async def new_active_scan(machine_captured: bool = False) -> dict[str, Any]:
         machine_captured=machine_captured,
         captures=[],
         scan_notes="",
+        scan_notes_edited=False,
+        scan_failed_points=[],
         scan_progress=0,
         scan_total=total,
         scan_dirty=False,
@@ -318,7 +401,7 @@ async def recreate_active_scan() -> dict[str, Any]:
 
 async def _autosave_loop(dirty: asyncio.Event) -> None:
     """Debounced autosave: once the active scan goes dirty, wait for a quiet
-    `_AUTOSAVE_DEBOUNCE_S` window (so a burst of captures coalesces into one
+    `_AUTOSAVE_DEBOUNCE_S` window (so a burst of edits coalesces into one
     write) then persist the manifest."""
     while True:
         await dirty.wait()
@@ -347,7 +430,9 @@ def start_autosave() -> None:
 
 
 async def stop_autosave() -> None:
-    """Cancel the autosave loop — called from the app lifespan shutdown."""
+    """Cancel the autosave loop and FLUSH a dirty active scan — called from
+    the app lifespan shutdown. Without the flush even a graceful Ctrl-C
+    inside the debounce window lost the last captures' manifest records."""
     global _autosave_task
     if _autosave_task is not None:
         _autosave_task.cancel()
@@ -356,6 +441,13 @@ async def stop_autosave() -> None:
         except asyncio.CancelledError:
             pass
         _autosave_task = None
+    if model.scan_dirty and model.current_scan_id:
+        try:
+            await save_active_scan()
+            log.info("shutdown flush: saved dirty scan %s", model.current_scan_id)
+        except Exception:  # noqa: BLE001 — shutdown must not raise
+            log.exception("shutdown flush failed for scan %s",
+                          model.current_scan_id)
 
 
 # ── scan execution (discrete sweep) ─────────────────────────────────────────
@@ -385,13 +477,38 @@ async def _capture_with_action(
                 log.exception("failed to turn torch off after capture")
 
 
+def _record_failed_point(
+    point: ScanPathPoint, stage: str, exc: Exception,
+) -> None:
+    """Append one skipped point to the model's failed-points list (persisted
+    as manifest ``failed_points`` on the next write)."""
+    entry = {
+        "index": point.index,
+        "az_deg": point.az_deg,
+        "el_deg": point.el_deg,
+        "stage": stage,
+        "error": str(exc)[:300] or type(exc).__name__,
+        "timestamp": _now(),
+    }
+    model.update(scan_failed_points=[*model.scan_failed_points, entry])
+    log.error("scan point %d (az=%.1f el=%.1f) FAILED at %s after retries: %s "
+              "— skipping the point, sweep continues",
+              point.index, point.az_deg, point.el_deg, stage, entry["error"])
+
+
 async def _run_discrete(scan_id: str, plan: DiscretePlan) -> None:
-    """Discrete loop: ring-grid points × per-point actions."""
+    """Discrete loop: ring-grid points × per-point actions.
+
+    Transient camera/ESP failures retry (`_with_retries`); a point that
+    still fails is recorded in `failed_points` and SKIPPED — one hiccup must
+    not discard the rest of a 30-minute sweep. Only
+    `_MAX_CONSECUTIVE_FAILED_POINTS` failures in a row abort the scan."""
     path = plan_scan_path(
         plan.el_start_deg, plan.el_max_deg, plan.el_steps, plan.az_step_deg,
     )
     actions: list[str] = list(plan.actions) or ["photo"]
     captures: list[dict[str, Any]] = []
+    consecutive_failed = 0
     log.info("discrete scan %s started — %d points × %d actions",
              scan_id, len(path), len(actions))
     for point in path:
@@ -399,19 +516,55 @@ async def _run_discrete(scan_id: str, plan: DiscretePlan) -> None:
             log.info("scan %s aborted at point %d/%d",
                      scan_id, point.index, len(path))
             break
-        await esp_move(point.az_deg, point.el_deg)
+
+        try:
+            await _with_retries(
+                f"move to az={point.az_deg:.1f} el={point.el_deg:.1f}",
+                lambda p=point: esp_move(p.az_deg, p.el_deg),
+            )
+        except Exception as exc:  # noqa: BLE001 — point failure, not scan failure
+            _record_failed_point(point, "move", exc)
+            await _persist_capture_now()
+            consecutive_failed += 1
+            if consecutive_failed >= _MAX_CONSECUTIVE_FAILED_POINTS:
+                raise RuntimeError(
+                    f"{consecutive_failed} consecutive points failed — "
+                    "rig looks down, aborting the scan"
+                ) from exc
+            continue
+
+        point_ok = True
         for action in actions:
             if _abort.is_set():
                 break
-            cap = await _capture_with_action(
-                scan_id, len(captures), point.az_deg, point.el_deg, action,
-            )
+            try:
+                cap = await _with_retries(
+                    f"capture {action} @ point {point.index}",
+                    lambda p=point, a=action, i=len(captures):
+                        _capture_with_action(scan_id, i, p.az_deg, p.el_deg, a),
+                )
+            except Exception as exc:  # noqa: BLE001 — skip this point's action
+                _record_failed_point(point, action, exc)
+                await _persist_capture_now()
+                point_ok = False
+                break
             captures.append(cap)
             model.update(
                 scan_progress=len(captures),
                 captures=list(captures),
             )
-            _mark_dirty()
+            # Write-through: the capture is durable the moment it exists.
+            await _persist_capture_now()
+
+        if point_ok:
+            consecutive_failed = 0
+        else:
+            consecutive_failed += 1
+            if consecutive_failed >= _MAX_CONSECUTIVE_FAILED_POINTS:
+                raise RuntimeError(
+                    f"{consecutive_failed} consecutive points failed — "
+                    "rig looks down, aborting the scan"
+                )
 
 
 async def _run_motion_plan(scan_id: str, plan: MotionPlan) -> None:
@@ -491,5 +644,6 @@ async def take_shot() -> dict[str, Any]:
         capture = await _capture_at(scan_id, len(captures), None, None)
         captures.append(capture)
         model.update(captures=captures)
-        _mark_dirty()
+        # Write-through: durable immediately (same policy as the scan loop).
+        await _persist_capture_now()
         return {"scan_id": scan_id, "capture_id": capture["capture_id"]}

@@ -1,0 +1,13 @@
+# SAM2 mask generation for COLMAP (generate_colmap_masks.py).
+# GPU (CUDA) strongly recommended; CPU works as a slow fallback.
+#
+# torch: install the CUDA build FIRST from the PyTorch index — a plain
+# `pip install torch` resolves the CPU wheel. RTX 50xx (Blackwell, sm_120)
+# needs cu128+ (torch >= 2.7):
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# then:
+#     pip install -r requirements.txt --no-build-isolation
+opencv-python-headless>=4.9
+numpy>=1.26
+torch>=2.7
+sam2>=1.1

@@ -1,4 +1,4 @@
-# Orbiter v0.1 — Docker stack
+# Orbiter — Docker stack
 
 This directory holds the Compose configuration that ties the **server**,
 **UI**, and the optional **COLMAP** container together.

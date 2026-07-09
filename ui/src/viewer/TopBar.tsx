@@ -3,12 +3,13 @@
 import { useViewerStore } from './modelStore';
 import type { ConnState } from './WsClient';
 import type { Commands } from './commands';
+import type { ViewerTab } from './uiStore';
 import { cls, num } from './ui';
 import { TabsList, TabsTrigger } from '../components/ui/tabs';
 import { Button } from '../components/ui/button';
 
-/** The top-level views of the app. */
-export type ViewerTab = 'scaner' | 'library' | 'help';
+/** Re-export for existing importers — the type now lives in the uiStore. */
+export type { ViewerTab } from './uiStore';
 
 const TABS: ReadonlyArray<readonly [ViewerTab, string]> = [
   ['scaner', 'Scaner'],

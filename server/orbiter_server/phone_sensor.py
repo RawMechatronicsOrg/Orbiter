@@ -1,7 +1,8 @@
 """Phone IMU poller — reads orientation from the IP Webcam app on the
-camera phone and pushes the derived tilt into `model.phone_pitch_deg` /
-`model.phone_roll_deg` so the UI can show where the lens is actually
-pointing, independent of the rig's encoder pose.
+camera phone and publishes the rig-frame elevation estimate
+(`model.phone_el_deg`), the raw lens pitch (`model.phone_lens_pitch_deg`)
+and the bank about the lens axis (`model.phone_roll_deg`), so the UI can
+show where the lens is actually pointing independent of the encoders.
 
 We poll `{camera_url}/sensors.json` at a few Hz. The endpoint returns a
 rolling buffer; we use the last sample only.
@@ -12,18 +13,16 @@ fusion filters out linear acceleration. Format from IP Webcam:
 `data = [[ts_ms, [qx, qy, qz, qw, accuracy]], …]` where
 (qx, qy, qz, qw) rotates *device-frame vectors into world frame*.
 
-Pitch above horizon — the phone is mounted so its long edge (device +Y,
-toward the top of the phone) runs along the OrbitArm. So the "where the
-camera points" direction for EL purposes is device +Y, not device -Z
-(which is the physical lens normal, perpendicular to the arm in this
-mount). After rotating device +Y into the world:
-    arm_world.z = R·(0,1,0) → 2·qy·qz + 2·qw·qx
-    pitch_deg = asin(arm_world.z) · 180/π
+The mount convention behind the navball phone marker — the single source of
+truth for "phone angle → rig EL":
 
-Roll about the arm axis (signed angle of world-up in device XZ plane,
-since the arm is along device-Y so the perpendicular plane is XZ):
-    world_up_in_device = Rᵀ·(0,0,1) → (2xz+2wy, …, 1-2x²-2y²)
-    roll_deg = atan2(2xz + 2wy, 1 - 2x² - 2y²) · 180/π
+    lens ⊥ arm;  rig.el = lens_pitch + 90
+    lens_pitch = -90°  ⇔  arm horizontal, lens straight down  ⇔  el = 0°
+    lens_pitch =   0°  ⇔  arm vertical,  lens horizontal      ⇔  el = 90°
+
+`phone_el_deg` is exactly that mapping applied server-side. It is a redundant
+EL indicator on the navball only — the UI must NOT re-derive it, and EL
+zeroing is done manually (firmware Zero EL), not from this value.
 
 Fallback: if rot_vector is missing (older Android, sensor disabled in the
 IP Webcam app), fall back to raw accel — less accurate but still useful.
@@ -57,14 +56,11 @@ _FETCH_TIMEOUT_S = 1.5
 #: If we go this long with no successful fetch, flip phone_sensor_online to
 #: False so the UI hides the marker (the value is stale).
 _OFFLINE_AFTER_S = 4.0
-#: Mount offset (deg) subtracted from the raw device-Y pitch so the navball's
-#: phone marker reads in the rig EL frame (lens roughly horizontal ⇒ ~0°). The
-#: phone sits rotated ~90° relative to this formula's nominal axes (its measured
-#: roll is ~90°), so the raw pitch is ~90° off the EL convention; subtracting it
-#: makes the marker track `el`. Empirically set against the reference rig.
-#: NOTE: only `phone_pitch_deg` (the navball readout) gets this offset;
-#: `phone_lens_pitch_deg` (used by `align_el_to_phone`) is left untouched.
-_PITCH_MOUNT_OFFSET_DEG = 90.0
+#: Mount mapping lens_pitch → rig EL (deg): this rig mounts the lens ⊥ to the
+#: arm, so el = lens_pitch + 90 (lens straight down at el=0, horizontal at
+#: el=90). The SAME constant the encoder auto-zero / align command uses — keep
+#: them identical or the navball marker and the zeroing will disagree.
+LENS_TO_EL_OFFSET_DEG = 90.0
 
 
 class PhoneSensor:
@@ -105,8 +101,8 @@ class PhoneSensor:
         # The loop already re-reads self._url each tick, so there's nothing
         # else to cancel/restart — just reset the online flag.
         if not new_url:
-            model.update(phone_sensor_online=False,
-                         phone_pitch_deg=None, phone_roll_deg=None)
+            model.update(phone_sensor_online=False, phone_el_deg=None,
+                         phone_lens_pitch_deg=None, phone_roll_deg=None)
 
     # ── poll ────────────────────────────────────────────────────────────────
 
@@ -120,47 +116,39 @@ class PhoneSensor:
                 if not url_base:
                     continue
                 try:
-                    pitch, lens_pitch, roll = await self._fetch_tilt(
-                        client, url_base,
-                    )
+                    lens_pitch, roll = await self._fetch_tilt(client, url_base)
                 except Exception as exc:  # noqa: BLE001
                     if model.phone_sensor_online:
                         log.warning("phone sensor fetch failed: %s", exc)
                     elapsed = asyncio.get_running_loop().time() - last_ok
                     if elapsed > _OFFLINE_AFTER_S and (
                         model.phone_sensor_online
-                        or model.phone_pitch_deg is not None
+                        or model.phone_el_deg is not None
                     ):
                         model.update(phone_sensor_online=False,
-                                     phone_pitch_deg=None,
+                                     phone_el_deg=None,
                                      phone_lens_pitch_deg=None,
                                      phone_roll_deg=None)
                     continue
                 last_ok = asyncio.get_running_loop().time()
                 model.update(
                     phone_sensor_online=True,
-                    phone_pitch_deg=pitch,
+                    phone_el_deg=lens_pitch + LENS_TO_EL_OFFSET_DEG,
                     phone_lens_pitch_deg=lens_pitch,
                     phone_roll_deg=roll,
                 )
 
     async def _fetch_tilt(
         self, client: httpx.AsyncClient, url_base: str,
-    ) -> tuple[float, float, float]:
-        """Return (pitch_deg, lens_pitch_deg, roll_deg) from the latest
-        sensor sample — rot_vector if available, accel as fallback.
+    ) -> tuple[float, float]:
+        """Return (lens_pitch_deg, roll_deg) from the latest sensor sample —
+        rot_vector if available, accel as fallback.
 
-        Phone is in **landscape** mount: arm runs along the short edge
-        (device ±X) and tilting the rig EL rotates the phone about its
-        device-Y axis. So:
-
-          * pitch     — full-range tilt angle about device-Y (atan2 form,
-                        continuous through ±90°, no gimbal lock here).
-                        Goes to the navball.
           * lens_pitch — elevation of the back-camera optical axis (device
-                         -Z) above the world horizon. Used by
-                         `align_el_to_phone` so rig.el == 0 ⇒ lens
-                         horizontal.
+                         -Z) above the world horizon. The ONLY tilt input:
+                         `phone_el_deg` (navball marker, encoder auto-zero,
+                         align command) is derived from it via
+                         `LENS_TO_EL_OFFSET_DEG`.
           * roll      — bank about the OPTICAL axis (device −Z); the slight
                         bracket tilt. Drives the live frustum bank.
         """
@@ -178,13 +166,6 @@ class PhoneSensor:
                 qx, qy, qz, qw = (float(sample[i]) for i in range(4))
                 qmag2 = qx * qx + qy * qy + qz * qz + qw * qw
                 if 0.95 <= qmag2 <= 1.05:
-                    # pitch = atan2 form that tracks the tilt rotation
-                    # about device-Y across the full range; shifted into the
-                    # rig EL frame by the mount offset (see _PITCH_MOUNT_OFFSET_DEG).
-                    pitch = math.degrees(math.atan2(
-                        2 * qx * qz + 2 * qw * qy,
-                        1 - 2 * qx * qx - 2 * qy * qy,
-                    )) - _PITCH_MOUNT_OFFSET_DEG
                     # lens_pitch: world-z of R·(0,0,-1) → 2x² + 2y² - 1.
                     lens = max(-1.0, min(1.0, 2 * qx * qx + 2 * qy * qy - 1))
                     lens_pitch = math.degrees(math.asin(lens))
@@ -198,11 +179,10 @@ class PhoneSensor:
                         2 * qx * qz - 2 * qw * qy,
                         2 * qy * qz + 2 * qw * qx,
                     ))
-                    return pitch, lens_pitch, roll
+                    return lens_pitch, roll
 
         # Fallback: raw accel. accel/|A| = world-up in device frame
-        # (third row of R). pitch = atan2(ax, az) tracks Y-rotation;
-        # lens_pitch uses az; roll uses ay.
+        # (third row of R). lens_pitch uses az; roll uses ay.
         accel = (data.get("accel") or {}).get("data") or []
         if not accel:
             raise RuntimeError("no rot_vector and no accel samples")
@@ -213,10 +193,9 @@ class PhoneSensor:
         mag = math.sqrt(ax * ax + ay * ay + az * az)
         if mag < 1.0:
             raise RuntimeError(f"accel magnitude too small: {mag:.3f}")
-        pitch = math.degrees(math.atan2(ax, az)) - _PITCH_MOUNT_OFFSET_DEG
         lens_pitch = math.degrees(math.asin(max(-1.0, min(1.0, -az / mag))))
         roll = math.degrees(math.atan2(ax, ay))  # bank about the optical axis
-        return pitch, lens_pitch, roll
+        return lens_pitch, roll
 
 
 # Process-wide singleton — same pattern as the other lifespan-managed bits.

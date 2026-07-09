@@ -172,7 +172,11 @@ const pointCloudFactory: NodeFactory = {
       geo,
       new THREE.PointsMaterial({
         size: props?.pointSize ?? 3,
-        color: new THREE.Color((props?.color as string) ?? '#ffffff'),
+        // three.js multiplies per-vertex colour by material.color when
+        // vertexColors is on, so a non-white tint washes out a cloud that
+        // ships real RGB (COLMAP fusions do). Use `props.color` only as the
+        // solid fallback for a colourless cloud; stay neutral otherwise.
+        color: new THREE.Color(hasColors ? '#ffffff' : ((props?.color as string) ?? '#ffffff')),
         vertexColors: hasColors,
         sizeAttenuation: true,
       }),

@@ -19,7 +19,7 @@
  *    closed-loop, no steps-per-degree calibration).
  */
 
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { useViewerStore } from './modelStore';
 import type { Commands } from './commands';
 import { num } from './ui';
@@ -39,7 +39,7 @@ const CAL_PRESETS: ReadonlyArray<readonly [CalPreset, string, string]> = [
 ];
 
 /** Common OpenCV predefined ArUco dictionaries, by their `cv2.aruco.DICT_*`
- *  integer id. The board defaults to DICT_4X4_50 (id 0). */
+ *  integer id. The board defaults to DICT_5X5_100 (id 5). */
 const ARUCO_DICTS: ReadonlyArray<readonly [number, string]> = [
   [0, 'DICT_4X4_50'],
   [1, 'DICT_4X4_100'],
@@ -123,6 +123,84 @@ const BoardNumberRow = ({
   </label>
 );
 
+/** Per-axis speed-knob ranges (Hz). Must match the server clamp in
+ *  commands.py (`_MOVE_HZ_BOUNDS`) so the slider can never request a value the
+ *  server would reject. AZ is the light axis (fast); EL carries the whole arm,
+ *  so it's capped lower to keep sweeps from over-shooting. Defaults match the
+ *  doubled firmware caps (CL_HZ_MAX_AZ/EL). */
+const SPEED_KNOBS = {
+  az: { min: 100, max: 4000, step: 50, def: 2100 },
+  el: { min: 50, max: 1000, step: 25, def: 350 },
+} as const;
+
+/** A motion-speed slider with a live Hz readout. Smooth while dragging (local
+ *  draft), debounced commit to the server, and re-syncs from the model when the
+ *  field is "clean" — the same dirty-flag pattern as the board inputs above. */
+function SpeedKnob({
+  label,
+  hint,
+  value,
+  min,
+  max,
+  step,
+  onCommit,
+}: {
+  label: string;
+  hint: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  onCommit: (v: number) => void;
+}) {
+  const [draft, setDraft] = useState<number>(value);
+  const [dirty, setDirty] = useState<boolean>(false);
+  const timer = useRef<number | null>(null);
+
+  // Re-sync from the model while the user isn't actively dragging (handles
+  // late hydration + the server's clamped echo).
+  useEffect(() => {
+    if (!dirty) setDraft(value);
+  }, [value, dirty]);
+
+  // Flush any pending debounce on unmount.
+  useEffect(
+    () => () => {
+      if (timer.current) window.clearTimeout(timer.current);
+    },
+    [],
+  );
+
+  const onSlide = (v: number) => {
+    setDraft(v);
+    setDirty(true);
+    if (timer.current) window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => {
+      onCommit(v);
+      setDirty(false);
+    }, 160);
+  };
+
+  return (
+    <div className="mb-2">
+      <div className="flex items-baseline justify-between">
+        <span className="text-[13px] text-inkdim">{label}</span>
+        <span className="font-mono text-[13px] text-ink">{draft} Hz</span>
+      </div>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={draft}
+        onChange={(e) => onSlide(Number(e.target.value))}
+        className="w-full cursor-pointer accent-accent"
+      />
+      <div className="text-[11px] text-inkmute">{hint}</div>
+    </div>
+  );
+}
+
 // UI-side heuristic: when *Calibrate from board* is pressed we have no
 // progress channel from server back yet, so we just keep the button
 // disabled for this long and trust the WS `model` update to refresh
@@ -192,13 +270,22 @@ export function MachineConfig({ commands }: { commands: Commands }) {
   const camTilt    = useViewerStore((s) => num(s.model, 'camera_tilt_deg', 0));
   const camPan     = useViewerStore((s) => num(s.model, 'camera_pan_deg', 0));
 
-  const boardSx    = useViewerStore((s) => num(s.model, 'charuco_squares_x', 5));
-  const boardSy    = useViewerStore((s) => num(s.model, 'charuco_squares_y', 7));
-  const boardSq    = useViewerStore((s) => num(s.model, 'charuco_square_length_mm', 30));
-  const boardMk    = useViewerStore((s) => num(s.model, 'charuco_marker_length_mm', 15));
-  // aruco_dict_id may be absent on older persisted state — default to 0
-  // (DICT_4X4_50), matching the server's default board.
-  const boardDict  = useViewerStore((s) => num(s.model, 'aruco_dict_id', 0));
+  // Per-axis closed-loop top step rate (Hz) — the speed knobs. Defaults match
+  // the doubled firmware caps until the server pushes the persisted values.
+  const moveHzAz = useViewerStore((s) => num(s.model, 'move_hz_max_az', SPEED_KNOBS.az.def));
+  const moveHzEl = useViewerStore((s) => num(s.model, 'move_hz_max_el', SPEED_KNOBS.el.def));
+
+  // Encoder-zero block: the live EL, so the operator can see what value is
+  // about to become the new zero.
+  const liveEl = useViewerStore((s) => num(s.model, 'el', 0));
+
+  const boardSx    = useViewerStore((s) => num(s.model, 'charuco_squares_x', 8));
+  const boardSy    = useViewerStore((s) => num(s.model, 'charuco_squares_y', 8));
+  const boardSq    = useViewerStore((s) => num(s.model, 'charuco_square_length_mm', 36));
+  const boardMk    = useViewerStore((s) => num(s.model, 'charuco_marker_length_mm', 26.64));
+  // aruco_dict_id may be absent on older persisted state — default to 5
+  // (DICT_5X5_100), matching the server's default board.
+  const boardDict  = useViewerStore((s) => num(s.model, 'aruco_dict_id', 5));
 
   // Editable board drafts. Seeded from the model and re-synced whenever the
   // server pushes a change AND the field is still "clean" (same dirty-flag
@@ -408,6 +495,35 @@ export function MachineConfig({ commands }: { commands: Commands }) {
         )}
       </CardContent>
 
+      {/* ── motion speed — the per-axis closed-loop top step rate knobs ── */}
+      <Collapsible title="Motion speed" defaultOpen>
+        <CardContent>
+          <SpeedKnob
+            label="AZ max"
+            hint="Azimuth (turntable) — light axis, runs fast."
+            value={moveHzAz}
+            min={SPEED_KNOBS.az.min}
+            max={SPEED_KNOBS.az.max}
+            step={SPEED_KNOBS.az.step}
+            onCommit={(v) => commands.setMoveSpeed(v, undefined)}
+          />
+          <SpeedKnob
+            label="EL max"
+            hint="Elevation (arm) — carries the whole arm; keep moderate to avoid over-shoot."
+            value={moveHzEl}
+            min={SPEED_KNOBS.el.min}
+            max={SPEED_KNOBS.el.max}
+            step={SPEED_KNOBS.el.step}
+            onCommit={(v) => commands.setMoveSpeed(undefined, v)}
+          />
+          <div className="mt-1 text-[11px] text-inkmute">
+            Closed-loop top step rate (Hz) capping every move — manual jog,
+            calibration sweep, and scan. Sent to the firmware with each move;
+            0/blank would fall back to the firmware default.
+          </div>
+        </CardContent>
+      </Collapsible>
+
       {/* ── derived geometry — collapsed (read-only result of Step 2) ── */}
       <Collapsible title="Geometry (derived)">
         <CardContent>
@@ -480,6 +596,33 @@ export function MachineConfig({ commands }: { commands: Commands }) {
           >
             Apply endpoints
           </Button>
+        </CardContent>
+      </Collapsible>
+
+      {/* ── encoder zero — collapsed ── */}
+      <Collapsible title="Encoder zero">
+        <CardContent>
+          <div className="text-[12px] text-inkdim">
+            Level the arm horizontally, then press <b>Zero EL</b>: the firmware
+            records the current elevation as 0. Do this once after assembly —
+            it only rewrites the encoder zero offset, nothing moves.
+          </div>
+          <div className="rounded-md border border-cardline bg-black/20 px-2.5 py-1.5 font-mono text-[12px]">
+            <div className="flex justify-between">
+              <span className="text-inkmute">rig el (now)</span>
+              <span className="text-zinc-100">{liveEl.toFixed(1)}°</span>
+            </div>
+          </div>
+          <Button
+            onClick={() => commands.calibrate('el', 'current')}
+            title="Record the current elevation as 0"
+          >
+            Zero EL
+          </Button>
+          <div className="mt-1 text-[11px] text-inkmute">
+            After pressing, rig el reads ~0°. Required before a calibration
+            sweep so the arm stays in its physical range.
+          </div>
         </CardContent>
       </Collapsible>
 

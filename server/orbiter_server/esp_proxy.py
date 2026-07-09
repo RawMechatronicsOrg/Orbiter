@@ -484,6 +484,16 @@ class EspProxy:
             body["azimuth_deg"] = azimuth_deg
         if elevation_deg is not None:
             body["elevation_deg"] = elevation_deg
+        # Per-axis top step rate from the operator speed knobs (model state).
+        # The firmware reads 0/absent as "use the compiled default cap", so
+        # only forward positive values. Sent on every move so the device never
+        # drifts from the model — no separate push/reconnect handshake.
+        az_hz = int(getattr(self.model, "move_hz_max_az", 0) or 0)
+        el_hz = int(getattr(self.model, "move_hz_max_el", 0) or 0)
+        if az_hz > 0:
+            body["az_hz_max"] = az_hz
+        if el_hz > 0:
+            body["el_hz_max"] = el_hz
         return await self._post("/move", body)
 
     async def move_and_await(

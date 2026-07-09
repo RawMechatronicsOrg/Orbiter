@@ -1,7 +1,7 @@
-# Orbiter v0.1 UI
+# Orbiter UI
 
 Slim Vite + React + three.js front-end for the Orbiter photogrammetry rig.
-This is the v0.1 slice — only the two tabs the operator needs to drive a
+This is the kit slice — only the two tabs the operator needs to drive a
 camera-only photogrammetry pass:
 
 - **Scaner** — live 3D view of the rig, motion controls (jog, absolute
@@ -50,8 +50,8 @@ npx tsc --noEmit
 ## Production build (Docker)
 
 ```bash
-docker build -t orbiter-v0.1-ui .
-docker run --rm -p 8080:80 orbiter-v0.1-ui
+docker build -t orbiter-ui .
+docker run --rm -p 8080:80 orbiter-ui
 # open http://localhost:8080
 ```
 
@@ -61,7 +61,7 @@ nginx config is enough — no custom routing needed for the SPA.
 
 ## COLMAP integration
 
-Not in v0.1. Each scan row in the Library tab has a placeholder "Run
+Not in the kit yet. Each scan row in the Library tab has a placeholder "Run
 COLMAP" button that's disabled with a tooltip pointing to v0.2. The
 adjacent "Export SfM priors" button does work — it POSTs to
 `/scans/{sid}/sfm_priors` on the storage-api, which writes a JSON sidecar

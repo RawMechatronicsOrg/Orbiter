@@ -46,6 +46,11 @@ motion_pos_t motion_get_position(void);
  * @param el_deg      Target elevation (ignored if has_el == false)
  * @param has_az      Move azimuth axis
  * @param has_el      Move elevation axis
+ * @param az_hz_max   AZ top step rate for this move (0 = compiled default
+ *                    CL_HZ_MAX_AZ); clamped to a safe range. The UI speed
+ *                    knobs flow in here via the server.
+ * @param el_hz_max   EL top step rate for this move (0 = compiled default
+ *                    CL_HZ_MAX_EL); clamped to a safe range.
  * @param timeout_ms  Max wait time (0 = use the internal hard ceiling)
  * @param out         Final position written here (may differ from target on timeout)
  *
@@ -55,6 +60,7 @@ motion_pos_t motion_get_position(void);
  */
 esp_err_t motion_move(float az_deg, float el_deg,
                       bool has_az, bool has_el,
+                      uint32_t az_hz_max, uint32_t el_hz_max,
                       uint32_t timeout_ms,
                       motion_pos_t *out);
 

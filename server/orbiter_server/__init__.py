@@ -2,7 +2,7 @@
 
 The modules inside this package use bare-name imports (``import config``,
 ``from esp_proxy import esp``, ...) rather than relative imports — a style
-inherited from the parent storage-api so the same files can be run both as a
+inherited from the parent research rig so the same files can be run both as a
 script (``uvicorn app:app``) and as a package (``import orbiter_server.app``).
 
 This ``__init__`` makes that work by inserting the package directory into

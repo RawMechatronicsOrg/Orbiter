@@ -74,6 +74,38 @@ async def _cmd_set_motion_plan(args: dict[str, Any]) -> dict[str, Any]:
     return serialised
 
 
+# Per-axis closed-loop top step rate (Hz) bounds for the operator speed knobs.
+# Tighter than the firmware sanity clamp (CL_HZ_MIN..CL_HZ_OVERRIDE_MAX) and
+# matched to the UI slider ranges. AZ is the light axis (fast); EL carries the
+# whole arm, so it's capped lower to keep calibration/scan sweeps from
+# over-shooting (the reason the EL default was historically conservative).
+_MOVE_HZ_BOUNDS: dict[str, tuple[int, int]] = {
+    "az": (100, 4000),
+    "el": (50, 1000),
+}
+
+
+async def _cmd_set_move_speed(args: dict[str, Any]) -> dict[str, Any]:
+    """Set the per-axis closed-loop top step rate — the Machine-config speed
+    knobs. Payload (either or both key): ``{az_hz_max: int, el_hz_max: int}``
+    in Hz. Each value is clamped to its per-axis safe band and persisted on the
+    model; the next /move carries it to the firmware (see esp_proxy.move)."""
+    patch: dict[str, Any] = {}
+    try:
+        if "az_hz_max" in args:
+            lo, hi = _MOVE_HZ_BOUNDS["az"]
+            patch["move_hz_max_az"] = max(lo, min(hi, int(args["az_hz_max"])))
+        if "el_hz_max" in args:
+            lo, hi = _MOVE_HZ_BOUNDS["el"]
+            patch["move_hz_max_el"] = max(lo, min(hi, int(args["el_hz_max"])))
+    except (TypeError, ValueError) as exc:
+        raise CommandError(f"set_move_speed: bad value: {exc}") from exc
+    if not patch:
+        raise CommandError("set_move_speed: provide az_hz_max and/or el_hz_max")
+    model.update(**patch)
+    return patch
+
+
 async def _cmd_set_camera_url(args: dict[str, Any]) -> dict[str, Any]:
     """Update the live still-image URL (IP Webcam etc.) at runtime."""
     url = args.get("url")
@@ -131,6 +163,13 @@ async def _cmd_calibrate_geometry(args: dict[str, Any]) -> dict[str, Any]:
     """
     import calibration
 
+    if not model.encoder_zero_initialized:
+        raise CommandError(
+            "encoder zero not initialized — the sweep would move to absolute "
+            "poses while the encoders may read arbitrary angles. Wait for the "
+            "first-boot auto-zero (needs ESP + phone IMU online) or zero the "
+            "encoders manually in Machine config first."
+        )
     do_apply = bool(args.get("apply", True))
     preset = str(args.get("preset", "fast"))
     poses = calibration.poses_for_preset(preset)
@@ -196,9 +235,11 @@ async def _cmd_set_active_session(args: dict[str, Any]) -> dict[str, Any]:
 
 async def _cmd_save_scan_notes(args: dict[str, Any]) -> dict[str, Any]:
     """Patch the active scan's notes field. Marks the scan dirty so the
-    autosave loop (or the explicit Save) flushes it to disk."""
+    autosave loop (or the explicit Save) flushes it to disk.
+    ``scan_notes_edited`` makes the manifest write take notes from the model
+    — otherwise the on-disk value (REST catalog edits) is kept."""
     notes = str(args.get("notes", ""))
-    model.update(scan_notes=notes, scan_dirty=True)
+    model.update(scan_notes=notes, scan_notes_edited=True, scan_dirty=True)
     return {"scan_notes": notes}
 
 
@@ -232,73 +273,24 @@ async def _cmd_motors(args: dict[str, Any]) -> dict[str, Any]:
     return await esp.motors(bool(args["enabled"]))
 
 
-async def _cmd_align_el_to_phone(_args: dict[str, Any]) -> dict[str, Any]:
-    """Re-zero the EL encoder so the rig's reported elevation tracks the
-    camera's actual orientation 1:1 in the operator-natural [0°, 90°]
-    range.
-
-    Mapping (this mount has lens ⊥ arm):
-      lens_pitch = -90°  ⇔  arm horizontal, lens pointing straight down
-                            ⇔  rig.el = 0°
-      lens_pitch =   0°  ⇔  arm vertical, lens horizontal
-                            ⇔  rig.el = 90°
-
-    So the alignment target is `lens_pitch + 90` and after calibration
-    rig.el reads as the operator expects.
-
-    Requires the phone IMU to be online.
-    """
-    if (
-        not model.phone_sensor_online
-        or model.phone_lens_pitch_deg is None
-    ):
-        raise CommandError(
-            "phone IMU not online — set the camera URL in endpoints and "
-            "make sure the IP Webcam app is exposing accelerometer data"
-        )
-    # Force a /state refresh — the periodic poll is dormant while the WS
-    # pose stream is fresh, so model.encoder_zero may be empty since
-    # startup. fetch_state() pulls /state from the firmware AND updates
-    # the model — after this returns, the model is the source of truth.
-    await esp.fetch_state()
-    cur_el = float(model.el)
-    lens_pitch = float(model.phone_lens_pitch_deg)
-    target_el = lens_pitch + 90.0
-    prev_zero = float(model.encoder_zero.get("el_zero_raw_deg", 0.0))
-    # displayed = raw - zero. We want displayed_new = target_el when raw
-    # is unchanged, so zero_new = zero_old + (displayed_old - target_el).
-    new_zero = prev_zero + (cur_el - target_el)
-    result = await esp.calibrate(
-        axis="el", mode="explicit", el_raw_deg=new_zero,
-    )
-    log.info(
-        "align_el_to_phone: el=%.2f lens=%.2f target=%.2f → el_zero %.3f → %.3f",
-        cur_el, lens_pitch, target_el, prev_zero, new_zero,
-    )
-    return {
-        "previous_el_zero_raw_deg": prev_zero,
-        "new_el_zero_raw_deg": new_zero,
-        "delta_applied_deg": cur_el - target_el,
-        "phone_lens_pitch_deg": lens_pitch,
-        "target_el_deg": target_el,
-        "rig_el_before": cur_el,
-        **result,
-    }
-
-
 async def _cmd_calibrate_encoder(args: dict[str, Any]) -> dict[str, Any]:
     """Set the firmware encoder zero.
 
     Tells the ESP firmware to interpret the current encoder reading (or a
     supplied raw degree value) as zero for the named axis. The same primitive
-    the operator hits after physically aligning the rig.
+    the operator hits after physically aligning the rig — so it also counts
+    as the rig's first-boot zero initialization.
     """
-    return await esp.calibrate(
+    import encoder_init
+
+    result = await esp.calibrate(
         axis=str(args.get("axis", "both")),
         mode=str(args.get("mode", "current")),
         az_raw_deg=args.get("az_raw_deg"),
         el_raw_deg=args.get("el_raw_deg"),
     )
+    encoder_init.mark_initialized("manual encoder zero")
+    return result
 
 
 async def _cmd_reboot_firmware(_args: dict[str, Any]) -> dict[str, Any]:
@@ -489,7 +481,6 @@ _COMMANDS: dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]] = {
     "jog": _cmd_jog,
     "motors": _cmd_motors,
     "calibrate_encoder": _cmd_calibrate_encoder,
-    "align_el_to_phone": _cmd_align_el_to_phone,
     "reboot_firmware": _cmd_reboot_firmware,
     # scan-loop / capture
     "take_shot": _cmd_take_shot,
@@ -503,6 +494,7 @@ _COMMANDS: dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]] = {
     "set_active_session": _cmd_set_active_session,
     # config / render
     "set_motion_plan": _cmd_set_motion_plan,
+    "set_move_speed": _cmd_set_move_speed,
     "set_machine_config": _cmd_set_machine_config,
     "set_render_pref": _cmd_set_render_pref,
     "set_camera_url": _cmd_set_camera_url,

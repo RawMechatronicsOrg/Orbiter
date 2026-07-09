@@ -12,6 +12,8 @@
 import { Button } from '../components/ui/button';
 import { Dialog, DialogContent, DialogTitle } from '../components/ui/dialog';
 import { API_BASE } from './api';
+import { formatTime } from '../lib/format';
+import { downloadFile } from '../lib/download';
 import type { Commands } from './commands';
 
 /** Subset of a `model.captures` entry the modal renders. Mirrors the server
@@ -28,33 +30,6 @@ export interface CaptureView {
   camera_preset?: string;
   stored_width?: number;
   stored_height?: number;
-}
-
-/** Server timestamps are UTC ISO-8601 — render uniformly in local time. */
-function formatTime(iso: unknown): string {
-  if (typeof iso !== 'string' || !iso) return '—';
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  const p = (n: number) => String(n).padStart(2, '0');
-  return (
-    `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
-    `${p(d.getHours())}:${p(d.getMinutes())}`
-  );
-}
-
-/** Fetch a file and save it under `filename` via a transient <a download>. */
-async function downloadFile(url: string, filename: string): Promise<void> {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`download: HTTP ${r.status}`);
-  const blob = await r.blob();
-  const objUrl = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = objUrl;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(objUrl);
 }
 
 /** Full-size photo preview for a scene-picked capture.

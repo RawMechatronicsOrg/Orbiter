@@ -236,6 +236,13 @@ esp_err_t handler_move(httpd_req_t *req)
     uint32_t tmo = 15000;
     json_uint(body, "timeout_ms", &tmo);
 
+    /* Optional per-axis top step rate (UI speed knobs, via the server).
+     * Absent / 0 → the firmware uses its compiled default cap. motion_move
+     * clamps to a safe band, so no range check is needed here. */
+    uint32_t az_hz_max = 0, el_hz_max = 0;
+    json_uint(body, "az_hz_max", &az_hz_max);
+    json_uint(body, "el_hz_max", &el_hz_max);
+
     if (!has_az && !has_el)
         return send_json(req,
             "{\"status\":\"error\",\"message\":\"provide azimuth_deg or elevation_deg\"}",
@@ -257,6 +264,8 @@ esp_err_t handler_move(httpd_req_t *req)
             .el_deg     = el_deg,
             .has_az     = has_az,
             .has_el     = has_el,
+            .az_hz_max  = az_hz_max,
+            .el_hz_max  = el_hz_max,
             .timeout_ms = tmo,
         },
     };

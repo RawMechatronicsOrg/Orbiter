@@ -306,7 +306,272 @@ def test_render_gauge_correction_gated_on_extrinsic():
     # the rendered camera — only the calibrated 6-DOF path applies the gauge.
     from geom.machine_model import compute_rig
     kw = dict(el_deg=30.0, arm_radius_mm=150.0, camera_offset_mm=40.0,
-              camera_tilt_deg=0.0, camera_pan_deg=0.0, machine_geometry=None)
+              camera_tilt_deg=0.0, camera_pan_deg=0.0)
     base = compute_rig(extrinsic=None, turntable_axis=None, **kw)
     with_axis = compute_rig(extrinsic=None, turntable_axis=(20.0, -7.0), **kw)
     assert np.allclose(base.camera_pos, with_axis.camera_pos)
+
+
+# ── P3: EL-axis rocker (tilt + transverse offset) — full-model refine ────────
+
+from geom.rig import MountTransform  # noqa: E402
+from geom.transforms import matrix_to_rotvec  # noqa: E402
+
+
+def _project_chain_samples(board, K, X_true, Z_true, poses, rocker_true):
+    """Fabricate samples the way the real pipeline sees them: B_i from the
+    TRUE chain (with rocker), corners = exact projections of the board
+    through K at B_i. PnP is assumed perfect (board_R/t = B_true)."""
+    import cv2
+    objp = np.asarray(board.getChessboardCorners(), dtype=np.float32)
+    samples = []
+    for az, el in poses:
+        R, t = calibration.arm_pose_in_world(az, el, None, rocker_true)
+        A_true = _se3(R, t)
+        B = np.linalg.inv(A_true @ X_true) @ Z_true
+        assert B[2, 3] > 0, "board must be in front of the camera"
+        rvec, _ = cv2.Rodrigues(B[:3, :3])
+        proj, _ = cv2.projectPoints(objp, rvec, B[:3, 3] / 1000.0, K, np.zeros(5))
+        samples.append(calibration.CaptureSample(
+            az_deg=az, el_deg=el,
+            board_R_cam=B[:3, :3], board_t_cam=B[:3, 3],
+            obj_points=objp.reshape(-1, 1, 3),
+            img_points=proj.astype(np.float32),
+        ))
+    return samples
+
+
+def test_rocker_identity_matches_legacy_pose():
+    ident = MountTransform(t=(0.0, 0.0, 0.0), rvec=(0.0, 0.0, 0.0))
+    for az, el in [(0.0, 0.0), (120.0, 45.0), (300.0, 65.0)]:
+        R0, t0 = calibration.arm_pose_in_world(az, el, None, None)
+        R1, t1 = calibration.arm_pose_in_world(az, el, None, ident)
+        assert np.allclose(R0, R1, atol=1e-12)
+        assert np.allclose(t0, t1, atol=1e-12)
+
+
+def test_refine_recovers_rocker_tilt_and_offset():
+    import cv2
+    board = calibration._build_board(
+        calibration.BoardSpec(5, 7, 30.0, 15.0, cv2.aruco.DICT_4X4_50))
+    K = np.array([[1500.0, 0.0, 960.0], [0.0, 1500.0, 540.0], [0.0, 0.0, 1.0]])
+    intr = calibration.Intrinsics(fx=1500.0, fy=1500.0, cx=960.0, cy=540.0,
+                                  dist=(0.0, 0.0, 0.0, 0.0, 0.0))
+    # Real-rig-like truth (from an actual calibration), plus a planted rocker.
+    X_true = _se3(Rotation.from_rotvec([2.3732, -0.1072, -1.9269]).as_matrix(),
+                  [293.28, -26.20, 23.70])
+    Z_true = _se3(Rotation.from_rotvec([3.1181, -0.2770, -0.0061]).as_matrix(),
+                  [-129.04, 163.86, -196.0])
+    # Truth: EL-axis tilt 0.06 rad + a 12 mm RADIAL offset of the EL axis.
+    # The radial offset is exactly degenerate with the turntable axis (only
+    # px − cx is observable — see the gauge note in refine_full_model), so
+    # the refine must return it as cx ≈ −12 with the rocker carrying tilt only.
+    rocker_true = MountTransform(t=(12.0, 0.0, 0.0), rvec=(0.06, 0.0, 0.0))
+    poses = [(float(az), el) for az in range(0, 360, 45)
+             for el in (15.0, 40.0, 65.0)]
+    samples = _project_chain_samples(board, K, X_true, Z_true, poses, rocker_true)
+
+    # PARK under the IDEAL-axis model: must misfit (that's the symptom).
+    R0, t0 = calibration.solve_hand_eye(samples, None)
+    stats0 = calibration.board_world_stats(samples, R0, t0, None)
+    assert stats0.rms_translation_mm > 1.0
+
+    out = calibration.refine_full_model(samples, intr, R0, t0, stats0, 0.0)
+    assert out is not None
+    R_X, t_X, z_ref, cx, rocker, az_harm, el_scale, rms_b, rms_a = out
+    assert rms_a < 0.05 and rms_a < rms_b * 0.1     # pixels: essentially exact
+    assert rocker is not None
+    assert rocker.rvec[0] == pytest.approx(0.06, abs=5e-3)
+    assert (rocker.t[0] - cx) == pytest.approx(12.0, abs=1.0)  # px − cx gauge
+    assert np.allclose(t_X, X_true[:3, 3], atol=2.0)
+    # Final chain must be self-consistent at sub-mm level.
+    stats1 = calibration.board_world_stats(samples, R_X, t_X, (cx, 0.0), rocker)
+    assert stats1.rms_translation_mm < 0.5
+    assert stats1.rms_rotation_deg < 0.05
+
+
+def test_refine_rejected_when_rig_is_ideal():
+    # No rocker in the truth: the refine must either return None (no gain)
+    # or come back with an essentially-zero rocker — never invent structure.
+    import cv2
+    board = calibration._build_board(
+        calibration.BoardSpec(5, 7, 30.0, 15.0, cv2.aruco.DICT_4X4_50))
+    K = np.array([[1500.0, 0.0, 960.0], [0.0, 1500.0, 540.0], [0.0, 0.0, 1.0]])
+    intr = calibration.Intrinsics(fx=1500.0, fy=1500.0, cx=960.0, cy=540.0,
+                                  dist=(0.0, 0.0, 0.0, 0.0, 0.0))
+    X_true = _se3(Rotation.from_rotvec([2.3732, -0.1072, -1.9269]).as_matrix(),
+                  [293.28, -26.20, 23.70])
+    Z_true = _se3(Rotation.from_rotvec([3.1181, -0.2770, -0.0061]).as_matrix(),
+                  [-129.04, 163.86, -196.0])
+    poses = [(float(az), el) for az in range(0, 360, 45)
+             for el in (15.0, 40.0, 65.0)]
+    samples = _project_chain_samples(board, K, X_true, Z_true, poses, None)
+    R0, t0 = calibration.solve_hand_eye(samples, None)
+    stats0 = calibration.board_world_stats(samples, R0, t0, None)
+    out = calibration.refine_full_model(samples, intr, R0, t0, stats0, 0.0)
+    if out is not None:
+        rocker = out[4]
+        assert rocker is None or (
+            np.degrees(np.linalg.norm(rocker.rvec)) < 0.2
+            and np.linalg.norm(rocker.t) < 2.0
+        )
+
+
+def test_per_view_diagnostics_shape():
+    import cv2
+    board = calibration._build_board(
+        calibration.BoardSpec(5, 7, 30.0, 15.0, cv2.aruco.DICT_4X4_50))
+    K = np.array([[1500.0, 0.0, 960.0], [0.0, 1500.0, 540.0], [0.0, 0.0, 1.0]])
+    intr = calibration.Intrinsics(fx=1500.0, fy=1500.0, cx=960.0, cy=540.0,
+                                  dist=(0.0, 0.0, 0.0, 0.0, 0.0))
+    X_true = _se3(Rotation.from_rotvec([2.3732, -0.1072, -1.9269]).as_matrix(),
+                  [293.28, -26.20, 23.70])
+    Z_true = _se3(Rotation.from_rotvec([3.1181, -0.2770, -0.0061]).as_matrix(),
+                  [-129.04, 163.86, -196.0])
+    poses = [(0.0, 15.0), (120.0, 40.0), (240.0, 65.0)]
+    samples = _project_chain_samples(board, K, X_true, Z_true, poses, None)
+    z_ref = MountTransform(
+        t=tuple(Z_true[:3, 3]), rvec=tuple(matrix_to_rotvec(Z_true[:3, :3])))
+    rows = calibration.per_view_diagnostics(
+        samples, intr, X_true[:3, :3], X_true[:3, 3], z_ref, None, None)
+    assert len(rows) == 3
+    for r in rows:
+        assert {"az", "el", "dpos_mm", "drot_deg", "reproj_px"} <= set(r)
+        assert r["dpos_mm"] < 1e-6 and r["reproj_px"] < 1e-6
+
+
+def test_disambiguated_pnp_picks_branch_near_prediction():
+    """The planar-PnP tie-break must return the pose consistent with the FK
+    prediction, and flag how ambiguous the view was."""
+    import cv2
+    board = calibration._build_board(
+        calibration.BoardSpec(5, 7, 30.0, 15.0, cv2.aruco.DICT_4X4_50))
+    K = np.array([[1500.0, 0.0, 960.0], [0.0, 1500.0, 540.0], [0.0, 0.0, 1.0]])
+    intr = calibration.Intrinsics(1500.0, 1500.0, 960.0, 540.0,
+                                  (0.0, 0.0, 0.0, 0.0, 0.0))
+    objp = np.asarray(board.getChessboardCorners(), dtype=np.float32)
+    ids = np.arange(len(objp), dtype=np.int32).reshape(-1, 1)
+    # An oblique board pose (where the planar ambiguity bites).
+    R_true = Rotation.from_euler("xyz", [35.0, 12.0, 4.0], degrees=True).as_matrix()
+    t_true_m = np.array([0.01, -0.02, 0.45])
+    rvec, _ = cv2.Rodrigues(R_true)
+    proj, _ = cv2.projectPoints(objp, rvec, t_true_m, K, np.zeros(5))
+    cc = proj.reshape(-1, 1, 2).astype(np.float32)
+
+    out = calibration.estimate_board_pose_disambiguated(cc, ids, board, intr, R_true)
+    assert out is not None
+    R, t_mm, amb = out
+    # Predicted near truth → returns the true branch (sub-degree, mm-accurate).
+    assert np.degrees(np.linalg.norm(
+        calibration.matrix_to_rotvec(R_true.T @ R))) < 1.0
+    assert np.allclose(t_mm, t_true_m * 1000.0, atol=3.0)
+    assert amb >= 0.0
+
+
+def test_refine_recovers_az_encoder_harmonic(monkeypatch):
+    """Stage B: a planted AZ-encoder first harmonic (AS5600 eccentricity) is
+    recovered on a full ring, and the chain self-consistency collapses.
+
+    The harmonic stage ships default-OFF (see config.az_harmonic_enabled) —
+    enable it for this test's scope; the solver machinery must still work."""
+    import cv2
+    from config import settings
+    monkeypatch.setattr(settings, "az_harmonic_enabled", True)
+    board = calibration._build_board(
+        calibration.BoardSpec(5, 7, 30.0, 15.0, cv2.aruco.DICT_4X4_50))
+    K = np.array([[1500.0, 0.0, 960.0], [0.0, 1500.0, 540.0], [0.0, 0.0, 1.0]])
+    intr = calibration.Intrinsics(1500.0, 1500.0, 960.0, 540.0,
+                                  (0.0, 0.0, 0.0, 0.0, 0.0))
+    X_true = _se3(Rotation.from_rotvec([2.3732, -0.1072, -1.9269]).as_matrix(),
+                  [293.28, -26.20, 23.70])
+    Z_true = _se3(Rotation.from_rotvec([3.1181, -0.2770, -0.0061]).as_matrix(),
+                  [-129.04, 163.86, -196.0])
+    harm_true = (1.2, -0.7)            # a_c, a_s in degrees
+    objp = np.asarray(board.getChessboardCorners(), dtype=np.float32)
+    samples = []
+    for az_meas in range(0, 360, 45):
+        for el in (15.0, 40.0, 65.0):
+            az_true = calibration.az_encoder_corrected(float(az_meas), harm_true)
+            R, t = calibration.arm_pose_in_world(az_true, el, None, None)
+            A_true = _se3(R, t)
+            B = np.linalg.inv(A_true @ X_true) @ Z_true
+            rvec, _ = cv2.Rodrigues(B[:3, :3])
+            proj, _ = cv2.projectPoints(objp, rvec, B[:3, 3] / 1000.0, K,
+                                        np.zeros(5))
+            samples.append(calibration.CaptureSample(
+                az_deg=float(az_meas), el_deg=el,
+                board_R_cam=B[:3, :3], board_t_cam=B[:3, 3],
+                obj_points=objp.reshape(-1, 1, 3),
+                img_points=proj.astype(np.float32)))
+
+    R0, t0 = calibration.solve_hand_eye(samples, None)
+    st0 = calibration.board_world_stats(samples, R0, t0, None)
+    out = calibration.refine_full_model(samples, intr, R0, t0, st0, 0.0)
+    assert out is not None
+    R_X, t_X, z_ref, cx, rocker, az_harm, el_scale, rms_b, rms_a = out
+    assert az_harm is not None, "harmonic stage must engage on a full ring"
+    assert az_harm[0] == pytest.approx(harm_true[0], abs=0.05)
+    assert az_harm[1] == pytest.approx(harm_true[1], abs=0.05)
+    assert rms_a < 0.3                              # pixels: essentially exact
+    assert np.allclose(t_X, X_true[:3, 3], atol=2.0)   # geometry stays physical
+
+
+def test_disambiguation_recovers_flipped_views():
+    """Plant REAL IPPE twins on a subset of views (the bench failure mode:
+    near-frontal flat board) and verify flip-descent restores rigidity."""
+    import cv2
+    board = calibration._build_board(
+        calibration.BoardSpec(5, 7, 30.0, 15.0, cv2.aruco.DICT_4X4_50))
+    K = np.array([[1500.0, 0.0, 960.0], [0.0, 1500.0, 540.0], [0.0, 0.0, 1.0]])
+    intr = calibration.Intrinsics(1500.0, 1500.0, 960.0, 540.0,
+                                  (0.0, 0.0, 0.0, 0.0, 0.0))
+    X_true = _se3(Rotation.from_rotvec([2.3732, -0.1072, -1.9269]).as_matrix(),
+                  [293.28, -26.20, 23.70])
+    Z_true = _se3(Rotation.from_rotvec([3.1181, -0.2770, -0.0061]).as_matrix(),
+                  [-129.04, 163.86, -196.0])
+    objp = np.asarray(board.getChessboardCorners(), dtype=np.float32)
+    # Near-frontal elevations (70/78): the polished twin reprojects within
+    # noise of the true branch — exactly the bench failure mode. el=15 views
+    # keep PARK well-conditioned.
+    poses = [(float(az), el) for az in range(0, 360, 45)
+             for el in (15.0, 70.0, 78.0)]
+    rng = np.random.default_rng(0)   # detector noise makes twins viable,
+    samples = []                     # exactly like on the bench
+    for az, el in poses:
+        R, t = calibration.arm_pose_in_world(az, el, None, None)
+        B = np.linalg.inv(_se3(R, t) @ X_true) @ Z_true
+        rvec, _ = cv2.Rodrigues(B[:3, :3])
+        proj, _ = cv2.projectPoints(objp, rvec, B[:3, 3] / 1000.0, K, np.zeros(5))
+        noisy = proj + rng.normal(0.0, 0.4, size=proj.shape)
+        samples.append(calibration.CaptureSample(
+            az_deg=az, el_deg=el,
+            board_R_cam=B[:3, :3], board_t_cam=B[:3, 3],
+            obj_points=objp.reshape(-1, 1, 3),
+            img_points=noisy.astype(np.float32)))
+
+    # Corrupt a third of the views with their REAL IPPE twin (when it exists).
+    # samples are ordered (az, el) groups of 3 — [1::3] picks the el=70 views,
+    # the near-frontal ones where twins exist.
+    n_twins = calibration.attach_pose_twins(samples, intr, board)
+    corrupted = 0
+    for s in samples[1::3]:
+        if s.board_pose_alt is not None:
+            R_alt, t_alt, err = s.board_pose_alt
+            s.board_pose_alt = (s.board_R_cam, s.board_t_cam, err)
+            s.board_R_cam, s.board_t_cam = R_alt, t_alt
+            corrupted += 1
+    if corrupted == 0:
+        pytest.skip("no view produced a viable IPPE twin at this geometry")
+
+    # The corruption must be visible…
+    R0, t0 = calibration.solve_hand_eye(samples, None)
+    spread_bad = calibration.board_world_stats(samples, R0, t0, None).rms_rotation_deg
+    assert spread_bad > 1.0
+
+    # …and flip-descent must undo it.
+    n_flipped = calibration.disambiguate_board_poses(samples)
+    assert n_flipped >= corrupted - 1            # allow one twin ≈ truth
+    R1, t1 = calibration.solve_hand_eye(samples, None)
+    spread_ok = calibration.board_world_stats(samples, R1, t1, None).rms_rotation_deg
+    assert spread_ok < 0.2
+    assert np.allclose(t1, X_true[:3, 3], atol=2.0)

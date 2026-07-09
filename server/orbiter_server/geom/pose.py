@@ -59,6 +59,18 @@ class GeomParams:
     camera_pan: float = 0.0
     # Turntable rotation axis (world XY, mm); used only on the calibrated path.
     turntable_axis: tuple[float, float] | None = None
+    # EL-axis correction (tilt + transverse offset) solved by the hand-eye
+    # refine; used only on the calibrated path. See rig.build_rig_graph.
+    rocker: MountTransform | None = None
+    # AZ-encoder harmonic correction in degrees, matching calibration's
+    # `az_encoder_corrected` (THE canonical definition): a 2-tuple (a_c, a_s)
+    # is first-harmonic only; a 4-tuple (a_c1, a_s1, a_c2, a_s2) adds the
+    # second harmonic. Applied on the calibrated path before the frame graph
+    # is built. None = encoder taken as exact.
+    az_harm: tuple[float, ...] | None = None
+    # EL encoder scale k (el_true = k·el); None = exact. Applied alongside
+    # az_harm on the calibrated path.
+    el_scale: float | None = None
 
 
 def _js_round(x: float, decimals: int) -> float:
@@ -136,11 +148,13 @@ def compute_camera_pose_x(
     el_deg: float,
     x: MountTransform,
     turntable_axis: tuple[float, float] | None = None,
+    rocker: MountTransform | None = None,
 ) -> Pose:
     """Full 6-DOF pose from the calibrated mount transform X, via the rig graph.
-    `T_cam->world = Az_C(az)·El(el)·X` — Az_C rotates about the vertical line
-    through the turntable axis, so an eccentric board placement is handled."""
-    graph = build_rig_graph(az_deg, el_deg, x, turntable_axis)
+    `T_cam->world = Az_C(az)·T_rocker·El(el)·X` — Az_C rotates about the
+    vertical line through the turntable axis; `rocker` is the solved EL-axis
+    tilt/offset correction (None = ideal axis)."""
+    graph = build_rig_graph(az_deg, el_deg, x, turntable_axis, rocker=rocker)
     c = np.asarray(graph.position(FRAME_CAMERA), dtype=float)
     optical = graph.rotation(FRAME_CAMERA) @ np.array([0.0, 0.0, 1.0])
     r = max(float(np.linalg.norm(c)), 1.0)
@@ -190,8 +204,19 @@ def camera_pose_at(az_deg: float, el_deg: float, geom: GeomParams) -> Pose:
     present (exact, roll included), else the manual model with a level-camera
     roll assumption."""
     if geom.extrinsic is not None:
+        if geom.az_harm is not None and any(geom.az_harm):
+            # Same harmonic model as calibration.az_encoder_corrected — core
+            # can't import it across the server layer, so the formula is
+            # mirrored here. 2 coeffs = first harmonic; 4 = first + second.
+            h = geom.az_harm
+            r = math.radians(az_deg)
+            az_deg = az_deg + h[0] * math.sin(r) + h[1] * math.cos(r)
+            if len(h) >= 4:
+                az_deg += h[2] * math.sin(2 * r) + h[3] * math.cos(2 * r)
+        if geom.el_scale is not None:
+            el_deg = el_deg * geom.el_scale
         return compute_camera_pose_x(
-            az_deg, el_deg, geom.extrinsic, geom.turntable_axis,
+            az_deg, el_deg, geom.extrinsic, geom.turntable_axis, geom.rocker,
         )
     p = compute_camera_pose(
         az_deg, el_deg,

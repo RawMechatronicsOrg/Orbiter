@@ -19,7 +19,9 @@ from typing import Any
 import numpy as np
 
 from geom.machine_model import Cylinder, compute_rig
+from config import settings
 from geom.pose import GeomParams, camera_pose_at
+from geom.rig import MountTransform
 from geom.rig_model import load_rig, to_three_name
 from geom.scan_path import plan_scan_path
 from geom.transforms import (
@@ -137,16 +139,22 @@ def _mesh(
 
 
 def _geom_params(model: ModelState) -> GeomParams:
+    # The calibrated 6-DOF mount X (when a hand-eye calibration has been
+    # applied) is the source of truth for the camera pose — the manual
+    # arm/offset/pan model is only the pre-calibration fallback.
     return GeomParams(
-        extrinsic=None,
+        extrinsic=MountTransform.from_dict(getattr(model, "calib_extrinsic", None)),
         arm_radius=max(model.arm_radius_mm, 1.0),
         camera_offset=model.camera_offset_mm,
-        # Camera optical axis is assumed to be along the arm direction
-        # (arm ⊥ phone screen plane). The phone IMU drives EL alignment
-        # now; an extra camera_tilt would fight that calibration.
+        # Manual-model tilt stays zeroed (fallback path only).
         camera_tilt=0.0,
         camera_pan=model.camera_pan_deg,
         turntable_axis=getattr(model, "turntable_axis", None),
+        rocker=MountTransform.from_dict(getattr(model, "rocker_correction", None)),
+        az_harm=(tuple(model.az_encoder_correction)
+                 if settings.az_harmonic_enabled
+                 and getattr(model, "az_encoder_correction", None) else None),
+        el_scale=getattr(model, "el_encoder_scale", None),
     )
 
 
@@ -273,7 +281,7 @@ def build_scene(model: ModelState) -> list[Node]:
         camera_pan_deg=model.camera_pan_deg,
         extrinsic=_geom_params(model).extrinsic,
         turntable_axis=_geom_params(model).turntable_axis,
-        machine_geometry=None,
+        rocker=_geom_params(model).rocker,
     )
 
     cam_math = np.asarray(rig.camera_pos, dtype=float)
@@ -410,11 +418,25 @@ def build_scene(model: ModelState) -> list[Node]:
     _frustum_props: dict[str, Any] = {
         "scale": 18.0, "color": "#f97316", "lineWidth": 1.6,
     }
+    _calibrated_quat = _geom_params(model).extrinsic is not None
     _aspect = _cam_stream.frame_aspect()
     if _aspect is not None:
+        # The CALIBRATED camera quaternion already carries the phone's real
+        # ~90° portrait roll (it is part of the solved mount X). The frustum's
+        # local axes therefore live in SENSOR orientation — its aspect must be
+        # the sensor's landscape ratio, or the portrait squeeze is applied
+        # TWICE (frustum showed up rotated 90° vs the camera body). On the
+        # manual fallback path the quat is roll-free and the frame aspect
+        # encodes the portrait orientation as before.
+        if _calibrated_quat and _aspect < 1.0:
+            _aspect = 1.0 / _aspect
         _frustum_props["aspect"] = _aspect
     live_quat = rig.camera_quat
-    if model.phone_sensor_online and model.phone_roll_deg is not None:
+    # Same double-counting logic for the IMU bank: the calibrated X already
+    # contains the bracket's mean roll — banking again would tilt the frustum
+    # off the camera body. Keep the live bank only for the manual model.
+    if (not _calibrated_quat and model.phone_sensor_online
+            and model.phone_roll_deg is not None):
         live_quat = _quat_mul(live_quat, _roll_about_lens_quat(model.phone_roll_deg))
     nodes.append(_node(
         "live_frustum", "camera_frustum",
@@ -456,12 +478,7 @@ def _arm_nodes(
     if stem_start_math is not None:
         stem_start = np.asarray(stem_start_math, dtype=float)
     else:
-        pivot = (
-            np.asarray(rig.el_pivot, dtype=float)
-            if rig.el_pivot is not None
-            else np.zeros(3)
-        )
-        stem_start = np.asarray(rig.arm_end, dtype=float) + pivot
+        stem_start = np.asarray(rig.arm_end, dtype=float)
 
     stem_vec = cam_pos - stem_start
     stem_len = float(np.linalg.norm(stem_vec))

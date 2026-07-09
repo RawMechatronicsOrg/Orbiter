@@ -2,14 +2,15 @@
 
 Drives the rig through a sweep of poses, captures a photo at each, detects
 the ChArUco calibration board, then runs `cv2.calibrateHandEye` to derive
-the camera's position in the arm-end frame. From that we read off the
-rig's three-scalar geometry:
+the camera's pose in the arm-end frame. From that we read off the rig's
+scalar geometry:
 
   * `arm_radius_mm`     — distance from arm pivot to camera along the arm
   * `camera_offset_mm`  — vertical offset of the camera above the arm pivot
                           (the camera does not sit on the arm centreline)
   * `camera_tilt_deg`   — pitch correction of the optical axis vs nominal
-  * `camera_pan_deg`    — yaw correction
+                          (diagnostic only — see `apply_result`)
+  * `camera_pan_deg`    — yaw correction (diagnostic only)
 
 `base_height_mm` (world height of the arm pivot above the platform) is
 **not** derived from hand-eye — the standard solver is invariant to
@@ -32,8 +33,9 @@ azimuth. A board placed *off* the platform (fixed in the lab) would NOT
 work here — with the camera's azimuth fixed, a lab-fixed board's bearing
 never changes across the AZ sweep.
 
-Board defaults are tuned for an A4-printable 5×7 ChArUco at 30 mm squares /
-15 mm markers using `cv2.aruco.DICT_4X4_50`. Override the board geometry
+Board defaults are tuned for the physical 8×8 ChArUco at 36 mm squares /
+26.64 mm markers using `cv2.aruco.DICT_5X5_100` (square measured by ruler,
+marker = 36 × 22.2/30). Override the board geometry
 from the Machine config panel if you print a different one — e.g.
 https://calib.io/pages/camera-calibration-pattern-generator.
 
@@ -71,7 +73,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Sequence
 
 import numpy as np
@@ -81,7 +85,7 @@ from scipy.spatial.transform import Rotation
 import camera_io
 from esp_proxy import esp
 from geom.rig import FRAME_EL, FRAME_WORLD, MountTransform, build_rig_graph
-from geom.transforms import matrix_to_rotvec
+from geom.transforms import homogeneous, matrix_to_rotvec, rotvec_to_matrix
 from orbiter_model import model
 
 log = logging.getLogger("orbiter.calibration")
@@ -154,6 +158,20 @@ class CaptureSample:
     charuco_corners: np.ndarray | None = None
     charuco_ids: np.ndarray | None = None
     image_wh: tuple[int, int] | None = None
+    # Matched 3D board points (metres, board frame) ↔ 2D detections (px) —
+    # retained for the nonlinear reprojection refine.
+    obj_points: np.ndarray | None = None
+    img_points: np.ndarray | None = None
+    # The OTHER branch of the planar-PnP two-fold ambiguity for this view
+    # (IPPE twin): (R, t_mm, reproj_rms_px). None when the view was
+    # unambiguous or the twin reprojects much worse. Used by
+    # disambiguate_board_poses to flip flipped views.
+    board_pose_alt: tuple[np.ndarray, np.ndarray, float] | None = None
+    # Phone-IMU readouts at capture time (rig-frame elevation estimate and
+    # bank about the lens axis) — a free strain gauge on the camera bracket.
+    # None when the IMU was offline during the sweep.
+    phone_el_deg: float | None = None
+    phone_roll_deg: float | None = None
 
 
 @dataclass
@@ -197,6 +215,24 @@ class CalibrationResult:
     # (an operator-set axis is respected and not overwritten).
     turntable_cx_mm: float | None = None
     turntable_axis_solved: bool = False
+    # EL-axis correction (tilt about X/Z + transverse offset) recovered by the
+    # nonlinear reprojection refine. None when the refine was skipped or
+    # rejected — the ideal-axis model is then kept.
+    rocker: MountTransform | None = None
+    # AZ-encoder first-harmonic coefficients (a_c, a_s) in degrees —
+    # az_true = az + a_c·sin(az) + a_s·cos(az). None unless stage B earned it.
+    az_harm: tuple[float, float] | None = None
+    # EL encoder scale k (el_true = k·el); 1.0 = exact. Also absorbs a linear
+    # bracket sag about the EL axis (identical signature).
+    el_scale: float = 1.0
+    # Reprojection RMS (px) over all views before/after the refine — the
+    # honest measure of how much unmodelled structure the rocker absorbed.
+    refine_rms_before_px: float | None = None
+    refine_rms_after_px: float | None = None
+    # Per-view residual table: [{az, el, dpos_mm, drot_deg, reproj_px}, ...]
+    # — az/el-correlated patterns here are the fingerprint of whatever
+    # structure is STILL unmodelled.
+    diagnostics: list[dict[str, float]] | None = None
 
 
 # ── lazy cv2 import ─────────────────────────────────────────────────────────
@@ -258,6 +294,191 @@ def estimate_board_pose(
     return R, tvec.flatten() * 1000.0
 
 
+def estimate_board_pose_disambiguated(
+    charuco_corners: np.ndarray,
+    charuco_ids: np.ndarray,
+    board,
+    intrinsics: Intrinsics,
+    R_predicted: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, float] | None:
+    """Board→camera pose for a NEAR-PLANAR target, with the two-fold planar
+    ambiguity broken against a prediction. Returns `(R, t_mm, ambiguity_deg)`
+    or None.
+
+    A flat ChArUco board admits TWO poses that reproject almost identically
+    (the classic planar PnP ambiguity); at oblique elevations a plain
+    `cv2.solvePnP` flips between them, which shows up as a ~10-30° rotation
+    error with only a modest translation error. `cv2.solvePnPGeneric` with
+    IPPE returns BOTH; we pick the one whose rotation is closest to
+    `R_predicted` (the board orientation the calibrated forward kinematics
+    expects at this pose). `ambiguity_deg` is the geodesic angle between the
+    two candidate rotations — large means the view was genuinely ambiguous and
+    the tie-break did real work; ~0 means PnP was unambiguous anyway."""
+    cv2 = _cv2()
+    obj_pts, img_pts = board.matchImagePoints(charuco_corners, charuco_ids)
+    if obj_pts is None or len(obj_pts) < 4:
+        return None
+    try:
+        n, rvecs, tvecs, _err = cv2.solvePnPGeneric(
+            obj_pts, img_pts, intrinsics.K, intrinsics.D,
+            flags=cv2.SOLVEPNP_IPPE,
+        )
+    except cv2.error:
+        return None
+    if not n:
+        return None
+    cands = []
+    for rv, tv in zip(rvecs, tvecs):
+        R, _ = cv2.Rodrigues(rv)
+        score = float(np.linalg.norm(matrix_to_rotvec(R_predicted.T @ R)))
+        cands.append((score, R, tv.flatten() * 1000.0))
+    cands.sort(key=lambda c: c[0])
+    ambiguity_deg = (
+        float(np.degrees(np.linalg.norm(
+            matrix_to_rotvec(cands[0][1].T @ cands[1][1]))))
+        if len(cands) > 1 else 0.0
+    )
+    return cands[0][1], cands[0][2], ambiguity_deg
+
+
+def attach_pose_twins(samples: Sequence[CaptureSample], intrinsics: Intrinsics,
+                      board) -> int:
+    """For every sample with retained correspondences, compute BOTH IPPE
+    branches of the planar pose, LM-polish each, and store the branch FARTHER
+    from the current `board_R_cam` as `board_pose_alt` (the candidate twin).
+
+    Twins are kept RAW (no LM polish at this stage): polishing a twin from a
+    clean view collapses it back into the dominant branch (measured: both
+    branches → 0.2° apart after LM), which would hide exactly the candidates
+    we need. The reprojection gate is deliberately loose (best+10 px) — the
+    real arbiter is board rigidity in `disambiguate_board_poses`, where a
+    wrong twin can only LOSE (it inflates the rotation spread and the flip is
+    rejected). Accepted flips are polished afterwards. Returns how many
+    samples got a twin."""
+    cv2 = _cv2()
+    n_twins = 0
+    for s in samples:
+        s.board_pose_alt = None
+        if (s.obj_points is None or s.img_points is None
+                or s.board_R_cam is None):
+            continue
+        try:
+            n, rvecs, tvecs, errs = cv2.solvePnPGeneric(
+                s.obj_points, s.img_points, intrinsics.K, intrinsics.D,
+                flags=cv2.SOLVEPNP_IPPE,
+            )
+        except cv2.error as exc:
+            log.warning("calibration: IPPE failed on az=%.0f el=%.0f (%s)",
+                        s.az_deg, s.el_deg, exc)
+            continue
+        if not n or len(rvecs) < 2:
+            continue
+        branches = []
+        for rv, tv, er in zip(rvecs, tvecs, np.asarray(errs).ravel()):
+            R, _ = cv2.Rodrigues(rv)
+            branches.append((R, tv.flatten() * 1000.0, float(er)))
+        best_err = min(b[2] for b in branches)
+        # The twin = branch farther in rotation from the CURRENT pose.
+        far = max(branches, key=lambda b: float(np.linalg.norm(
+            matrix_to_rotvec(s.board_R_cam.T @ b[0]))))
+        sep = float(np.degrees(np.linalg.norm(
+            matrix_to_rotvec(s.board_R_cam.T @ far[0]))))
+        if sep < 3.0:                       # both branches ≈ current: unambiguous
+            continue
+        # Only reject outright garbage — rigidity in disambiguate_board_poses
+        # is the real arbiter, and on real noisy frames the raw-IPPE twin of a
+        # genuinely flipped view easily sits 10-20 px above the best branch.
+        if far[2] > best_err + 50.0:
+            continue
+        s.board_pose_alt = far
+        n_twins += 1
+    return n_twins
+
+
+def _polish_flipped(s: CaptureSample, intrinsics: Intrinsics) -> None:
+    """LM-polish a freshly-flipped view from its new (raw-IPPE) branch.
+    Kept only if LM stays in that branch — on real noisy data the twin
+    branch has a genuine local minimum; if LM slides back toward the old
+    branch, the raw twin is retained."""
+    cv2 = _cv2()
+    old_R = s.board_pose_alt[0] if s.board_pose_alt is not None else None
+    rv0, _ = cv2.Rodrigues(s.board_R_cam)
+    ok, rv1, tv1 = cv2.solvePnP(
+        s.obj_points, s.img_points, intrinsics.K, intrinsics.D,
+        rv0, (s.board_t_cam / 1000.0).reshape(3, 1),
+        useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE,
+    )
+    if not ok:
+        return
+    R1, _ = cv2.Rodrigues(rv1)
+    if old_R is not None:
+        d_new = float(np.linalg.norm(matrix_to_rotvec(s.board_R_cam.T @ R1)))
+        d_old = float(np.linalg.norm(matrix_to_rotvec(old_R.T @ R1)))
+        if d_old < d_new:
+            return                      # LM slid back to the old branch
+    s.board_R_cam, s.board_t_cam = R1, tv1.flatten() * 1000.0
+
+
+def disambiguate_board_poses(
+    samples: Sequence[CaptureSample],
+    intrinsics: Intrinsics | None = None,
+) -> int:
+    """Resolve the planar-PnP two-fold ambiguity ACROSS the sweep.
+
+    A flat board admits two near-identical-reprojection poses per view; on
+    near-frontal views `calibrateCamera` can converge to the WRONG branch for
+    a subset of views, which poisons the hand-eye with a large constant
+    rotation spread (bench 2026-06-11: mean Δrot ≈ 14°, X lateral +124 mm,
+    rocker pinned at its bound).
+
+    The board is rigid on the platform, so the per-view board-in-world
+    rotations must agree. Flip-descent: try each view's twin; keep the flip
+    if the ROTATION spread of `Z_i = A_i·X·B_i` (X re-solved by PARK each
+    time) drops. Rotation spread is independent of cx and of all the
+    translation gauges, so the criterion needs no axis/rocker knowledge.
+    Returns the number of flipped views; samples are edited in place.
+    """
+    flippable = [s for s in samples if s.board_pose_alt is not None]
+    if not flippable:
+        return 0
+
+    def rot_spread() -> float:
+        try:
+            R_x, t_x = solve_hand_eye(samples, None)
+            return board_world_stats(samples, R_x, t_x, None).rms_rotation_deg
+        except (ValueError, np.linalg.LinAlgError, _cv2().error):
+            return float("inf")
+
+    base = rot_spread()
+    n_flipped = 0
+    flipped_views: list[CaptureSample] = []
+    for _ in range(4):                       # flip-descent passes
+        changed = False
+        for s in flippable:
+            saved = (s.board_R_cam, s.board_t_cam)
+            alt = s.board_pose_alt
+            s.board_R_cam, s.board_t_cam = alt[0], alt[1]
+            trial = rot_spread()
+            if trial < base - 1e-3:
+                base = trial
+                s.board_pose_alt = (saved[0], saved[1], alt[2])
+                if s not in flipped_views:
+                    flipped_views.append(s)
+                n_flipped += 1
+                changed = True
+            else:
+                s.board_R_cam, s.board_t_cam = saved
+        if not changed:
+            break
+    # Polish accepted flips from their new branch (kept only if LM stays
+    # there — see _polish_flipped).
+    if intrinsics is not None:
+        for s in flipped_views:
+            if s.obj_points is not None and s.img_points is not None:
+                _polish_flipped(s, intrinsics)
+    return n_flipped
+
+
 # ── kinematic arm pose (encoder-only, no geometry priors) ───────────────────
 
 
@@ -265,6 +486,7 @@ def arm_pose_in_world(
     az_deg: float,
     el_deg: float,
     turntable_axis: tuple[float, float] | None = None,
+    rocker: MountTransform | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """EL("gripper") pose in the rotating-platform world frame — the hand-eye
     A matrix, built from the shared rig frame graph so it stays in lock-step
@@ -284,8 +506,12 @@ def arm_pose_in_world(
 
     `base_height_mm` does NOT enter (a constant world-vertical translation
     cancels in the relative AX=XB motions). Returns (R, t) with t in mm.
+
+    `rocker` is the EL-axis tilt/offset correction (see rig.build_rig_graph);
+    None reproduces the ideal-axis pose exactly.
     """
-    graph = build_rig_graph(az_deg, el_deg, _IDENTITY_MOUNT, turntable_axis)
+    graph = build_rig_graph(az_deg, el_deg, _IDENTITY_MOUNT, turntable_axis,
+                            rocker=rocker)
     T = graph.matrix(FRAME_EL, FRAME_WORLD)
     return T[:3, :3], T[:3, 3]
 
@@ -296,6 +522,7 @@ def arm_pose_in_world(
 def solve_hand_eye(
     samples: Sequence[CaptureSample],
     turntable_axis: tuple[float, float] | None = None,
+    rocker: MountTransform | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """`cv2.calibrateHandEye` for the eye-in-hand setup.
 
@@ -316,7 +543,7 @@ def solve_hand_eye(
     R_board_cam: list[np.ndarray] = []
     t_board_cam: list[np.ndarray] = []
     for s in samples:
-        R, t = arm_pose_in_world(s.az_deg, s.el_deg, turntable_axis)
+        R, t = arm_pose_in_world(s.az_deg, s.el_deg, turntable_axis, rocker)
         R_arm_world.append(R)
         t_arm_world.append(t.reshape(3, 1))
         R_board_cam.append(s.board_R_cam)
@@ -329,42 +556,54 @@ def solve_hand_eye(
     return R_cam_arm, t_cam_arm.flatten()
 
 
-def _handeye_residual(
-    samples: Sequence[CaptureSample],
-    R_cam_arm: np.ndarray,
-    t_cam_arm: np.ndarray,
-    turntable_axis: tuple[float, float] | None = None,
-) -> tuple[float | None, float | None]:
-    """RMS hand-eye consistency residual, split into translation (mm) and
-    rotation (deg).
+@dataclass(frozen=True)
+class BoardWorldStats:
+    """Statistics of the per-view board-in-world poses `Z_i = A_i · X · B_i`.
 
-    The board is glued to the platform, so its pose in the world frame,
-    `Z_i = A_i · X · B_i`, must be the SAME rigid transform for every view.
-    The residual is how much these per-view estimates disagree — the RMS
-    spread of `Z_i`'s translation about its mean and of its rotation about
-    its mean rotation.
+    The board is glued to the platform, so `Z_i` must be the SAME rigid
+    transform for every view. `R_ref` / `t_ref` are the mean pose (rotation
+    averaged on SO(3)) — the board's constant placement, persisted as the
+    "Test accuracy" reference. The RMS spreads about that mean are the
+    hand-eye consistency residual.
 
-    This is the diagnostic for the one approximation in the model: a
+    The residual is the diagnostic for the one approximation in the model: a
     transverse AZ↔EL arm offset is not absorbable into the single constant X,
     so instead of silently biasing the recovered scalars it leaks into this
     spread — and it climbs with elevation. An el-correlated residual is the
     tell that the rig has a transverse offset the v0.1 solve does not fit
     (or that `turntable_axis` is wrong).
+
+    Subtracting `turntable_axis` from `t_ref`'s XY gives the board's
+    ECCENTRICITY — how far its centre sits from the AZ rotation axis. On a
+    full, non-90°-periodic ring that read is exact even when `turntable_axis`
+    is unset (the wrong-axis variation mean-cancels over a symmetric ring).
     """
+
+    R_ref: np.ndarray
+    t_ref: np.ndarray
+    rms_translation_mm: float
+    rms_rotation_deg: float
+
+
+def board_world_stats(
+    samples: Sequence[CaptureSample],
+    R_cam_arm: np.ndarray,
+    t_cam_arm: np.ndarray,
+    turntable_axis: tuple[float, float] | None = None,
+    rocker: MountTransform | None = None,
+) -> BoardWorldStats:
+    """ONE pass over `Z_i = A_i · X · B_i` yielding the mean board-in-world
+    pose AND the residual spreads about it. The single source for what used
+    to be three near-identical loops (residual / mean centre / reference
+    pose)."""
     if not samples:
-        return None, None
-    X = np.eye(4)
-    X[:3, :3] = R_cam_arm
-    X[:3, 3] = t_cam_arm
+        raise ValueError("board_world_stats: no samples")
+    X = homogeneous(R_cam_arm, t_cam_arm)
     zs: list[np.ndarray] = []
     for s in samples:
-        R, t = arm_pose_in_world(s.az_deg, s.el_deg, turntable_axis)
-        A = np.eye(4)
-        A[:3, :3] = R
-        A[:3, 3] = t
-        B = np.eye(4)
-        B[:3, :3] = s.board_R_cam
-        B[:3, 3] = s.board_t_cam
+        A = homogeneous(*arm_pose_in_world(s.az_deg, s.el_deg, turntable_axis,
+                                           rocker))
+        B = homogeneous(s.board_R_cam, s.board_t_cam)
         zs.append(A @ X @ B)             # board-in-world; constant for a perfect fit
     t_ref = np.mean([Z[:3, 3] for Z in zs], axis=0)
     R_ref = Rotation.from_matrix(np.array([Z[:3, :3] for Z in zs])).mean().as_matrix()
@@ -373,10 +612,26 @@ def _handeye_residual(
         float(np.degrees(np.linalg.norm(matrix_to_rotvec(R_ref.T @ Z[:3, :3]))))
         for Z in zs
     ]
-    return (
-        float(np.sqrt(np.mean(np.square(t_errs)))),
-        float(np.sqrt(np.mean(np.square(r_errs)))),
+    return BoardWorldStats(
+        R_ref=R_ref,
+        t_ref=t_ref,
+        rms_translation_mm=float(np.sqrt(np.mean(np.square(t_errs)))),
+        rms_rotation_deg=float(np.sqrt(np.mean(np.square(r_errs)))),
     )
+
+
+def _handeye_residual(
+    samples: Sequence[CaptureSample],
+    R_cam_arm: np.ndarray,
+    t_cam_arm: np.ndarray,
+    turntable_axis: tuple[float, float] | None = None,
+) -> tuple[float | None, float | None]:
+    """RMS hand-eye consistency residual (translation mm, rotation deg) —
+    thin view over `board_world_stats`; see its docstring."""
+    if not samples:
+        return None, None
+    s = board_world_stats(samples, R_cam_arm, t_cam_arm, turntable_axis)
+    return s.rms_translation_mm, s.rms_rotation_deg
 
 
 def board_in_world_mean(
@@ -385,82 +640,35 @@ def board_in_world_mean(
     t_cam_arm: np.ndarray,
     turntable_axis: tuple[float, float] | None = None,
 ) -> np.ndarray:
-    """Azimuth-averaged board centre in the world (platform) frame.
-
-    `Z_i = A_i · X · B_i` is the board's placement in the platform frame; for
-    a board glued to the platform it is the same for every view, so the mean
-    translation is the board CENTRE in world. Subtracting `turntable_axis`
-    gives the board's ECCENTRICITY — how far its centre sits from the AZ
-    rotation axis. This is FREE: the very `A_i · X · B_i` `_handeye_residual`
-    already forms. On a full, non-90°-periodic ring the mean is exact even
-    when `turntable_axis` is unset (the wrong-axis variation mean-cancels over
-    a symmetric ring); the spread about it is exactly `rms_translation_mm`.
-    """
-    X = np.eye(4)
-    X[:3, :3] = R_cam_arm
-    X[:3, 3] = t_cam_arm
-    centres: list[np.ndarray] = []
-    for s in samples:
-        R, t = arm_pose_in_world(s.az_deg, s.el_deg, turntable_axis)
-        A = np.eye(4)
-        A[:3, :3] = R
-        A[:3, 3] = t
-        B = np.eye(4)
-        B[:3, :3] = s.board_R_cam
-        B[:3, 3] = s.board_t_cam
-        centres.append((A @ X @ B)[:3, 3])
-    return np.mean(centres, axis=0)
-
-
-def board_world_pose(
-    samples: Sequence[CaptureSample],
-    R_cam_arm: np.ndarray,
-    t_cam_arm: np.ndarray,
-    turntable_axis: tuple[float, float] | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Full board-in-world reference pose (R_ref, t_ref) = mean of `Z_i =
-    A_i·X·B_i` over the sweep — the constant board placement the "Test
-    accuracy" check compares a live observation against. Same `Z` the
-    residual forms; here we keep the rotation too (averaged on SO(3))."""
-    X = np.eye(4)
-    X[:3, :3] = R_cam_arm
-    X[:3, 3] = t_cam_arm
-    zs: list[np.ndarray] = []
-    for s in samples:
-        R, t = arm_pose_in_world(s.az_deg, s.el_deg, turntable_axis)
-        A = np.eye(4)
-        A[:3, :3] = R
-        A[:3, 3] = t
-        B = np.eye(4)
-        B[:3, :3] = s.board_R_cam
-        B[:3, 3] = s.board_t_cam
-        zs.append(A @ X @ B)
-    t_ref = np.mean([Z[:3, 3] for Z in zs], axis=0)
-    R_ref = Rotation.from_matrix(np.array([Z[:3, :3] for Z in zs])).mean().as_matrix()
-    return R_ref, t_ref
+    """Azimuth-averaged board centre in the world (platform) frame — thin
+    view over `board_world_stats`; see its docstring."""
+    return board_world_stats(samples, R_cam_arm, t_cam_arm, turntable_axis).t_ref
 
 
 def derive_geometry(R_cam_arm: np.ndarray, t_cam_arm: np.ndarray) -> CalibrationResult:
-    """Translate the camera-in-arm-end SE3 into the rig's three scalars.
+    """Translate the camera-in-arm-end SE3 into the rig's scalar geometry.
 
     Convention (matches scene_graph.py):
       * arm-end frame at the pivot, +X = arm direction, +Z = up at el=0
-      * at (az=0, el=0) the camera sits at (arm_radius, 0, camera_offset)
-        with optical axis nominally pointing back at the platform centre
-        (i.e. along −X in arm frame)
+      * at (az=0, el=0) the camera sits at (arm_radius, 0, camera_offset);
+        the NOMINAL mount rotation is Ry(180°) = diag(−1, 1, −1), i.e. the
+        optical axis (+Z_cam) points along −Z_arm — straight DOWN at el=0.
+        That matches the physical mount: the phone lens is ⊥ to the arm, so
+        el=0 (arm horizontal) ⇔ the lens points straight down.
+        Historically this matrix is dubbed "look-back" in tests/docstrings —
+        keep in mind the actual axis is lens-down, not −X.
 
     From those:
       * arm_radius     = t_cam_arm[0]
       * camera_offset  = t_cam_arm[2]
-      * camera_tilt    = pitch correction vs the nominal "look-back" axis
+      * camera_tilt    = pitch correction vs the nominal mount rotation
       * camera_pan     = yaw correction
     """
     arm_radius_mm    = float(t_cam_arm[0])
     camera_offset_mm = float(t_cam_arm[2])
 
-    # Nominal rotation: camera optical axis +Z_cam points along −X_arm
-    # (looking back at the platform). That's a 180° rotation about the
-    # arm-Y axis applied to bring camera-frame to arm-frame.
+    # Nominal mount rotation Ry(180°): +X_cam→−X_arm, +Z_cam→−Z_arm
+    # (lens straight down at el=0 — the phone mounts with lens ⊥ arm).
     nominal = np.array([
         [-1.0,  0.0,  0.0],
         [ 0.0,  1.0,  0.0],
@@ -509,10 +717,15 @@ def derive_geometry(R_cam_arm: np.ndarray, t_cam_arm: np.ndarray) -> Calibration
 #: diversity — it breaks the solve outright (verified: ΔR≈180°). 45° steps (8
 #: azimuths) include the intermediate bearings and avoid that aliasing.
 #:
-#: The four elevations span a wide out-of-plane tilt range, which is what
+#: The elevations span a wide out-of-plane tilt range, which is what
 #: conditions the intrinsics solve (P1) — a narrow {20,50} span leaves focal
-#: length and the principal point measurably noisier. Adjust the set if the
-#: rig cannot physically reach 10° or 70° EL.
+#: length and the principal point measurably noisier.
+#:
+#: ⚠ EL is CAPPED at 55°. Above that the camera sees the flat board nearly
+#: frontally and the planar-PnP two-fold ambiguity becomes live (bench: a 26°
+#: twin at el=65, flipped views poisoning the solve with a ~14° constant
+#: rotation spread). Staying ≥ ~35° away from frontal kills the twin branch
+#: geometrically — same effect as wedging the board, with no hardware change.
 #:
 #: ⚠ DEBUG SWEEP (reduced for speed while iterating — accuracy traded for
 #: turnaround, per the operator). 3 azimuths × 3 elevations = 9 poses. Azimuths
@@ -520,11 +733,11 @@ def derive_geometry(R_cam_arm: np.ndarray, t_cam_arm: np.ndarray) -> Calibration
 #: intrinsics solve alive (≥6 views, ≥3 elevations) but is too sparse for the
 #: turntable-axis cx solve (that needs the full ≥6-azimuth ring) — cx stays 0.
 #: RESTORE the full accurate ring for production:
-#:   [(float(az), el) for az in range(0, 360, 45) for el in (10., 30., 50., 70.)]
+#:   [(float(az), el) for az in range(0, 360, 45) for el in (10., 25., 40., 55.)]
 DEFAULT_POSES: list[tuple[float, float]] = [
     (float(az), el)
     for az in range(0, 360, 120)          # 0, 120, 240 — non-90°-periodic
-    for el in (15.0, 45.0, 65.0)
+    for el in (15.0, 35.0, 50.0)
 ]
 
 
@@ -540,19 +753,22 @@ def poses_for_preset(preset: str) -> list[tuple[float, float]]:
       * `full`   — 8 az (45° steps) × 4 el = 32 poses, widest EL span. The
                    production sweep this module's docstrings describe.
 
+    All presets cap EL at 55° — higher elevations view the flat board nearly
+    frontally, where the planar-PnP twin pose goes live (see DEFAULT_POSES).
+
     An unknown preset falls back to `fast`.
     """
     if preset == "normal":
         return [
             (float(az), el)
             for az in range(0, 360, 60)
-            for el in (15.0, 35.0, 55.0, 70.0)
+            for el in (15.0, 30.0, 45.0, 55.0)
         ]
     if preset == "full":
         return [
             (float(az), el)
             for az in range(0, 360, 45)
-            for el in (10.0, 30.0, 50.0, 70.0)
+            for el in (10.0, 25.0, 40.0, 55.0)
         ]
     return list(DEFAULT_POSES)
 
@@ -666,6 +882,10 @@ def calibrate_intrinsics(
         (cv2.Rodrigues(rv)[0], tv.ravel() * 1000.0)   # board→camera, m→mm
         for rv, tv in zip(rvecs, tvecs)
     ]
+    # Retain the matched 3D↔2D points on each kept sample — the nonlinear
+    # reprojection refine re-uses exactly the correspondences this solve saw.
+    for s, obj, imgp in zip(kept, obj_pts, img_pts):
+        s.obj_points, s.img_points = obj, imgp
     return intrinsics, float(rms), kept, poses
 
 
@@ -681,14 +901,14 @@ def _cx_cost(cx: float, samples: Sequence[CaptureSample]) -> float:
     cv2 = _cv2()
     try:
         R, t = solve_hand_eye(samples, (float(cx), 0.0))
-        rt, _ = _handeye_residual(samples, R, t, (float(cx), 0.0))
+        rt = board_world_stats(samples, R, t, (float(cx), 0.0)).rms_translation_mm
     except (ValueError, np.linalg.LinAlgError, cv2.error):
         # A degenerate board-in-world cloud makes calibrateHandEye return a NaN
         # rotation (no raise) → Rotation.mean()/matrix_to_rotvec raise
         # ValueError/LinAlgError; calibrateHandEye itself can raise cv2.error.
         # Treat any of these as an infeasible axis.
         return 1e9
-    return float(rt) if (rt is not None and np.isfinite(rt)) else 1e9
+    return float(rt) if np.isfinite(rt) else 1e9
 
 
 def _is_full_azimuth_ring(samples: Sequence[CaptureSample]) -> bool:
@@ -728,6 +948,378 @@ def solve_turntable_cx(samples: Sequence[CaptureSample]) -> float | None:
     return float(res.x)
 
 
+# ── EL-axis rocker refine: 2-DOF outer search, PARK inner ────────────────────
+#
+# PARK solves AX=XB under the IDEAL kinematic model A = Az_C·Ry(-el): the AZ
+# and EL axes intersect and EL is exactly horizontal. This rig's history says
+# otherwise (the laser-era machine_solve settled on a ~6.8° EL-axis tilt), and
+# any such structure makes PARK smear the error across X — consistent within
+# the sweep, but wrong at any new pose (exactly what "Test accuracy" measures).
+#
+# A naive fix — bundle-adjust X(6), Z(6), cx and the rocker against the pixels
+# all at once — is ILL-CONDITIONED on a sparse sweep: X and Z slide together
+# along the viewing direction (a near-planar target weakly constrains it),
+# fitting the corners while ballooning arm_radius from 293 to 415 mm and
+# camera_offset to 246 mm. Reprojection looks great; the absolute geometry is
+# garbage, and a fresh-pose check is WORSE. (Observed on the bench, 2026-06-11.)
+#
+# So the search is reduced to the only two NEW observable parameters:
+#   θ = [cx, rx]   — turntable-axis world-X and the EL-axis out-of-horizontal
+#                    tilt — while X and Z are NOT free: at every (cx, rx) they
+#                    come from the linear PARK hand-eye + board mean. PARK pins
+#                    arm_radius from the board's metric square size, so the
+#                    geometry can't wander; the outer search only places the
+#                    axis. Excluded by symmetry (see the older note that stood
+#                    here, condensed): rocker ry/py and cy are absorbed by X /
+#                    are gauges, a rocker z-rotation/z-translation commute with
+#                    Az and are absorbed by Z, and the radial offset px is
+#                    EXACTLY degenerate with cx (only px−cx observable). What
+#                    remains is rx, the EL axis tilting out of horizontal.
+
+# With (cx, rx) the RIGID two-revolute model is complete: the camera observes
+# only the board, so "AZ-axis tilt" relative to the lab/gravity is a pure
+# gauge — only the axes' MUTUAL angle (rx) and offset (cx) are observable.
+# What can still produce an az-correlated residual is NON-rigid structure;
+# the dominant deterministic candidate on this hardware is the AZ encoder's
+# first harmonic (AS5600 magnet eccentricity: az_true = az_meas +
+# a_c·sin(az) + a_s·cos(az), classically up to a few degrees). Stage B of the
+# refine solves those two coefficients — gated hard, so they are only kept
+# when the data genuinely demands them. (A constant az offset is the board-
+# phase gauge and stays excluded by construction: the harmonic has no DC term.)
+
+#: Hard limit for the refine — beyond this it's a build error, not geometry.
+_ROCKER_TILT_BOUND_RAD = 0.35      # ±20°
+#: AZ-encoder first-harmonic coefficient limit (deg) — beyond this the magnet
+#: is physically misassembled, not calibratable.
+_AZ_HARM_BOUND_DEG = 5.0
+#: Accept the refined model only if it beats the ideal-axis reprojection RMS
+#: by at least this factor (guards against overfitting noise with new DOF).
+_REFINE_MIN_GAIN = 0.97
+#: Stage B (encoder harmonic, +2 DOF) must earn a further material gain over
+#: stage A AND be solvable at all (full ring) — stricter than stage A's gate.
+_AZ_HARM_MIN_GAIN = 0.93
+#: Ignore a solved harmonic smaller than this (deg) — below detection noise.
+_AZ_HARM_MIN_AMP_DEG = 0.05
+#: EL encoder scale (el_true = k·el) limits — also covers a linear bracket
+#: sag about the EL axis (mathematically the same parameter). Beyond ±15 %
+#: something is mechanically broken, not calibratable.
+_EL_SCALE_MIN = 0.85
+_EL_SCALE_MAX = 1.15
+
+
+def _rocker_from_params(rx: float) -> MountTransform | None:
+    return MountTransform(t=(0.0, 0.0, 0.0), rvec=(rx, 0.0, 0.0)) if rx else None
+
+
+def az_encoder_corrected(az_deg: float,
+                         harm: Sequence[float] | None) -> float:
+    """Apply the AZ-encoder harmonic correction
+    `az_true = az + Σ_n (h[2n]·sin(n·az) + h[2n+1]·cos(n·az))`, n = 1, 2
+    (coefficients in degrees; a 2-element harm is first-harmonic-only for
+    backward compatibility). An AS5600 with an eccentric magnet produces the
+    1st harmonic; a tilted/misseated magnet adds a strong 2nd (bench
+    2026-06-11: 9.1° + 7.6°). None / zeros → identity. THE single
+    definition — calibration, FK and test_accuracy must all route through it.
+    """
+    if not harm or not any(harm):
+        return az_deg
+    r = math.radians(az_deg)
+    out = az_deg + harm[0] * math.sin(r) + harm[1] * math.cos(r)
+    if len(harm) >= 4:
+        out += harm[2] * math.sin(2 * r) + harm[3] * math.cos(2 * r)
+    return out
+
+
+def _reproj_residuals(
+    samples: Sequence[CaptureSample],
+    K: np.ndarray,
+    D: np.ndarray,
+    X44: np.ndarray,
+    Z44: np.ndarray,
+    turntable_axis: tuple[float, float],
+    rocker: MountTransform | None,
+    az_harm: tuple[float, float] | None = None,
+    el_scale: float = 1.0,
+) -> np.ndarray:
+    """Stacked pixel residuals of all corners in all views, for the model
+    B_pred = X⁻¹ · A⁻¹ · Z (board→camera). Units: px."""
+    cv2 = _cv2()
+    X_inv = np.linalg.inv(X44)
+    out: list[np.ndarray] = []
+    for s in samples:
+        az = az_encoder_corrected(s.az_deg, az_harm)
+        A = homogeneous(*arm_pose_in_world(az, s.el_deg * el_scale,
+                                           turntable_axis, rocker))
+        B = X_inv @ np.linalg.inv(A) @ Z44
+        rvec, _ = cv2.Rodrigues(B[:3, :3])
+        tvec = B[:3, 3] / 1000.0            # mm → m (obj points are metres)
+        proj, _ = cv2.projectPoints(s.obj_points, rvec, tvec, K, D)
+        out.append((proj - s.img_points).reshape(-1))
+    return np.concatenate(out)
+
+
+def _solve_xz_at(
+    samples: Sequence[CaptureSample], cx: float, rx: float,
+    az_harm: tuple[float, float] | None = None,
+    el_scale: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Inner solve: PARK hand-eye + board-mean under the (cx, rx, harmonic,
+    el-scale) model. Returns (X44, Z44) so X and Z are always the
+    linear-optimal pair for that axis — they cannot wander. None when the
+    hand-eye is degenerate. Encoder corrections are applied by substituting
+    corrected angles into throwaway sample copies (solve_hand_eye /
+    board_world_stats read angles from samples)."""
+    rocker = _rocker_from_params(rx)
+    axis = (float(cx), 0.0)
+    if (az_harm and (az_harm[0] or az_harm[1])) or el_scale != 1.0:
+        samples = [
+            CaptureSample(
+                az_deg=az_encoder_corrected(s.az_deg, az_harm),
+                el_deg=s.el_deg * el_scale,
+                board_R_cam=s.board_R_cam, board_t_cam=s.board_t_cam,
+            )
+            for s in samples
+        ]
+    try:
+        R_x, t_x = solve_hand_eye(samples, axis, rocker)
+        st = board_world_stats(samples, R_x, t_x, axis, rocker)
+    except (ValueError, np.linalg.LinAlgError, _cv2().error):
+        return None
+    return homogeneous(R_x, t_x), homogeneous(st.R_ref, st.t_ref)
+
+
+def refine_full_model(
+    samples: Sequence[CaptureSample],
+    intrinsics: Intrinsics,
+    R_cam_arm: np.ndarray,
+    t_cam_arm: np.ndarray,
+    stats: BoardWorldStats,
+    cx0: float,
+    freeze_cx: bool = False,
+) -> tuple[np.ndarray, np.ndarray, MountTransform, float, MountTransform | None,
+           tuple[float, float] | None, float, float] | None:
+    """Place the deterministic machine model by minimising corner reprojection,
+    with X and Z taken from the linear PARK solve at each step — so the
+    recovered geometry stays physical.
+
+    Stage A: θ = (cx, rx, k) — turntable axis, EL-axis tilt and the EL scale
+    factor `el_true = k·el` (a linear bracket sag about the EL axis is
+    mathematically identical to an encoder scale error — one parameter covers
+    both; the complete rigid two-revolute model + the dominant el-trend).
+    Stage B: θ = (cx, rx, k, a_c, a_s) — adds the AZ-encoder first harmonic,
+    attempted only on a full azimuth ring and kept only on a further material
+    reprojection gain (its own stricter gate).
+
+    Returns `(R_X, t_X, Z_ref, cx, rocker, az_harm, el_scale, rms_before_px,
+    rms_after_px)` or None when unavailable / rejected. `az_harm` is
+    `(a_c, a_s)` in degrees or None; `el_scale` is k (1.0 = exact encoder)."""
+    from scipy.optimize import least_squares
+
+    usable = [s for s in samples if s.obj_points is not None
+              and s.img_points is not None]
+    if len(usable) < 3:
+        return None
+    K, D = intrinsics.K, intrinsics.D
+    big_residual = np.full(sum(s.obj_points.shape[0] for s in usable) * 2, 1e4)
+
+    def residual(theta):
+        cx, rx, k = float(theta[0]), float(theta[1]), float(theta[2])
+        harm = (tuple(float(v) for v in theta[3:])
+                if len(theta) > 3 else None)
+        xz = _solve_xz_at(usable, cx, rx, harm, k)
+        if xz is None:
+            return big_residual
+        X44, Z44 = xz
+        return _reproj_residuals(usable, K, D, X44, Z44, (cx, 0.0),
+                                 _rocker_from_params(rx), harm, k)
+
+    rms_before = float(np.sqrt(np.mean(np.square(residual([cx0, 0.0, 1.0])))))
+    cx_lo, cx_hi = ((cx0 - 1e-3, cx0 + 1e-3) if freeze_cx
+                    else (-_CX_BOUND_MM, _CX_BOUND_MM))
+
+    # ── stage A: rigid model + el scale (cx, rx, k) ──
+    try:
+        sol_a = least_squares(
+            residual, [cx0, 0.0, 1.0],
+            bounds=([cx_lo, -_ROCKER_TILT_BOUND_RAD, _EL_SCALE_MIN],
+                    [cx_hi, _ROCKER_TILT_BOUND_RAD, _EL_SCALE_MAX]),
+            x_scale=[10.0, 0.02, 0.02],
+            diff_step=[1e-2, 1e-3, 1e-3], max_nfev=250,
+        )
+    except Exception as exc:  # noqa: BLE001 — refine is best-effort
+        log.warning("calibration: refine raised (%s) — keeping PARK result", exc)
+        return None
+    rms_a = float(np.sqrt(np.mean(np.square(sol_a.fun))))
+    if not np.isfinite(rms_a) or rms_a > rms_before * _REFINE_MIN_GAIN:
+        return None                          # no material gain — don't add DOF
+    best_x = [float(sol_a.x[0]), float(sol_a.x[1]), float(sol_a.x[2])]
+    rms_after = rms_a
+    az_harm: tuple[float, float] | None = None
+
+    # ── stage B: + AZ-encoder harmonics 1+2 (4 coeffs), full ring only ──
+    # 1st harmonic = magnet eccentricity; 2nd = magnet tilt/misseating. The
+    # bench map needed BOTH (9.1° + 7.6°) — a 1st-only model left R²≈0.58.
+    from config import settings
+    if settings.az_harmonic_enabled and _is_full_azimuth_ring(usable):
+        b = _AZ_HARM_BOUND_DEG
+        try:
+            sol_b = least_squares(
+                residual, best_x + [0.0, 0.0, 0.0, 0.0],
+                bounds=([cx_lo, -_ROCKER_TILT_BOUND_RAD, _EL_SCALE_MIN,
+                         -b, -b, -b, -b],
+                        [cx_hi, _ROCKER_TILT_BOUND_RAD, _EL_SCALE_MAX,
+                         b, b, b, b]),
+                x_scale=[10.0, 0.02, 0.02, 0.2, 0.2, 0.2, 0.2],
+                diff_step=[1e-2, 1e-3, 1e-3, 1e-2, 1e-2, 1e-2, 1e-2],
+                max_nfev=400,
+            )
+            rms_b = float(np.sqrt(np.mean(np.square(sol_b.fun))))
+            amp1 = float(np.hypot(sol_b.x[3], sol_b.x[4]))
+            amp2 = float(np.hypot(sol_b.x[5], sol_b.x[6]))
+            if (np.isfinite(rms_b) and rms_b < rms_a * _AZ_HARM_MIN_GAIN
+                    and max(amp1, amp2) >= _AZ_HARM_MIN_AMP_DEG):
+                best_x = [float(sol_b.x[0]), float(sol_b.x[1]),
+                          float(sol_b.x[2])]
+                az_harm = tuple(float(v) for v in sol_b.x[3:7])
+                rms_after = rms_b
+                _ui_log("I", (
+                    f"calibration: AZ-encoder harmonics accepted — 1st "
+                    f"{amp1:.2f}°, 2nd {amp2:.2f}° (reproj {rms_a:.2f} → "
+                    f"{rms_b:.2f} px). AS5600 magnet eccentricity + tilt."
+                ))
+        except Exception as exc:  # noqa: BLE001 — stage B is optional
+            log.warning("calibration: harmonic stage raised (%s) — skipped", exc)
+
+    cx, rx, el_scale = best_x
+    xz = _solve_xz_at(usable, cx, rx, az_harm, el_scale)
+    if xz is None:
+        return None
+    X44, Z44 = xz
+    tilt_deg = float(np.degrees(abs(rx)))
+    if abs(rx) > 0.98 * _ROCKER_TILT_BOUND_RAD:
+        _ui_log("W", (
+            f"calibration: refine hit its tilt bound ({tilt_deg:.1f}°) — "
+            "inspect the rig, this is implausibly large for axis geometry"
+        ))
+    Z_ref = MountTransform(
+        t=tuple(float(v) for v in Z44[:3, 3]),
+        rvec=tuple(float(v) for v in matrix_to_rotvec(Z44[:3, :3])),
+    )
+    # Drop a numerically-zero rocker so the FK chain stays on the exact
+    # legacy path when the rig really is ideal.
+    use_rocker = _rocker_from_params(rx) if tilt_deg >= 0.05 else None
+    # An el-scale within encoder noise of exact is dropped (keeps FK on the
+    # untouched path for a healthy rig).
+    if abs(el_scale - 1.0) < 5e-4:
+        el_scale = 1.0
+    return (X44[:3, :3], X44[:3, 3], Z_ref, cx, use_rocker, az_harm,
+            el_scale, rms_before, rms_after)
+
+
+def per_view_diagnostics(
+    samples: Sequence[CaptureSample],
+    intrinsics: Intrinsics,
+    R_cam_arm: np.ndarray,
+    t_cam_arm: np.ndarray,
+    Z_ref: MountTransform,
+    turntable_axis: tuple[float, float] | None,
+    rocker: MountTransform | None,
+    az_harm: tuple[float, float] | None = None,
+    el_scale: float = 1.0,
+) -> list[dict[str, float]]:
+    """Per-view residual table against the FINAL model: how far each view's
+    board-in-world pose sits from Z_ref (mm / deg), plus its reprojection RMS
+    (px) when the matched points were retained. An az/el-correlated pattern
+    here is the fingerprint of still-unmodelled structure."""
+    cv2 = _cv2()
+    X44 = homogeneous(R_cam_arm, t_cam_arm)
+    Z44 = Z_ref.as_matrix()
+    R_ref_T = Z44[:3, :3].T
+    t_ref = Z44[:3, 3]
+    X_inv = np.linalg.inv(X44)
+    out: list[dict[str, float]] = []
+    for s in samples:
+        az = az_encoder_corrected(s.az_deg, az_harm)
+        A = homogeneous(*arm_pose_in_world(az, s.el_deg * el_scale,
+                                           turntable_axis, rocker))
+        Z_i = A @ X44 @ homogeneous(s.board_R_cam, s.board_t_cam)
+        rv = np.degrees(matrix_to_rotvec(R_ref_T @ Z_i[:3, :3]))
+        row: dict[str, float] = {
+            "az": float(s.az_deg),
+            "el": float(s.el_deg),
+            "dpos_mm": float(np.linalg.norm(Z_i[:3, 3] - t_ref)),
+            "drot_deg": float(np.linalg.norm(rv)),
+            # Signed rotation-vector components (deg) — the vector residual,
+            # for structure analysis (a |Δrot| mean alone cannot distinguish
+            # a smooth model defect from a flipped subset of views).
+            "drot_x": float(rv[0]), "drot_y": float(rv[1]),
+            "drot_z": float(rv[2]),
+        }
+        if s.phone_el_deg is not None:
+            row["phone_el_dev"] = float(s.phone_el_deg - s.el_deg)
+        if s.phone_roll_deg is not None:
+            row["phone_roll"] = float(s.phone_roll_deg)
+        if s.obj_points is not None and s.img_points is not None:
+            B = X_inv @ np.linalg.inv(A) @ Z44
+            rvec, _ = cv2.Rodrigues(B[:3, :3])
+            proj, _ = cv2.projectPoints(s.obj_points, rvec, B[:3, 3] / 1000.0,
+                                        intrinsics.K, intrinsics.D)
+            row["reproj_px"] = float(np.sqrt(np.mean(
+                np.square((proj - s.img_points).reshape(-1)))))
+        out.append(row)
+    return out
+
+
+def residual_structure(rows: list[dict[str, float]]) -> str | None:
+    """Deterministic verdict on the REMAINING per-view rotation residual.
+
+    Fits the VECTOR rotation residual (signed rotvec components, not the
+    modulus — a |Δrot| mean cannot distinguish a smooth model defect from a
+    flipped subset of views) onto [1, sin az, cos az, el] per component, and
+    additionally screens for bimodality (a cluster of outlier views ≫ the
+    median = surviving planar-PnP flips). None when too few views."""
+    if len(rows) < 5 or "drot_x" not in rows[0]:
+        return None
+    azr = np.radians([r["az"] for r in rows])
+    el = np.array([r["el"] for r in rows], float)
+    mag = np.array([r["drot_deg"] for r in rows], float)
+    V = np.column_stack([[r["drot_x"] for r in rows],
+                         [r["drot_y"] for r in rows],
+                         [r["drot_z"] for r in rows]])
+    M = np.column_stack([np.ones_like(azr), np.sin(azr), np.cos(azr),
+                         (el - el.mean()) / 30.0])
+    coef, *_ = np.linalg.lstsq(M, V, rcond=None)   # (4, 3)
+    fit = M @ coef
+    ss_tot = float(np.sum((V - V.mean(axis=0)) ** 2))
+    r2 = (1.0 - float(np.sum((V - fit) ** 2)) / ss_tot
+          if ss_tot > 1e-12 else 0.0)
+    const_amp = float(np.linalg.norm(coef[0]))
+    az_amp = float(np.linalg.norm(coef[1:3]))
+    el_amp = float(np.linalg.norm(coef[3]))
+    # Bimodality screen: views whose |Δrot| dwarfs the median are a flip
+    # cluster, not a smooth defect.
+    med = float(np.median(mag))
+    n_out = int(np.sum(mag > max(2.5 * med, med + 5.0)))
+    verdict = (
+        f"{n_out}/{len(rows)} views are far-outliers vs the median "
+        f"({med:.2f}°) → looks like SURVIVING planar-PnP flips; rerun with "
+        "the board wedged 10-15° off flat." if n_out >= 2 else
+        "az-harmonic dominates → AZ bearing wobble or residual encoder error."
+        if az_amp > 2 * el_amp and az_amp > 0.2 else
+        "el-trend dominates → el-dependent flex (arm sag) or EL-encoder scale."
+        if el_amp > 2 * az_amp and el_amp > 0.2 else
+        "constant offset dominates — board moved mid-sweep or a global "
+        "reference inconsistency." if const_amp > 2 * max(az_amp, el_amp)
+        and const_amp > 0.5 else
+        "no dominant structure — remaining residual looks like noise."
+    )
+    return (
+        f"residual structure (vector): const {const_amp:.2f}° | az-harmonic "
+        f"{az_amp:.2f}° | el-trend {el_amp:.2f}°/30°el | R²={r2:.2f} | "
+        f"median |Δrot| {med:.2f}°. {verdict}"
+    )
+
+
 async def _capture_one(
     az: float,
     el: float,
@@ -735,10 +1327,24 @@ async def _capture_one(
 ) -> CaptureSample | None:
     """Move to (az, el), grab a photo, detect the ChArUco board, and RETAIN the
     raw corners + image size. The board→camera pose is filled later — either by
-    the one-shot intrinsics calibration or the per-view solvePnP fallback."""
+    the one-shot intrinsics calibration or the per-view solvePnP fallback.
+
+    The sample records the ACTUAL settled encoder angles, not the commanded
+    pose — the closed-loop accepts a settle tolerance, and feeding commanded
+    angles into the hand-eye silently injects that tolerance as model error.
+    The phone-IMU readouts at capture time are retained too: a free strain
+    gauge on the camera bracket (flex shows up as an el-correlated deviation
+    between phone_el and the encoder el)."""
     cv2 = _cv2()
     await esp.move_and_await(azimuth_deg=az, elevation_deg=el, timeout_ms=15000)
     await asyncio.sleep(_SETTLE_S)
+    az_act, el_act = float(model.az), float(model.el)
+    phone_el = (float(model.phone_el_deg)
+                if model.phone_sensor_online and model.phone_el_deg is not None
+                else None)
+    phone_roll = (float(model.phone_roll_deg)
+                  if model.phone_sensor_online and model.phone_roll_deg is not None
+                  else None)
     raw = await camera_io.fetch_photo(el_deg=el)
     if not raw:
         log.warning("calibration: no photo at az=%.1f el=%.1f", az, el)
@@ -753,11 +1359,16 @@ async def _capture_one(
         log.warning("calibration: board not detected at az=%.1f el=%.1f", az, el)
         return None
     h, w = img.shape[:2]
+    if abs(az_act - az) > 0.5 or abs(el_act - el) > 0.5:
+        log.info("calibration: settled %.2f°/%.2f° off the commanded pose "
+                 "(az %.1f→%.1f, el %.1f→%.1f) — using actuals",
+                 az_act - az, el_act - el, az, az_act, el, el_act)
     # Per-pose progress is logged by run_calibration (it has the pose index),
     # so we don't double-log the corner count here.
     return CaptureSample(
-        az_deg=az, el_deg=el,
+        az_deg=az_act, el_deg=el_act,
         charuco_corners=corners, charuco_ids=ids, image_wh=(w, h),
+        phone_el_deg=phone_el, phone_roll_deg=phone_roll,
     )
 
 
@@ -866,12 +1477,33 @@ async def run_calibration(
             )
             if pose is not None:
                 s.board_R_cam, s.board_t_cam = pose
+                # Retain the correspondences so the refine can still run on
+                # the fallback path (K is a guess, but the rocker geometry is
+                # observable regardless).
+                obj, imgp = board.matchImagePoints(s.charuco_corners,
+                                                   s.charuco_ids)
+                if obj is not None:
+                    s.obj_points = obj.astype(np.float32)
+                    s.img_points = imgp.astype(np.float32)
         samples = [s for s in samples if s.board_R_cam is not None]
         if len(samples) < 3:
             raise RuntimeError(
                 "calibration failed: board poses could not be recovered for "
                 "≥ 3 views even with the fallback intrinsics."
             )
+
+    # ── planar-PnP ambiguity: flip flipped views BEFORE anything uses B_i ──
+    # A flat board admits a twin pose per view; near-frontal views can come
+    # out of the intrinsics solve on the wrong branch and poison the
+    # hand-eye with a large constant rotation spread. The board's rigidity
+    # is the arbiter.
+    n_twins = attach_pose_twins(samples, intrinsics, board)
+    n_flipped = disambiguate_board_poses(samples, intrinsics) if n_twins else 0
+    _ui_log("I" if n_flipped == 0 else "W", (
+        f"calibration: planar-ambiguity check — {n_twins}/{len(samples)} "
+        f"views had a viable twin pose, {n_flipped} flipped to the "
+        "rigid-board-consistent branch"
+    ))
 
     # ── turntable axis (P2). cy is a structural gauge null. ──
     axis = getattr(model, "turntable_axis", None)
@@ -898,34 +1530,150 @@ async def run_calibration(
                      "sweep is not a full ring) — using origin")
     turntable_axis = (cx, cy)
 
-    # ── hand-eye + geometry (existing path); guard the degenerate solve ──
+    # ── hand-eye (PARK) under the ideal-axis model; guard degenerate solves ──
     _ui_log("I", f"calibration: solving hand-eye (PARK) from {len(samples)} "
                  f"views, axis=({cx:.1f}, {cy:.1f})…")
     try:
         R_cam_arm, t_cam_arm = solve_hand_eye(samples, turntable_axis)
-        result = derive_geometry(R_cam_arm, t_cam_arm)
-        rms_t, rms_r = _handeye_residual(
-            samples, R_cam_arm, t_cam_arm, turntable_axis,
-        )
-        t_z = board_in_world_mean(samples, R_cam_arm, t_cam_arm, turntable_axis)
+        stats = board_world_stats(samples, R_cam_arm, t_cam_arm, turntable_axis)
     except (ValueError, np.linalg.LinAlgError, _cv2().error) as exc:
         raise RuntimeError(
             f"calibration failed: degenerate hand-eye solve ({exc}). The "
             "captured views are too few or too co-linear — widen the sweep."
         ) from exc
+
+    # ── EL-axis rocker refine: place (cx, rx) by reprojection, X/Z from PARK ──
+    # PARK assumes the AZ/EL axes intersect and EL is exactly horizontal; on
+    # this rig they don't (laser-era history: ~6.8° rocker tilt). The refine
+    # searches only the turntable axis cx and the EL-axis tilt rx against the
+    # raw corner reprojections, with X and Z taken from PARK at each step so
+    # the recovered geometry stays physical (see refine_full_model).
+    rocker: MountTransform | None = None
+    az_harm: tuple[float, float] | None = None
+    el_scale = 1.0
+    refine_before: float | None = None
+    refine_after: float | None = None
+    _ui_log("I", "calibration: refining EL-axis tilt + turntable axis + EL "
+                 "scale against corner reprojections…")
+    refined = refine_full_model(
+        samples, intrinsics, R_cam_arm, t_cam_arm, stats, cx,
+        freeze_cx=(axis is not None),
+    )
+    if refined is not None:
+        (R_cam_arm, t_cam_arm, z_ref_mt, cx, rocker, az_harm, el_scale,
+         refine_before, refine_after) = refined
+        turntable_axis = (cx, cy)
+        if az_harm or el_scale != 1.0:
+            # Re-evaluate the SE3 stats with corrected encoder angles.
+            corr = [CaptureSample(
+                az_deg=az_encoder_corrected(s.az_deg, az_harm),
+                el_deg=s.el_deg * el_scale,
+                board_R_cam=s.board_R_cam, board_t_cam=s.board_t_cam,
+            ) for s in samples]
+            stats = board_world_stats(corr, R_cam_arm, t_cam_arm,
+                                      turntable_axis, rocker)
+        else:
+            stats = board_world_stats(samples, R_cam_arm, t_cam_arm,
+                                      turntable_axis, rocker)
+        if axis is None:
+            axis_solved = True
+        tilt_deg = (float(np.degrees(np.linalg.norm(rocker.rvec)))
+                    if rocker is not None else 0.0)
+        _ui_log("I", (
+            f"calibration: refine accepted — reproj rms {refine_before:.2f} → "
+            f"{refine_after:.2f} px | EL-axis tilt {tilt_deg:.2f}° | "
+            f"el-scale {el_scale:.4f} | cx={cx:.1f} mm"
+        ))
+    else:
+        _ui_log("I", "calibration: refine skipped/rejected (no material gain) "
+                     "— keeping the ideal-axis PARK solve")
+        z_ref_mt = MountTransform(
+            t=tuple(float(v) for v in stats.t_ref),
+            rvec=tuple(float(x) for x in matrix_to_rotvec(stats.R_ref)),
+        )
+
+    result = derive_geometry(R_cam_arm, t_cam_arm)
     result.n_views = len(samples)
     result.n_attempted = len(poses)
-    result.rms_translation_mm, result.rms_rotation_deg = rms_t, rms_r
+    result.rms_translation_mm = stats.rms_translation_mm
+    result.rms_rotation_deg = stats.rms_rotation_deg
+    result.rocker = rocker
+    result.az_harm = az_harm
+    result.el_scale = el_scale
+    result.refine_rms_before_px = refine_before
+    result.refine_rms_after_px = refine_after
     # Free eccentricity read-off (diagnostic only; exact on a full ring).
     # rms_translation_mm is the quality flag.
+    t_z = np.asarray(z_ref_mt.t, float)
     result.board_eccentricity_mm = (float(t_z[0] - cx), float(t_z[1] - cy))
     result.board_height_mm = float(t_z[2])
     # Reference board-in-world pose Z_ref — persisted for "Test accuracy".
-    _bw_R, _bw_t = board_world_pose(samples, R_cam_arm, t_cam_arm, turntable_axis)
-    result.board_world = MountTransform(
-        t=(float(_bw_t[0]), float(_bw_t[1]), float(_bw_t[2])),
-        rvec=tuple(float(x) for x in matrix_to_rotvec(_bw_R)),
+    result.board_world = z_ref_mt
+
+    # ── per-view residual table: the fingerprint of remaining structure ──
+    result.diagnostics = per_view_diagnostics(
+        samples, intrinsics, R_cam_arm, t_cam_arm, z_ref_mt,
+        turntable_axis, rocker, az_harm, el_scale,
     )
+    for row in result.diagnostics:
+        px = (f" | reproj {row['reproj_px']:.2f} px"
+              if 'reproj_px' in row else "")
+        _ui_log("I", (
+            f"calibration:   view az={row['az']:.0f}° el={row['el']:.0f}° → "
+            f"Δpos {row['dpos_mm']:.1f} mm · Δrot {row['drot_deg']:.2f}°{px}"
+        ))
+    # Deterministic verdict on whatever is left — names the next defect.
+    structure = residual_structure(result.diagnostics)
+    if structure:
+        _ui_log("I", f"calibration: {structure}")
+
+    # Machine-readable dump for offline analysis (overwritten every run) —
+    # everything needed to re-derive the solve without asking for logs.
+    try:
+        import json as _json
+
+        from config import settings
+        views = []
+        for s, row in zip(samples, result.diagnostics or []):
+            v = dict(row)
+            v["B_rvec"] = [float(x) for x in matrix_to_rotvec(s.board_R_cam)]
+            v["B_t_mm"] = [float(x) for x in s.board_t_cam]
+            v["had_twin"] = s.board_pose_alt is not None
+            views.append(v)
+        dump = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "n_views": result.n_views, "n_attempted": result.n_attempted,
+            "board": {
+                "squares_x": int(model.charuco_squares_x),
+                "squares_y": int(model.charuco_squares_y),
+                "square_mm": float(model.charuco_square_length_mm),
+                "marker_mm": float(model.charuco_marker_length_mm),
+                "dict_id": int(model.aruco_dict_id),
+            },
+            "intrinsics": {
+                "fx": intrinsics.fx, "fy": intrinsics.fy,
+                "cx": intrinsics.cx, "cy": intrinsics.cy,
+                "dist": list(intrinsics.dist),
+                "from_photos": intrinsics_from_photos,
+            },
+            "X": {"rvec": [float(x) for x in matrix_to_rotvec(R_cam_arm)],
+                  "t_mm": [float(x) for x in t_cam_arm]},
+            "Z_ref": {"rvec": list(z_ref_mt.rvec), "t_mm": list(z_ref_mt.t)},
+            "cx_mm": float(cx),
+            "rocker_rvec": list(rocker.rvec) if rocker else None,
+            "az_harm_deg": list(az_harm) if az_harm else None,
+            "el_scale": el_scale,
+            "rms_translation_mm": result.rms_translation_mm,
+            "rms_rotation_deg": result.rms_rotation_deg,
+            "refine_rms_px": [refine_before, refine_after],
+            "residual_structure": structure,
+            "views": views,
+        }
+        dump_path = settings.storage_dir / "calib_debug_last.json"
+        dump_path.write_text(_json.dumps(dump, indent=1), encoding="utf-8")
+        _ui_log("I", f"calibration: debug dump → {dump_path}")
+    except Exception:  # noqa: BLE001 — diagnostics must never kill a solve
+        log.exception("calibration: debug dump failed")
 
     # ── carry the photo-solved intrinsics + axis for apply_result/result_dict ──
     result.intrinsics_from_photos = intrinsics_from_photos
@@ -986,7 +1734,10 @@ def apply_result(result: CalibrationResult) -> None:
     if result.turntable_axis_solved and result.turntable_cx_mm is not None:
         model.update(turntable_axis=(result.turntable_cx_mm, 0.0))
     # Persist the hand-eye X + board-in-world reference so "Test accuracy" can
-    # predict the board pose at the live encoder angles after a restart.
+    # predict the board pose at the live encoder angles after a restart. The
+    # rocker (EL-axis correction) is written alongside — and explicitly reset
+    # to None when this calibration didn't solve one, so a stale correction
+    # from a previous run can't haunt the FK chain.
     if result.extrinsic is not None and result.board_world is not None:
         model.update(
             calib_extrinsic={
@@ -997,6 +1748,16 @@ def apply_result(result: CalibrationResult) -> None:
                 "rvec": list(result.board_world.rvec),
                 "t": list(result.board_world.t),
             },
+            rocker_correction=(
+                {"rvec": list(result.rocker.rvec), "t": list(result.rocker.t)}
+                if result.rocker is not None else None
+            ),
+            az_encoder_correction=(
+                list(result.az_harm) if result.az_harm is not None else None
+            ),
+            el_encoder_scale=(
+                result.el_scale if result.el_scale != 1.0 else None
+            ),
         )
 
 
@@ -1011,9 +1772,6 @@ async def test_accuracy() -> dict[str, Any]:
     (human string, timestamped so the UI always sees a fresh value) and returns
     `{ok, detected, delta_deg, delta_mm, az, el}`.
     """
-    import camera_io
-    from datetime import datetime
-
     cv2 = _cv2()
     _ts = datetime.now().strftime("%H:%M:%S")  # stamp every msg so it's unique
     ex = getattr(model, "calib_extrinsic", None)
@@ -1024,42 +1782,62 @@ async def test_accuracy() -> dict[str, Any]:
         _ui_log("W", msg)
         return {"ok": True, "detected": False, "message": msg}
 
-    az, el = float(model.az), float(model.el)
+    az_raw, el_raw = float(model.az), float(model.el)
+    from config import settings
+    harm = (getattr(model, "az_encoder_correction", None)
+            if settings.az_harmonic_enabled else None)
+    az = az_encoder_corrected(
+        az_raw, tuple(harm) if harm else None)
+    k = getattr(model, "el_encoder_scale", None)
+    el = el_raw * float(k) if k else el_raw
     board = _build_board(_board_spec_from_model())
     intr = _intrinsics_from_model()
     raw = await camera_io.fetch_photo(el_deg=el)
     img = (cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
            if raw else None)
     corners, ids = detect_board(img, board) if img is not None else (None, None)
-    pose = (estimate_board_pose(corners, ids, board, intr)
-            if corners is not None else None)
-    if pose is None:
-        msg = f"Test accuracy ({_ts}): board NOT detected @ az={az:.0f}° el={el:.0f}°"
+    if corners is None:
+        msg = f"Test accuracy ({_ts}): board NOT detected @ az={az_raw:.0f}° el={el_raw:.0f}°"
         model.update(calib_test_msg=msg)
         _ui_log("W", msg)
         return {"ok": True, "detected": False, "message": msg}
 
-    R_bc, t_bc = pose
-    Ra, ta = arm_pose_in_world(az, el, getattr(model, "turntable_axis", None))
-    A = np.eye(4); A[:3, :3] = Ra; A[:3, 3] = ta
-    X = np.eye(4)
-    X[:3, :3] = Rotation.from_rotvec(np.asarray(ex["rvec"], float)).as_matrix()
-    X[:3, 3] = np.asarray(ex["t"], float)
-    B = np.eye(4); B[:3, :3] = R_bc; B[:3, 3] = t_bc
-    Z = A @ X @ B
-
-    Zr_R = Rotation.from_rotvec(np.asarray(zr["rvec"], float)).as_matrix()
+    # The calibrated forward kinematics predict the board's pose at this pose;
+    # use it to break the planar PnP two-fold ambiguity so a flipped twin
+    # solution can't masquerade as a calibration error.
+    A = homogeneous(*arm_pose_in_world(
+        az, el, getattr(model, "turntable_axis", None),
+        MountTransform.from_dict(getattr(model, "rocker_correction", None)),
+    ))
+    X = homogeneous(rotvec_to_matrix(np.asarray(ex["rvec"], float)),
+                    np.asarray(ex["t"], float))
+    Zr_R = rotvec_to_matrix(np.asarray(zr["rvec"], float))
     Zr_t = np.asarray(zr["t"], float)
+    Zr = homogeneous(Zr_R, Zr_t)
+    B_pred = np.linalg.inv(X) @ np.linalg.inv(A) @ Zr      # board→camera, predicted
+
+    pose = estimate_board_pose_disambiguated(
+        corners, ids, board, intr, B_pred[:3, :3])
+    if pose is None:
+        msg = f"Test accuracy ({_ts}): board pose unsolvable @ az={az_raw:.0f}° el={el_raw:.0f}°"
+        model.update(calib_test_msg=msg)
+        _ui_log("W", msg)
+        return {"ok": True, "detected": False, "message": msg}
+
+    R_bc, t_bc, ambiguity_deg = pose
+    Z = A @ X @ homogeneous(R_bc, t_bc)
     delta_mm = float(np.linalg.norm(Z[:3, 3] - Zr_t))
     delta_deg = float(np.degrees(
         np.linalg.norm(matrix_to_rotvec(Zr_R.T @ Z[:3, :3])),
     ))
-    msg = (f"Test accuracy ({_ts}) @ az={az:.0f}° el={el:.0f}°: "
-           f"Δrot {delta_deg:.2f}° · Δpos {delta_mm:.1f} mm")
+    amb = f" (planar-PnP ambiguity {ambiguity_deg:.0f}°)" if ambiguity_deg > 5 else ""
+    msg = (f"Test accuracy ({_ts}) @ az={az_raw:.0f}° el={el_raw:.0f}°: "
+           f"Δrot {delta_deg:.2f}° · Δpos {delta_mm:.1f} mm{amb}")
     model.update(calib_test_msg=msg)
     _ui_log("I", msg)
     return {"ok": True, "detected": True, "delta_deg": delta_deg,
-            "delta_mm": delta_mm, "az": az, "el": el}
+            "delta_mm": delta_mm, "az": az_raw, "el": el_raw,
+            "ambiguity_deg": ambiguity_deg}
 
 
 def result_dict(result: CalibrationResult) -> dict[str, Any]:
@@ -1095,4 +1873,15 @@ def result_dict(result: CalibrationResult) -> dict[str, Any]:
             {"t": list(result.extrinsic.t), "rvec": list(result.extrinsic.rvec)}
             if result.extrinsic is not None else None
         ),
+        "rocker": (
+            {"t": list(result.rocker.t), "rvec": list(result.rocker.rvec)}
+            if result.rocker is not None else None
+        ),
+        "az_encoder_harmonic_deg": (
+            list(result.az_harm) if result.az_harm is not None else None
+        ),
+        "el_encoder_scale":     result.el_scale,
+        "refine_rms_before_px": result.refine_rms_before_px,
+        "refine_rms_after_px":  result.refine_rms_after_px,
+        "diagnostics":          result.diagnostics,
     }

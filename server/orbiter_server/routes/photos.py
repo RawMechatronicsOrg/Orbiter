@@ -2,12 +2,26 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 import storage
-from models import Capture, CaptureMeta
+from models import Capture, CaptureMeta, Manifest
+from orbiter_model import model
 
 router = APIRouter(prefix="/scans/{scan_id}/photos", tags=["photos"])
 
 # Photo media is immutable per capture — cache forever, skip the 304 roundtrip.
 _IMMUTABLE = {"Cache-Control": "public, max-age=31536000, immutable"}
+
+
+def _reject_if_active(scan_id: str) -> None:
+    """409 while the scan is the device's active session — the scan loop
+    rebuilds the manifest from memory (write-through), so a REST mutation
+    would be resurrected with its files already gone. Use the
+    ``delete_capture`` WS command for the live session instead."""
+    if model.current_scan_id == scan_id:
+        raise HTTPException(
+            status_code=409,
+            detail=f"scan {scan_id} is the active session — "
+                   "mutate it through the device commands instead",
+        )
 
 
 @router.post("", response_model=Capture)
@@ -50,6 +64,24 @@ async def upload_photo(
     return capture
 
 
+@router.delete("/{capture_id}", response_model=Manifest)
+def delete_photo(scan_id: str, capture_id: str) -> Manifest:
+    """Delete one capture from a stored scan.
+
+    Removes the manifest entry, the capture's pool files, the materialized
+    ``photos/`` link, any mask/preview built from it, and the stale priors
+    file. Returns the updated manifest so the UI can refresh without a
+    second GET."""
+    _reject_if_active(scan_id)
+    try:
+        return storage.delete_scan_capture(scan_id, capture_id)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"capture {capture_id} not found in scan {scan_id}",
+        )
+
+
 @router.get("/{idx}/thumb")
 def get_thumb(scan_id: str, idx: int):
     try:
@@ -90,3 +122,31 @@ def get_full(scan_id: str, idx: int):
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="full not found")
     return FileResponse(p, media_type="image/jpeg", headers=_IMMUTABLE)
+
+
+# Mask media: regenerated in place by the masks tool between runs — always
+# revalidate (cheap 304s keep repeat visits snappy without staleness).
+_MASK_REVALIDATE = {"Cache-Control": "no-cache"}
+
+
+@router.get("/{idx}/mask")
+def get_mask(scan_id: str, idx: int):
+    """COLMAP mask for one capture (white = features kept). 404 until the
+    masks tool has produced it (see colmap/masks/README.md)."""
+    try:
+        p = storage.photo_mask_path(scan_id, idx)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="mask not found")
+    return FileResponse(p, media_type="image/png", headers=_MASK_REVALIDATE)
+
+
+@router.get("/{idx}/mask_preview")
+def get_mask_preview(scan_id: str, idx: int):
+    """Debug overlay (mask painted over the frame, green outline) written by
+    the masks tool next to the masks. 404 when the run skipped previews or
+    the frame has none."""
+    try:
+        p = storage.photo_mask_preview_path(scan_id, idx)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="mask preview not found")
+    return FileResponse(p, media_type="image/jpeg", headers=_MASK_REVALIDATE)

@@ -9,14 +9,15 @@ The app brings up:
   * the live camera MJPEG stream,
   * the scan-task autosave loop.
 
-v0.1 deliberately excludes the live triangulator and the photogrammetry
-job orchestration found in the parent storage-api. The ChArUco hand-eye
+The kit deliberately excludes the live triangulator and the photogrammetry
+job orchestration found in the parent research rig. The ChArUco hand-eye
 geometry calibration *is* included here (see calibration.py and the
 `calibrate_geometry` command).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -29,15 +30,15 @@ import scan_task
 from camera_stream import stream as camera_stream
 from config import settings
 from esp_proxy import esp
+from logsetup import install_loop_exception_handler, setup_logging
 from orbiter_model import PERSISTED_FIELDS, model
 from phone_sensor import phone_sensor
 from routes import captures, photos, scans, stream, ws
 from ws_hub import hub
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+# Non-blocking queue → data/logs/server.log; uvicorn access log off. See
+# logsetup.py for why a blocked stdout pipe must never stall the event loop.
+setup_logging("server")
 # The ESP proxy polls /state ~4 Hz — silence httpx's per-request INFO line.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -47,6 +48,7 @@ async def lifespan(_app: FastAPI):
     """Startup: bring up the WS hub, the ESP32 proxy and the camera stream;
     launch the scan autosave loop. Shutdown unwinds in reverse so each
     component's teardown can still talk to its dependencies."""
+    install_loop_exception_handler(asyncio.get_running_loop())
     hub.start(model)
     scan_task.publish_scan_list()   # populate model.scans so the Library lists
                                     # already-saved scans on first connect
@@ -75,7 +77,7 @@ app = FastAPI(
         "scan-session manifests, photo storage, live camera adapter, "
         "WebSocket scene graph."
     ),
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 

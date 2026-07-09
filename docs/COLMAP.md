@@ -12,20 +12,23 @@ This guide assumes you have a session saved by Orbiter (see
 
 The easiest path. Use the [`colmap/`](../colmap/) container we ship.
 
+From the UI, in the **Library** tab → pick a session → **Export → SfM
+priors**. That writes `sfm_priors.json` *and* materializes the capture
+originals into `scans/<session_id>/photos/` — the layout the runner reads.
+Then:
+
 ```bash
 cd docker
-docker compose up colmap
+docker compose --profile colmap run --rm colmap \
+    run_colmap_session.sh <session_id>          # add --gpu for CUDA
 ```
 
-From the UI, in the **Library** tab → pick a session → **Export → COLMAP
-priors**. Then in the same panel: **Run COLMAP**.
-
-The container mounts the storage directory read-only, reads the session
-manifest, builds the COLMAP database + priors, and runs the reconstruction.
-Output ends up in `<storage>/scans/<session_id>/colmap/`.
-
-Progress is streamed back to the UI. Hit cancel and the container is
-killed.
+The runner pins the COLMAP camera model to the priors intrinsics, picks up
+object masks automatically when `scans/<session_id>/masks/` exists (see
+[`colmap/masks/README.md`](../colmap/masks/README.md)), syncs the priors
+into the COLMAP database (`pose_priors`, `rigs.txt`/`frames.txt`), and runs
+triangulation + dense reconstruction. Output ends up in
+`<storage>/scans/<session_id>/colmap/`.
 
 ## Option B — Hand-off to your own COLMAP
 
@@ -39,22 +42,27 @@ From the UI: **Library → session → Export → SfM priors** writes
 {
   "schema": "orbiter.sfm_priors.v1",
   "camera_intrinsics": {
-    "model": "PINHOLE",
-    "width":  1920,
-    "height": 1080,
-    "fx": 1500,
-    "fy": 1500,
-    "cx":  960,
-    "cy":  540
+    "model": "PINHOLE",              // "OPENCV" once calibrated with distortion
+    "width":  4080,                  // stored-photo pixels
+    "height": 3060,
+    "fx": 3122.9,
+    "fy": 3122.1,
+    "cx": 2039.5,
+    "cy": 1529.5
   },
   "images": [
     {
-      "file": "c_001/photo.jpg",
+      "file": "photos/001_az000_el+15.jpg",
       "qw":  0.707, "qx": 0, "qy": 0.707, "qz": 0,
       "tx":   220, "ty": 0,  "tz":  45
     }
     /* ... */
-  ]
+  ],
+  "turntable": {                     // present once the rig is calibrated
+    "axis_xy_mm": [1.8, 0.0],
+    "board": { "rvec": [/*…*/], "t": [/*…*/],
+               "width_mm": 288, "height_mm": 288 }
+  }
 }
 ```
 
@@ -63,20 +71,33 @@ Quaternions are **Hamilton** convention (w, x, y, z). Translations are in
 [`ARCHITECTURE.md`](ARCHITECTURE.md). The transform takes world points
 into camera space (COLMAP's convention).
 
-Camera intrinsics are guessed from the IP Webcam stream by default — if
-you've calibrated your phone separately, override them via the **Camera
-config** panel before exporting.
+Once the rig has been ChArUco-calibrated, the exporter embeds the solved
+intrinsics (rotated to match the stored-pixel orientation) instead of the
+IP-Webcam guess — if you've calibrated your phone separately, override via
+the **Camera config** panel before exporting.
 
-To use the priors in your COLMAP run:
+To use the priors in your COLMAP run
+([`colmap/sfm_priors_to_colmap.py`](../colmap/sfm_priors_to_colmap.py) does
+the JSON → text-model conversion):
 
 ```bash
+# Pin the database camera to the priors intrinsics — without this COLMAP
+# defaults to SIMPLE_RADIAL and point_triangulator aborts on the mismatch.
+CAM_FLAGS=$(python3 sfm_priors_to_colmap.py --emit-extractor-flags sfm_priors.json)
+
 colmap feature_extractor \
     --database_path session.db \
-    --image_path photos/
+    --image_path photos/ \
+    --ImageReader.single_camera=1 \
+    $CAM_FLAGS
+    # add --ImageReader.mask_path masks/ if you generated object masks
 
 colmap exhaustive_matcher --database_path session.db
 
-# load priors as a fixed sparse model, then triangulate / refine
+# priors -> text model, image/frame ids synced to the database (also fills
+# COLMAP's pose_priors table and emits rigs.txt/frames.txt for COLMAP >= 3.13)
+python3 sfm_priors_to_colmap.py sfm_priors.json priors_sparse/ --database session.db
+
 colmap point_triangulator \
     --database_path session.db \
     --image_path photos/ \
@@ -93,11 +114,6 @@ colmap stereo_fusion        --workspace_path dense/ \
                             --output_path dense/fused.ply
 ```
 
-The conversion from `sfm_priors.json` to COLMAP's `cameras.txt` /
-`images.txt` is a one-liner in Python — see
-[`server/orbiter_server/sfm_export.py`](../server/orbiter_server/sfm_export.py)
-for our implementation.
-
 ## How accurate are the priors?
 
 It depends on how carefully you measured `arm_radius`, `base_height`,
@@ -112,9 +128,10 @@ with a calliper-measured arm and AS5600 + AS5048A encoders should give:
 That's not enough for "feature-free" reconstruction, but it's plenty as a
 warm start. COLMAP's bundle adjustment will polish them.
 
-If you want **better** priors, the parent repo (`Orbiter/`) has a ChArUco
-hand-eye calibration that gets the per-shot error down to ~10 mm / ~0.5°
-after solving. That's not part of v0.1.
+If you want **better** priors, run the ChArUco hand-eye calibration that
+ships with the kit (**Machine config → Calibrate from board**) — it refines
+the machine geometry, solves the camera intrinsics from the same photos and
+gets the per-shot error down to ~10 mm / ~0.5°.
 
 ## What this is *not* good for
 

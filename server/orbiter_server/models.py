@@ -75,6 +75,13 @@ class CaptureMeta(BaseModel):
     # Full camera orientation as a three.js object-frame quaternion
     # [x, y, z, w] (-Z along the optical axis). Optional.
     camera_quat: list[float] | None = None
+    # Which pixel frame `camera_quat` is expressed in:
+    #   "stored" — matches the stored (preset-rotated) original.jpg pixels;
+    #              what frustum renderers and the SfM exporter expect.
+    #   None     — legacy record: the SENSOR frame (pre-rotation pixels).
+    #              Identical to "stored" when the preset applies no turns
+    #              (native); 90 deg off for presets that rotate the file.
+    quat_frame: Literal["stored"] | None = None
     timestamp: str
     planned_az_deg: float | None = None
     planned_el_deg: float | None = None
@@ -143,6 +150,11 @@ class Manifest(BaseModel):
     path: list[ScanPathPoint] = Field(default_factory=list)
     # Snapshot of the MotionPlanner used (machine scans only). See MotionPlan.
     motion_plan: dict[str, Any] | None = None
+    # Points the scan loop SKIPPED after exhausting capture/move retries
+    # (entries: index/az_deg/el_deg/stage/error/timestamp) — the sweep
+    # continues past transient failures instead of dying; this is the honest
+    # record of the gaps. See scan_task._record_failed_point.
+    failed_points: list[dict[str, Any]] = Field(default_factory=list)
     notes: str = ""
     tags: list[str] = Field(default_factory=list)
     archived: bool = False

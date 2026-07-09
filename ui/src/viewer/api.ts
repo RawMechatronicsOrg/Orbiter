@@ -1,7 +1,7 @@
 /**
- * Shared HTTP client for the storage-api. WS commands handle mutating state
- * the model exposes; HTTP is for everything else (calibration sessions,
- * scan storage, verify, config). Single source of truth for `API_BASE`.
+ * Shared HTTP client for the Orbiter server. WS commands handle mutating
+ * state the model exposes; HTTP is for everything else (calibration
+ * sessions, scan storage, config). Single source of truth for `API_BASE`.
  */
 
 /** True when the UI is served by the Vite dev server (proxied API + WS). */
@@ -37,25 +37,37 @@ export function cameraStreamUrl(): string {
   return `${API_BASE}/camera/stream.mjpeg`;
 }
 
-export async function getJson<T>(path: string): Promise<T> {
-  const r = await fetch(API_BASE + path);
-  if (!r.ok) throw new Error(`${path}: HTTP ${r.status}`);
-  return (await r.json()) as T;
-}
+// ── core fetchers ────────────────────────────────────────────────────────────
 
-export async function postJson<T>(path: string, body: unknown = {}): Promise<T> {
+async function sendJson<T>(
+  method: 'POST' | 'PATCH',
+  path: string,
+  body: unknown,
+): Promise<T> {
   const r = await fetch(API_BASE + path, {
-    method: 'POST',
+    method,
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
   if (!r.ok) {
     let detail = '';
     try { detail = ` — ${(await r.json()).detail ?? ''}`; } catch { /* ignore */ }
-    throw new Error(`POST ${path}: HTTP ${r.status}${detail}`);
+    throw new Error(`${method} ${path}: HTTP ${r.status}${detail}`);
   }
   return (await r.json()) as T;
 }
+
+export async function getJson<T>(path: string): Promise<T> {
+  const r = await fetch(API_BASE + path);
+  if (!r.ok) throw new Error(`${path}: HTTP ${r.status}`);
+  return (await r.json()) as T;
+}
+
+export const postJson = <T>(path: string, body: unknown = {}): Promise<T> =>
+  sendJson<T>('POST', path, body);
+
+export const patchJson = <T>(path: string, body: unknown = {}): Promise<T> =>
+  sendJson<T>('PATCH', path, body);
 
 export async function del(path: string): Promise<void> {
   const r = await fetch(API_BASE + path, { method: 'DELETE' });

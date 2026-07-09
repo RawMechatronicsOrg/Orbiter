@@ -11,12 +11,13 @@
  * calibration plane, a pose) into those abstract nodes.
  */
 
-import { useEffect, useRef } from 'react';
-import { Canvas } from '@react-three/fiber';
+import { useEffect, useMemo, useRef } from 'react';
+import { Canvas, useThree } from '@react-three/fiber';
 import { OrbitControls, Grid, GizmoHelper, GizmoViewport } from '@react-three/drei';
 import * as THREE from 'three';
 import type { SceneNode, Transform } from './protocol';
 import { createObject, disposeObject } from './nodeRegistry';
+import { raycastPick } from './picking';
 
 export type Vec3 = [number, number, number];
 
@@ -142,6 +143,9 @@ function SceneRoot({ nodes }: { nodes: SceneNode[] }) {
       );
       obj.scale.set(t.scale[0], t.scale[1], t.scale[2]);
       obj.visible = node.visible;
+      // Carry pick metadata so the raycaster can map a hit back to its node.
+      obj.userData.nodeId = node.id;
+      obj.userData.pickable = node.pickable;
       root.add(obj);
       built.push(obj);
     }
@@ -155,14 +159,52 @@ function SceneRoot({ nodes }: { nodes: SceneNode[] }) {
   return <group ref={rootRef} />;
 }
 
+/** Raycasts pointer clicks against the scene and reports the picked node id.
+ *  A small drag tolerance keeps orbit-drags from registering as clicks. */
+function PickController({ onPick }: { onPick: (nodeId: string) => void }) {
+  const { camera, gl, scene } = useThree();
+  const raycaster = useMemo(() => new THREE.Raycaster(), []);
+
+  useEffect(() => {
+    const el = gl.domElement;
+    let down: { x: number; y: number } | null = null;
+    const onPointerDown = (ev: PointerEvent) => {
+      down = { x: ev.clientX, y: ev.clientY };
+    };
+    const onPointerUp = (ev: PointerEvent) => {
+      if (!down) return;
+      const moved = Math.hypot(ev.clientX - down.x, ev.clientY - down.y);
+      down = null;
+      if (moved > 5) return; // a drag (orbit), not a click
+      const rect = el.getBoundingClientRect();
+      const ndc = new THREE.Vector2(
+        ((ev.clientX - rect.left) / rect.width) * 2 - 1,
+        -((ev.clientY - rect.top) / rect.height) * 2 + 1,
+      );
+      const hit = raycastPick(raycaster, camera, ndc, scene);
+      if (hit) onPick(hit.nodeId);
+    };
+    el.addEventListener('pointerdown', onPointerDown);
+    el.addEventListener('pointerup', onPointerUp);
+    return () => {
+      el.removeEventListener('pointerdown', onPointerDown);
+      el.removeEventListener('pointerup', onPointerUp);
+    };
+  }, [camera, gl, scene, raycaster, onPick]);
+
+  return null;
+}
+
 /** Library 3D viewer — world axes + grid, orbit controls, and the given
  *  nodes rendered through `nodeRegistry` (same path as the Scaner). */
 export function LibraryScene({
   nodes,
   target = [0, 0, 0],
+  onPick,
 }: {
   nodes: SceneNode[];
   target?: Vec3;
+  onPick?: (nodeId: string) => void;
 }) {
   return (
     <Canvas
@@ -201,6 +243,7 @@ export function LibraryScene({
         />
       </GizmoHelper>
       <SceneRoot nodes={nodes} />
+      {onPick && <PickController onPick={onPick} />}
     </Canvas>
   );
 }

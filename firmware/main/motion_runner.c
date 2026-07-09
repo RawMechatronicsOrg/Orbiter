@@ -89,6 +89,7 @@ static void run_move(uint32_t id, const mr_cmd_t *cmd)
 
     esp_err_t ret = motion_move(cmd->u.move.az_deg, cmd->u.move.el_deg,
                                 cmd->u.move.has_az, cmd->u.move.has_el,
+                                cmd->u.move.az_hz_max, cmd->u.move.el_hz_max,
                                 cmd->u.move.timeout_ms, &final);
     uint32_t dur = (uint32_t)(esp_timer_get_time() / 1000ULL - t0);
     uint64_t now_ms = esp_timer_get_time() / 1000ULL;

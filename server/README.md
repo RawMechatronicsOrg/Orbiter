@@ -2,11 +2,10 @@
 
 FastAPI service for the two-axis Orbiter turntable.
 
-This is the **v0.1** server. Compared to the parent repo's `storage-api`
-it intentionally omits the laser triangulator and the photogrammetry job
-orchestration — what remains is the minimum required to drive the rig,
-capture (manual or motion-planned) photo sessions, and run ChArUco
-hand-eye geometry calibration.
+Compared to the parent research rig it intentionally omits the laser
+triangulator and the photogrammetry job orchestration — what remains is
+the minimum required to drive the rig, capture (manual or motion-planned)
+photo sessions, and run ChArUco hand-eye geometry calibration.
 
 ## What it does
 
@@ -93,12 +92,13 @@ docker run --rm -p 8000:8000 \
       meta.json
 ```
 
-## Out of scope for v0.1
+## Out of scope
 
-The parent repo's `storage-api` carries a live laser-stripe triangulator
-and a photogrammetry job orchestrator. Neither is shipped here. The v0.1
-slice does ship a ChArUco hand-eye solver (`calibration.py`) so the rig
-geometry can be derived from a calibration board rather than measured
-with calipers and entered by hand. The SfM-priors exporter writes
-COLMAP-ready poses from that derived geometry; refining them further is
-a downstream COLMAP-side step.
+The parent research rig carries a live laser-stripe triangulator and a
+photogrammetry job orchestrator. Neither is shipped here. The kit does
+ship a ChArUco hand-eye solver (`calibration.py`) so the rig geometry —
+and, since v0.2, the camera intrinsics, the turntable axis, the EL-axis
+tilt and per-view diagnostics — can be derived from calibration photos
+rather than measured with calipers and entered by hand. The SfM-priors
+exporter writes COLMAP-ready poses from that derived geometry; refining
+them further is a downstream COLMAP-side step.

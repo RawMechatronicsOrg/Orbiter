@@ -1,14 +1,16 @@
 /**
  * The generic viewer: a Top / Left / Right bar frame around the
  * domain-agnostic scene renderer, all driven by one WebSocket to the
- * Python server. The top-level Scaner / Library switch is a Radix Tabs
- * root — TopBar renders its TabsList, content goes in TabsContent below.
+ * Python server. The top-level Scaner / Library / Help switch is a Radix
+ * Tabs root — TopBar renders its TabsList, content goes in TabsContent
+ * below. The active tab lives in the uiStore so other features (e.g. the
+ * Library's "Open in 3D") can switch tabs programmatically.
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo } from 'react';
 import { WsClient } from './WsClient';
 import { SceneRenderer } from './SceneRenderer';
-import { TopBar, type ViewerTab } from './TopBar';
+import { TopBar } from './TopBar';
 import { LeftBar } from './LeftBar';
 import { RightBar } from './RightBar';
 import { PositionOverlay } from './PositionOverlay';
@@ -20,13 +22,15 @@ import { LogPanel } from './LogPanel';
 import { CaptureProgressModal } from './CaptureProgressModal';
 import { makeCommands } from './commands';
 import { bindClientToStore, useViewerStore } from './modelStore';
+import { useUiStore, type ViewerTab } from './uiStore';
 import { Tabs, TabsContent } from '../components/ui/tabs';
 import { wsSceneUrl } from './api';
 
 export function ViewerApp() {
   const client = useMemo(() => new WsClient(wsSceneUrl()), []);
   const commands = useMemo(() => makeCommands(client), [client]);
-  const [tab, setTab] = useState<ViewerTab>('scaner');
+  const activeTab = useUiStore((s) => s.activeTab);
+  const setActiveTab = useUiStore((s) => s.setActiveTab);
 
   useEffect(() => {
     bindClientToStore(client.handlers);
@@ -48,8 +52,8 @@ export function ViewerApp() {
 
   return (
     <Tabs
-      value={tab}
-      onValueChange={(v) => setTab(v as ViewerTab)}
+      value={activeTab}
+      onValueChange={(v) => setActiveTab(v as ViewerTab)}
       className="fixed inset-0 flex flex-col bg-stage"
     >
       <TopBar commands={commands} />
