@@ -77,6 +77,22 @@ MAX_RMS_PX = 1.5
 #: of tilt across the set reveals whether it was there.
 MIN_TILT_SPREAD = 8.0
 
+#: A view whose reprojection error exceeds this multiple of the set's median is
+#: dropped and the solve repeated once.
+#:
+#: Measured on 98 live views from this rig: the per-view median was 0.73 px but
+#: the worst reached 3.25 px, and those few dragged the overall rms to 0.91.
+#: Refitting the best half gave 0.54 px while moving the focal length by 1% and
+#: the principal point by 0.1% — so the bad views were adding error without
+#: adding information. Dropping them reports an honest figure instead of one
+#: inflated by frames the operator could not have known were blurred.
+OUTLIER_FACTOR = 2.0
+
+#: Never discard more than this fraction, however bad the set looks. Beyond it
+#: the problem is the whole set, and silently calibrating from a third of it
+#: would hide that.
+MAX_OUTLIER_FRACTION = 0.3
+
 
 #: Divisor that brings the tilt terms onto the same 0..1 footing as position
 #: and scale for the novelty distance. Measured: a stationary board's tilt
@@ -339,6 +355,8 @@ class SolveResult:
     #: Per-view reprojection RMS — the outlier view is visible here even when
     #: the overall figure looks acceptable.
     per_view_rms: list[float] = field(default_factory=list)
+    #: Views the robust pass discarded before the final fit.
+    dropped: int = 0
 
     def as_config(self) -> dict:
         """The payload `set_stereo_rig` stores on an eye.
@@ -402,6 +420,25 @@ def solve(
         rms, k, dist, rvecs, tvecs = cv2.calibrateCamera(
             obj_pts, img_pts, wh, None, None, flags=flags,
         )
+        per_view = _per_view_rms(obj_pts, img_pts, rvecs, tvecs, k, dist)
+
+        # One robust pass: drop the views the fit cannot explain and refit. A
+        # blurred frame adds error without adding information, and the operator
+        # had no way to see it at capture time.
+        dropped = 0
+        median = float(np.median(per_view))
+        cut = OUTLIER_FACTOR * median
+        keep = [j for j, e in enumerate(per_view) if e <= cut]
+        if (len(keep) >= MIN_VIEWS
+                and len(keep) >= (1.0 - MAX_OUTLIER_FRACTION) * len(per_view)
+                and len(keep) < len(per_view)):
+            dropped = len(per_view) - len(keep)
+            obj_pts = [obj_pts[j] for j in keep]
+            img_pts = [img_pts[j] for j in keep]
+            rms, k, dist, rvecs, tvecs = cv2.calibrateCamera(
+                obj_pts, img_pts, wh, None, None, flags=flags,
+            )
+            per_view = _per_view_rms(obj_pts, img_pts, rvecs, tvecs, k, dist)
     except cv2.error as exc:
         return None, f"solve failed: {exc}"
 
@@ -409,12 +446,6 @@ def solve(
         return None, "solve produced a non-finite RMS"
     if rms > MAX_RMS_PX:
         return None, f"reprojection RMS {rms:.2f} px exceeds {MAX_RMS_PX} px"
-
-    per_view = []
-    for o, i, rv, tv in zip(obj_pts, img_pts, rvecs, tvecs):
-        proj, _ = cv2.projectPoints(o, rv, tv, k, dist)
-        err = np.linalg.norm(proj.reshape(-1, 2) - i.reshape(-1, 2), axis=1)
-        per_view.append(float(np.sqrt((err ** 2).mean())))
 
     return SolveResult(
         intrinsics=Intrinsics(
@@ -427,4 +458,15 @@ def solve(
         wh=wh,
         tilt_spread=float("nan") if tilt_spread is None else float(tilt_spread),
         per_view_rms=per_view,
+        dropped=dropped,
     ), None
+
+
+def _per_view_rms(obj_pts, img_pts, rvecs, tvecs, k, dist) -> list[float]:
+    """Reprojection RMS for each view, in pixels."""
+    out = []
+    for o, i, rv, tv in zip(obj_pts, img_pts, rvecs, tvecs):
+        proj, _ = cv2.projectPoints(o, rv, tv, k, dist)
+        err = np.linalg.norm(proj.reshape(-1, 2) - i.reshape(-1, 2), axis=1)
+        out.append(float(np.sqrt((err ** 2).mean())))
+    return out
