@@ -30,8 +30,10 @@ solve later uses the subset where both are.
 
 from __future__ import annotations
 
+import io
 import logging
 import os
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -295,7 +297,13 @@ class SampleSet:
         # is passed rather than the path because `savez_compressed` appends
         # `.npz` to any name that lacks it — which would write beside the temp
         # name instead of to it.
-        tmp = p.with_name(p.name + ".tmp")
+        #
+        # The temp name carries the process id. A fixed one is not enough: two
+        # copies of the app, each auto-capturing, wrote the same temp file at
+        # once and their output interleaved, leaving a npz whose members failed
+        # their CRC. The rename stays atomic, so the last writer wins cleanly
+        # instead of both losing.
+        tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
         with open(tmp, "wb") as fh:
             np.savez_compressed(fh, **blob)
         os.replace(tmp, p)
@@ -312,7 +320,11 @@ class SampleSet:
         if not p.exists():
             return 0
         try:
-            with np.load(p) as blob:
+            # Read the bytes first, then parse. np.load on a path is lazy, so a
+            # concurrent rewrite — auto-capture saves after every view — can
+            # change the file out from under a half-finished read.
+            raw = io.BytesIO(p.read_bytes())
+            with np.load(raw) as blob:
                 n = int(blob["count"][0])
                 loaded: list[PairSample] = []
                 for i in range(n):
@@ -333,7 +345,10 @@ class SampleSet:
                                 capture_mono=None if np.isnan(t) else t)
                     if sides["left"] is not None or sides["right"] is not None:
                         loaded.append(PairSample(**sides))
-        except (OSError, KeyError, ValueError) as exc:
+        except (OSError, KeyError, ValueError, zipfile.BadZipFile) as exc:
+            # A truncated or corrupt file must cost the captured set, not the
+            # session: without BadZipFile here the app died on startup instead
+            # of beginning with an empty set.
             log.warning("could not load captured views from %s: %s", p, exc)
             return 0
         self.samples = loaded
