@@ -177,6 +177,11 @@ class EyeView:
     ids: np.ndarray
     wh: tuple[int, int]
     descriptor: ViewDescriptor
+    #: camserver's capture instant for this frame. Kept so the gap between the
+    #: two eyes of a pair stays measurable after the fact — a stereo residual
+    #: that correlates with it means the board moved between the two exposures,
+    #: which no amount of calibration can fix and which is otherwise invisible.
+    capture_mono: float | None = None
 
 
 @dataclass
@@ -218,6 +223,21 @@ class SampleSet:
     def paired(self) -> list[PairSample]:
         """Samples where both eyes saw the board — the stereo solve's input."""
         return [s for s in self.samples if s.both]
+
+    def pair_gaps_ms(self) -> list[float]:
+        """How far apart, in ms, the two exposures of each pair were.
+
+        camserver reports the pair as free-running rather than held, so this is
+        not always ~0. With a hand-held board it bounds how much the board
+        could have moved between the two views, which sets a floor on the
+        stereo residual that no calibration can remove.
+        """
+        out = []
+        for p in self.paired():
+            a, b = p.left.capture_mono, p.right.capture_mono
+            if a is not None and b is not None:
+                out.append(abs(a - b) * 1000.0)
+        return out
 
     def novelty(self, side: str, d: ViewDescriptor | None) -> float:
         """Distance from `d` to the nearest held view of that eye.
@@ -266,6 +286,9 @@ class SampleSet:
                 blob[f"{i}_{side}_corners"] = v.corners
                 blob[f"{i}_{side}_ids"] = v.ids
                 blob[f"{i}_{side}_wh"] = np.asarray(v.wh, np.int32)
+                blob[f"{i}_{side}_t"] = np.asarray(
+                    [float("nan") if v.capture_mono is None else v.capture_mono],
+                    np.float64)
         blob["count"] = np.asarray([len(self.samples)], np.int32)
         # Written to a temp file and renamed, so an interrupted save cannot
         # leave a half-written set where a complete one used to be. The handle
@@ -303,7 +326,11 @@ class SampleSet:
                         wh = tuple(int(v) for v in blob[f"{i}_{side}_wh"])
                         d = describe(corners, ids, board, wh)
                         if d is not None:
-                            sides[side] = EyeView(corners, ids, wh, d)
+                            tkey = f"{i}_{side}_t"
+                            t = float(blob[tkey][0]) if tkey in blob else float("nan")
+                            sides[side] = EyeView(
+                                corners, ids, wh, d,
+                                capture_mono=None if np.isnan(t) else t)
                     if sides["left"] is not None or sides["right"] is not None:
                         loaded.append(PairSample(**sides))
         except (OSError, KeyError, ValueError) as exc:

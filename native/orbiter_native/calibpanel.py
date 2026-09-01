@@ -58,7 +58,14 @@ log = logging.getLogger("orbiter_native.calibpanel")
 #: Two frames count as simultaneous within this much of camserver's capture
 #: clock — the one clock that times both cameras, which holds the pair to about
 #: 0.05 ms. Well under the ~33 ms frame interval, so it still names one frame.
-_PAIR_WINDOW_S = 0.010
+#:
+#: Tightened from 10 ms after the pair measured a median gap of 3.75 ms in
+#: practice: camserver reports the pair as free-running rather than held, and a
+#: hand-held board keeps moving during that gap, so the two eyes see it in
+#: slightly different places. That is a floor on the stereo residual no
+#: calibration can lift. Views still carry their capture instants, so
+#: `SampleSet.pair_gaps_ms` can show whether this is what is limiting a set.
+_PAIR_WINDOW_S = 0.004
 
 #: How many recent results to keep per eye while looking for a partner frame.
 #:
@@ -352,7 +359,8 @@ class CalibrationPanel(QFrame):
                 continue
             if not force and not self._still(r):
                 return
-            views[side] = EyeView(r.board.corners, r.board.ids, r.wh, r.descriptor)
+            views[side] = EyeView(r.board.corners, r.board.ids, r.wh,
+                                  r.descriptor, capture_mono=r.capture_mono)
 
         if views["left"] is None and views["right"] is None:
             return
@@ -473,6 +481,7 @@ class CalibrationPanel(QFrame):
         if self._stereo is not None:
             payload["_extrinsics"] = self._stereo.as_config()
         self.save_requested.emit(payload)
-        self.report.setText(
-            self.report.text() + "\n\nsent to server — the panels will show "
-            "board pose once it comes back")
+        # Replace, never append: a stale "sent to server" line left under a
+        # later failure reads as if the failed solve had been saved.
+        self.report.setText("sent to server — the panels will show board pose "
+                            "once it comes back")
