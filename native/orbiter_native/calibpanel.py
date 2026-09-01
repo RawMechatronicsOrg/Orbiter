@@ -283,9 +283,22 @@ class CalibrationPanel(QFrame):
     # ── live feed ─────────────────────────────────────────────────────────
 
     def on_result(self, res: EyeResult) -> None:
-        """Take one eye's result and, when a partner frame exists, capture."""
+        """Take one eye's result and, when a partner frame exists, capture.
+
+        The plane collector is fed first but must never gate what follows:
+        it has its own preconditions (left eye, intrinsics, laser on, a board
+        pose), and view capture has none of them. An earlier edit left the
+        history append, the live refresh and auto-capture inside the
+        collector's early returns, so with no intrinsics yet — exactly the
+        state at the start of every calibration — nothing ever captured.
+        """
         self._collect_plane(res)
         self._still(res)                 # keep the stillness history current
+        if res.board is not None and res.board.corners is not None:
+            self._recent[res.side].append(res)
+        self._refresh_live(res)
+        if self.auto.isChecked():
+            self._capture(force=False)
 
     def _collect_plane(self, res: EyeResult) -> None:
         """Bank stripe-on-board points from the LEFT eye.
@@ -303,11 +316,6 @@ class CalibrationPanel(QFrame):
             return
         self._plane_pts.add_frame(line.inlier_points, self._left_k,
                                   board.R, board.t, line.rms_px)
-        if res.board is not None and res.board.corners is not None:
-            self._recent[res.side].append(res)
-        self._refresh_live(res)
-        if self.auto.isChecked():
-            self._capture(force=False)
 
     def _find_pair(self):
         """The closest-in-capture-time result from each eye, if they pair up.
