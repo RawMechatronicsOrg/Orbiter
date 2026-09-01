@@ -468,9 +468,13 @@ class CalibrationPanel(QFrame):
             self.report.setText(f"stereo: {why}")
             return
         self._stereo = res
+        fx = self._known_k["left"].fx
         self.report.setText(
             f"stereo: baseline {res.baseline_mm:.1f} mm  rms {res.rms_px:.3f} px\n"
-            f"  over {res.n_views} simultaneous views @ {res.wh[0]}x{res.wh[1]}"
+            f"  over {res.n_views} simultaneous views @ {res.wh[0]}x{res.wh[1]}\n"
+            f"  depth error ~{res.depth_error_mm(300, fx):.1f} mm at 300 mm, "
+            f"~{res.depth_error_mm(500, fx):.1f} mm at 500 mm\n"
+            f"  (halving it needs twice the baseline, not a better fit)"
         )
         self.btn_save.setEnabled(True)
 

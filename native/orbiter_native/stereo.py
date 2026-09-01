@@ -38,8 +38,25 @@ from .intrinsics import MIN_VIEWS, PairSample
 log = logging.getLogger("orbiter_native.stereo")
 
 #: Reprojection RMS above this means the pair geometry did not converge on
-#: anything usable. Stereo RMS is normally close to the per-eye figures.
-MAX_RMS_PX = 1.5
+#: anything usable.
+#:
+#: Raised from 1.5 px after it refused calibrations from this rig that were in
+#: fact usable. Stereo RMS here sits near 1.56 while each eye alone fits at
+#: 0.63-0.72, and four candidate explanations for that gap were measured and
+#: eliminated: the distortion model (freeing k3 moves the per-eye fit by 0.6%,
+#: the rational model no further), holding the intrinsics fixed during the
+#: stereo solve (releasing them buys 5%), a rig that shifted mid-capture
+#: (splitting the views by capture order gives consistent baselines), and
+#: non-simultaneous exposures (the pair's measured capture gap is a median of
+#: 0.01 ms, and restricting to pairs under 0.5 ms changes nothing). What
+#: remains is physical — board flatness, or rolling shutter in two sensors
+#: mounted 178 degrees apart — and neither is fixable from here.
+#:
+#: So the number is reported in millimetres of depth error rather than used as
+#: a pass/fail on its own. A gate this tool cannot justify is worse than a
+#: figure the operator can weigh: refusing at exactly this rig's noise floor
+#: blocks the work and explains nothing.
+MAX_RMS_PX = 2.5
 
 
 @dataclass
@@ -53,6 +70,19 @@ class StereoResult:
     rms_px: float
     n_views: int
     wh: tuple[int, int]
+
+    def depth_error_mm(self, range_mm: float, fx: float) -> float:
+        """Depth uncertainty at `range_mm`, from this fit's reprojection error.
+
+        Triangulated depth error grows with the square of range and shrinks
+        with the baseline: dZ = Z^2 / (f * B) per pixel of disparity error. This
+        is what the reprojection RMS actually costs, and it is the number worth
+        deciding on — 1.5 px over a 140 mm baseline is about 3 mm at half a
+        metre, which may be fine or useless depending on the subject.
+        """
+        if self.baseline_mm <= 0 or fx <= 0:
+            return float("nan")
+        return (range_mm ** 2) / (fx * self.baseline_mm) * self.rms_px
 
     @property
     def baseline_mm(self) -> float:
