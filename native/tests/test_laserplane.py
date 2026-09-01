@@ -63,6 +63,19 @@ def _stripe_on_board(board_R, board_t, n=400, noise=0.0, rng=None):
     return px[inside], xyz[inside]
 
 
+#: Board poses whose stripe lands inside the frame for this synthetic sheet.
+#: Several, at varied tilts and depths, so a plane is determined and the
+#: three-pose gate is met with margin.
+GOOD_POSES = (
+    ((0.25, -0.15, 0.0), (0, 0, 520)),
+    ((-0.2, 0.3, 0.1), (30, -20, 600)),
+    ((0.05, -0.35, -0.1), (-25, 15, 460)),
+    ((0.15, 0.1, 0.0), (10, 5, 550)),
+    ((-0.1, -0.2, 0.05), (-10, -10, 500)),
+    ((0.2, 0.25, -0.05), (20, 10, 640)),
+)
+
+
 def test_rays_are_unit_and_point_forward() -> None:
     px = np.array([[640.0, 360.0], [100.0, 80.0], [1200.0, 700.0]])
     d = rays(px, K)
@@ -85,14 +98,14 @@ def test_points_on_board_recovers_the_true_3d() -> None:
 def test_fit_recovers_the_known_plane() -> None:
     rng = np.random.default_rng(3)
     col = PlaneCollector()
-    for rv, tv in (((0.25, -0.15, 0.0), (0, 0, 520)),
-                   ((-0.2, 0.3, 0.1), (30, -20, 600)),
-                   ((0.05, -0.35, -0.1), (-25, 15, 460)),
-                   ((0.3, 0.2, 0.2), (0, 25, 700))):
+    # More poses than strictly needed: not every synthetic pose lands the
+    # stripe inside the frame, and the fit now requires three that do.
+    for rv, tv in GOOD_POSES:
         board_R, board_t = _board(rv, tv)
         px, _ = _stripe_on_board(board_R, board_t, noise=0.15, rng=rng)
         col.add_frame(px, K, board_R, board_t)
     assert len(col) > 200
+    assert col.frames >= 3
     plane, why = col.fit(WH)
     assert plane is not None, why
     assert abs(abs(float(plane.normal @ N_TRUE)) - 1.0) < 1e-3
@@ -121,13 +134,12 @@ def test_fit_survives_a_few_strays() -> None:
     """A handful of glints must not tilt a plane the rest determines."""
     rng = np.random.default_rng(5)
     col = PlaneCollector()
-    for rv, tv in (((0.25, -0.15, 0.0), (0, 0, 520)),
-                   ((-0.2, 0.3, 0.1), (30, -20, 600)),
-                   ((0.05, -0.35, -0.1), (-25, 15, 460))):
+    for rv, tv in GOOD_POSES:
         board_R, board_t = _board(rv, tv)
         px, _ = _stripe_on_board(board_R, board_t, noise=0.1, rng=rng)
         col.add_frame(px, K, board_R, board_t)
-    clean, _ = col.fit(WH)
+    clean, why = col.fit(WH)
+    assert clean is not None, why
 
     pts = col.points()
     strays = pts[:15] + np.array([0.0, 0.0, 30.0])     # 30 mm off the sheet
@@ -214,3 +226,28 @@ def test_collector_is_bounded() -> None:
             col.add_frame(px, K, R, t)
     assert len(col) <= MAX_POINTS
     assert len(col.points()) == len(col)
+
+
+def test_fit_refuses_a_single_pose() -> None:
+    """One pose is one line; every plane through it has zero residual.
+
+    Regression: a 267-point single-frame collection passed the point gate,
+    fit at rms 0.000 mm, and overwrote a good 337-frame plane on the server.
+    """
+    board_R, board_t = _board((0.2, -0.1, 0.0), (0.0, 0.0, 520.0))
+    px, _ = _stripe_on_board(board_R, board_t)
+    col = PlaneCollector()
+    col.add_frame(px, K, board_R, board_t)
+    assert len(col) >= 200
+    plane, why = col.fit(WH)
+    assert plane is None
+    assert "pose" in why or "collinear" in why
+
+
+def test_fit_refuses_collinear_points_even_across_frames() -> None:
+    """Frame count alone is not enough: three identical poses are still one line."""
+    board_R, board_t = _board((0.2, -0.1, 0.0), (0.0, 0.0, 520.0))
+    px, _ = _stripe_on_board(board_R, board_t)
+    pts = points_on_board(px, K, board_R, board_t)
+    plane, why = fit(np.vstack([pts, pts, pts]), WH, n_frames=3)
+    assert plane is None and "collinear" in why

@@ -50,6 +50,17 @@ MAX_RMS_MM = 2.0
 
 MIN_POINTS = 200
 
+#: A plane needs samples from several distinct board poses. One pose gives one
+#: LINE, and every plane through a line fits it with zero residual — which is
+#: exactly how a 267-point, single-frame collection passed the point gate, fit
+#: at rms 0.000 mm, and overwrote a good 337-frame plane on the server.
+MIN_FRAMES = 3
+
+#: How much the samples must spread within the sheet, beyond a single line:
+#: ratio of the second-largest to the largest singular value of the centred
+#: points. Collinear samples give ~0; a well-swept sheet gives ~0.3-1.
+MIN_SPREAD_RATIO = 0.05
+
 #: The stripe lies on a FLAT board during this calibration, so its image is a
 #: straight line. A frame whose line fit is worse than this was taken while the
 #: board was moving — a smeared centroid and a lagging pose — and its points do
@@ -187,6 +198,14 @@ def fit(points: np.ndarray, wh: tuple[int, int],
     pts = pts[np.isfinite(pts).all(axis=1)]
     if len(pts) < MIN_POINTS:
         return None, f"only {len(pts)} stripe points on the board (need {MIN_POINTS})"
+    if n_frames and n_frames < MIN_FRAMES:
+        return None, (f"only {n_frames} board pose(s) — one pose is one line, and a "
+                      f"line does not fix a plane. Hold the board still at "
+                      f"{MIN_FRAMES}+ different tilts.")
+    sv = np.linalg.svd(pts - pts.mean(axis=0), compute_uv=False)
+    if sv[0] > 0 and sv[1] / sv[0] < MIN_SPREAD_RATIO:
+        return None, ("stripe samples are collinear — they all lie on one line, "
+                      "so no plane is determined. Tilt the board between poses.")
 
     def _plane(p):
         centre = p.mean(axis=0)
