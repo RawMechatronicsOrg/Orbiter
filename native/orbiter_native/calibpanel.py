@@ -390,11 +390,15 @@ class CalibrationPanel(QFrame):
                 + (f"  (moving {sk['moving']})" if sk["moving"] else ""))
         self._stat_labels["views"].setText(str(len(self.samples)))
         self._stat_labels["paired"].setText(str(len(self.samples.paired())))
-        spreads = [self.samples.tilt_spread(s) for s in ("left", "right")]
-        worst = min(spreads)
+        # Per eye, named. The two cameras see the board from different angles,
+        # so a tilt that is rich for one can be near flat for the other — an
+        # operator shown only the worst figure kept tilting for the eye that
+        # was already fine while the other stayed 0.3 short of the gate.
+        tl, tr = (self.samples.tilt_spread(s) for s in ("left", "right"))
+        short = [n for n, v in (("L", tl), ("R", tr)) if v < MIN_TILT_SPREAD]
         self._stat_labels["tilt"].setText(
-            f"{worst:.1f} / {MIN_TILT_SPREAD:.0f}"
-            + ("  ✓" if worst >= MIN_TILT_SPREAD else "  tilt more"))
+            f"L {tl:.1f}  R {tr:.1f}  / {MIN_TILT_SPREAD:.0f}"
+            + ("  ✓" if not short else f"  tilt more for {'+'.join(short)}"))
         for side in ("left", "right"):
             self.coverage[side].set_cells(self.samples.coverage(side))
 
