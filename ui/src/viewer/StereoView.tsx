@@ -137,6 +137,30 @@ function streamUrl(rig: StereoRig, eye: StereoEye, nonce: number): string | null
 const fmt = (v: number | undefined, d = 1) =>
   v === undefined || v === null ? '—' : v.toFixed(d);
 
+/**
+ * camserver reports either `/dev/video2` or a stable
+ * `/dev/v4l/by-path/pci-…-usb-0:1:1.0-video-index0`. The latter is too long
+ * for a header or a select, so show the part that actually distinguishes
+ * one port from another; callers keep the full string in a `title`.
+ */
+function shortPath(path: string | undefined): string {
+  if (!path) return '—';
+  const usb = path.match(/usb-[\d:.]+-video-index\d+$/);
+  return usb ? usb[0] : path.replace(/^.*\//, '');
+}
+
+/**
+ * What to show beside the eye label. camserver may report an empty `info`
+ * (it does after a restart), so a missing card name must NOT be read as a
+ * missing camera — only the absence of an upstream entry means that.
+ */
+function eyeSubtitle(cam: UpstreamCamera | undefined): string {
+  if (!cam) return 'offline';
+  const a = cam.actual;
+  const mode = a?.width && a?.height ? `${a.width}×${a.height} ${a.fourcc ?? ''}`.trim() : '';
+  return [shortPath(cam.path), cam.info?.card || mode || cam.state || ''].filter(Boolean).join(' · ');
+}
+
 // ── one eye ────────────────────────────────────────────────────────────────
 
 function EyePanel({
@@ -166,8 +190,8 @@ function EyePanel({
         <span className="text-[13px] font-semibold uppercase tracking-[0.18em] text-accent">
           {side}
         </span>
-        <span className="font-mono text-[11px] text-inkmute">
-          {upstream?.path ?? '—'} · {upstream?.info?.card ?? 'not connected'}
+        <span className="font-mono text-[11px] text-inkmute" title={upstream?.path ?? ''}>
+          {eyeSubtitle(upstream)}
         </span>
       </div>
 
@@ -224,8 +248,8 @@ function EyePanel({
           >
             <option value="">— none —</option>
             {cameras.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.id} · {c.path ?? ''}
+              <option key={c.id} value={c.id} title={c.path ?? ''}>
+                {c.id} · {shortPath(c.path)}
               </option>
             ))}
             {/* Keep a configured-but-absent id selectable so a camserver
