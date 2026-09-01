@@ -26,5 +26,11 @@ FROM nginx:alpine AS runtime
 RUN rm -rf /usr/share/nginx/html/*
 COPY --from=build /app/dist /usr/share/nginx/html
 
+# Static files alone are not enough: api.ts treats port 5173 as "Vite dev,
+# talk same-origin", and compose publishes this container on exactly that
+# port — so the API calls and the /ws/scene WebSocket arrive here and must be
+# forwarded to the server. See ui/nginx.conf.
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
 EXPOSE 80
 CMD ["nginx", "-g", "daemon off;"]
