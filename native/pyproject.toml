@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orbiter-native"
+version = "0.1.0"
+description = "Native CV workbench for the Orbiter binocular camera pair."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Orbiter contributors" }]
+
+# NOTE: this package also needs `orbiter-server`, which is not listed here
+# because it has no release on an index — it is a sibling source tree. Install
+# both editable from the repo root:
+#
+#     pip install -e ./server -e ./native
+#
+# `orbiter_native.cvcore` fails with an explicit message if it is missing,
+# rather than dying on an opaque ImportError deep in a worker thread.
+dependencies = [
+    "PySide6>=6.7",
+    "numpy>=1.26",
+    # Must match the server's choice. opencv-python and opencv-python-headless
+    # install the same `cv2` module and clobber each other when both are
+    # present; the server pins headless, so this does too.
+    "opencv-python-headless>=4.7",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+orbiter-native = "orbiter_native.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["orbiter_native*"]
