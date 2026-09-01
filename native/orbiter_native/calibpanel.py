@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import Qt, Signal
@@ -62,6 +63,12 @@ _PAIR_WINDOW_S = 0.010
 #: corner movement between consecutive detections. Motion blur rounds corners
 #: off and quietly biases the solve.
 _STILL_PX = 1.0
+
+#: Captured views live here between runs. A board sweep costs the operator
+#: minutes, and losing it to a restart also loses the SIMULTANEOUS views that
+#: stereoCalibrate needs — a session that solved intrinsics and then restarted
+#: could not solve the pair at all without sweeping again.
+SAMPLES_PATH = Path.home() / ".orbiter-native" / "calib-views.npz"
 
 
 class CoverageMap(QWidget):
@@ -121,6 +128,7 @@ class CalibrationPanel(QFrame):
         #: Intrinsics currently known for each eye — from a fresh solve here,
         #: or from the server when a previous run already stored them.
         self._known_k: dict[str, object] = {}
+        self._samples_path = SAMPLES_PATH
 
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 8, 10, 10)
@@ -214,11 +222,20 @@ class CalibrationPanel(QFrame):
         two would solve for a geometry that never existed."""
         if spec == self._board_spec:
             return
+        had = len(self.samples)
         self._board_spec = spec
         self._board = build_board(spec) if spec is not None else None
-        if self.samples:
+        if had:
             self._clear()
             self.report.setText("board spec changed — captured views discarded")
+        elif self._board is not None:
+            # First board spec of the session: pick up whatever the last run
+            # captured, so a restart does not cost another sweep.
+            n = self.samples.load(self._samples_path, self._board)
+            if n:
+                self.report.setText(f"loaded {n} views from the previous run "
+                                    f"({len(self.samples.paired())} paired)")
+                self._refresh_counters()
 
     # ── live feed ─────────────────────────────────────────────────────────
 
@@ -296,12 +313,28 @@ class CalibrationPanel(QFrame):
 
         self.samples.add(PairSample(left=views["left"], right=views["right"]))
         self._pending.clear()
+        self._persist()
         self.report.setText(f"captured view {len(self.samples)}")
+
+    def _persist(self) -> None:
+        """Keep the captured set on disk. A failure here must not stop capture."""
+        try:
+            self.samples.save(self._samples_path)
+        except OSError as exc:
+            log.warning("could not persist captured views: %s", exc)
+
+    def _refresh_counters(self) -> None:
+        self._stat_labels["views"].setText(str(len(self.samples)))
+        self._stat_labels["paired"].setText(str(len(self.samples.paired())))
+        for s in ("left", "right"):
+            self.coverage[s].set_cells(self.samples.coverage(s))
 
     def _clear(self) -> None:
         self.samples.clear()
         self._results.clear()
+        self._stereo = None
         self.btn_save.setEnabled(False)
+        self._persist()
         self.report.setText("cleared")
 
     # ── solve ─────────────────────────────────────────────────────────────

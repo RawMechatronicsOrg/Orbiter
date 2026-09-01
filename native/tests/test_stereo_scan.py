@@ -13,7 +13,7 @@ import pytest
 
 from orbiter_native.cvcore import BoardSpec, Intrinsics, build_board
 from orbiter_native.intrinsics import EyeView, PairSample, describe
-from orbiter_native.laser import LaserLine
+from orbiter_native.laser import LaserPoints
 from orbiter_native.scan import ScanParams, ScanVolume, PointCloud, scan_frame
 from orbiter_native.stereo import StereoRig, calibrate, result_from_config
 
@@ -133,32 +133,33 @@ def test_triangulation_recovers_known_points() -> None:
     assert np.all(rig.reprojection_error(got, lp, rp) < 1e-3)
 
 
+def _stripe(rig: StereoRig, xyz_truth: np.ndarray):
+    """Project a 3D stripe into both eyes as shape-free centroid sets."""
+    lp = _project(KL, np.zeros(3), np.zeros(3), xyz_truth)
+    rp = _project(KR, cv2.Rodrigues(R_TRUE)[0].ravel(), T_TRUE, xyz_truth)
+
+    def pts(a):
+        # Sample order along the axis the detector would have scanned.
+        along_x = np.ptp(a[:, 0]) >= np.ptp(a[:, 1])
+        order = np.argsort(a[:, 0] if along_x else a[:, 1])
+        return LaserPoints(points=a[order].astype(np.float32),
+                           along_x=bool(along_x), reason=None)
+
+    return pts(lp), pts(rp)
+
+
 def _laser_on_plane(rig: StereoRig, z_mm: float, y_mm: float):
-    """A stripe at a fixed depth, as both eyes would see it.
+    """A straight stripe at a fixed depth, running ACROSS the baseline.
 
-    It runs mostly ACROSS the baseline, not along it. A stripe parallel to the
-    baseline lies along the epipolar lines, and then a point in one image has
-    no unique match in the other — the intersection is degenerate no matter how
-    good the calibration is. This synthetic rig has a horizontal baseline, so
-    the stripe is close to vertical. The physical rig gets the same property
-    from the other direction: its sensors are mounted rotated 90 degrees, so
-    its near-horizontal stripe crosses a baseline that is vertical in sensor
-    coordinates.
+    A stripe parallel to the baseline lies along the epipolar lines and has no
+    unique match in the other image, whatever the calibration quality. This
+    synthetic rig has a horizontal baseline, so the stripe is close to
+    vertical.
     """
-    t = np.linspace(-80.0, 80.0, 120)
+    t = np.linspace(-80.0, 80.0, 160)
     truth = np.stack([0.15 * t, y_mm + t, np.full_like(t, z_mm)], axis=1)
-    lp = _project(KL, np.zeros(3), np.zeros(3), truth)
-    rp = _project(KR, cv2.Rodrigues(R_TRUE)[0].ravel(), T_TRUE, truth)
-
-    def line(pts):
-        c = pts.mean(axis=0)
-        d = np.linalg.svd(pts - c)[2][0]
-        return LaserLine(points=pts.astype(np.float32),
-                         inliers=np.ones(len(pts), bool),
-                         point=c, direction=d / np.linalg.norm(d),
-                         rms_px=0.0, reason=None)
-
-    return line(lp), line(rp), truth
+    left, right = _stripe(rig, truth)
+    return left, right, truth
 
 
 def test_scan_triangulates_a_stripe_into_the_board_frame() -> None:
@@ -183,48 +184,108 @@ def test_scan_drops_points_outside_the_volume() -> None:
     inside, r_in, _ = _laser_on_plane(rig, z_mm=500.0, y_mm=0.0)
     assert scan_frame(rig, inside, r_in, board_R, board_t).n_kept > 100
 
-    # 500 mm off the board, i.e. beyond the 400 mm ceiling.
-    above, r_ab, _ = _laser_on_plane(rig, z_mm=100.0, y_mm=0.0)
-    out = scan_frame(rig, above, r_ab, board_R, board_t)
+    # The same stripe against a ceiling below it. Shrinking the box rather than
+    # moving the stripe far from the cameras keeps the projection geometry
+    # workable, so the VOLUME is demonstrably what rejects the points and not
+    # the stereo overlap running out at close range.
+    low = ScanParams(volume=ScanVolume(height_mm=50.0))
+    out = scan_frame(rig, inside, r_in, board_R, board_t, low)
     assert out.n_kept == 0
-    assert out.n_rejected_volume > 0
+    assert out.n_rejected_volume > 100
+
+    # Same for the horizontal extent. The stripe runs +/-80 mm in y, so a
+    # 10 mm half-width keeps only the short span across the middle.
+    narrow = ScanParams(volume=ScanVolume(half_width_mm=10.0))
+    kept = scan_frame(rig, inside, r_in, board_R, board_t, narrow).n_kept
+    assert 0 < kept < 40
 
     # On the board's own surface — the calibration target, not the subject.
     on_board, r_on, _ = _laser_on_plane(rig, z_mm=600.0, y_mm=0.0)
     assert scan_frame(rig, on_board, r_on, board_R, board_t).n_kept == 0
 
 
+def test_scan_follows_a_stripe_that_is_not_a_line() -> None:
+    """The case a line fit destroys, and the reason scanning stopped using one.
+
+    On a real frame from this rig — a drill on the bench — the straight-line
+    fit kept 126 of 649 stripe points; the 523 it discarded WERE the object.
+    Here the stripe steps 40 mm partway along, and both the near and the far
+    part must survive with their own depths.
+    """
+    rig = _rig()
+    t = np.linspace(-80.0, 80.0, 160)
+    z = np.where(t < 0.0, 500.0, 460.0)          # a 40 mm step in depth
+    truth = np.stack([0.15 * t, t, z], axis=1)
+    left, right = _stripe(rig, truth)
+
+    out = scan_frame(rig, left, right, BOARD_R, BOARD_T)
+    assert out.reason is None, out.reason
+    assert out.n_kept > 120
+
+    z_board = out.points_board[:, 2]
+    near = z_board[z_board < 120.0]
+    far = z_board[z_board >= 120.0]
+    assert len(near) > 50 and len(far) > 50, "both sides of the step must survive"
+    assert abs(np.median(near) - 100.0) < 1.0     # 600 - 500
+    assert abs(np.median(far) - 140.0) < 1.0      # 600 - 460
+
+
+def test_scan_does_not_bridge_a_gap_in_the_stripe() -> None:
+    """Where the stripe is interrupted, no surface may be invented across it."""
+    rig = _rig()
+    t = np.concatenate([np.linspace(-80.0, -30.0, 60),
+                        np.linspace(30.0, 80.0, 60)])       # a hole in the middle
+    truth = np.stack([0.15 * t, t, np.full_like(t, 500.0)], axis=1)
+    left, right = _stripe(rig, truth)
+    out = scan_frame(rig, left, right, BOARD_R, BOARD_T)
+    assert out.reason is None, out.reason
+    ys = np.sort(out.points_board[:, 1])
+    # Nothing reconstructed inside the gap the detector never saw.
+    assert not ((ys > -25.0) & (ys < 25.0)).any()
+
+
 def test_scan_requires_both_eyes_and_a_board_pose() -> None:
     rig = _rig()
     left, right, _ = _laser_on_plane(rig, 500.0, 0.0)
-    empty = LaserLine(reason="no stripe")
+    empty = LaserPoints(reason="no stripe")
     assert scan_frame(rig, empty, right, BOARD_R, BOARD_T).n_kept == 0
     assert scan_frame(rig, left, empty, BOARD_R, BOARD_T).n_kept == 0
     r = scan_frame(rig, left, right, None, None)
     assert r.n_kept == 0 and "board pose" in r.reason
 
 
-def test_scan_rejects_points_the_two_eyes_disagree_about() -> None:
-    """A right stripe that is not the same physical line must not be accepted.
+def test_a_shifted_right_stripe_moves_the_depth_and_is_not_otherwise_caught() -> None:
+    """Documents a real limit of two-camera stripe matching, not a bug.
 
-    Note what does NOT catch this: reprojection error. The match is built as a
-    point on the left observation's epipolar line, so the rays meet exactly by
-    construction and every point reprojects to ~1e-13 px however wrong the
-    match is. Only support on the right eye's actually-detected points notices.
+    Nothing purely geometric distinguishes "both eyes saw the same physical
+    point" from "both eyes saw laser, at points that do not correspond". The
+    match is built as a crossing of the left point's epipolar line with an
+    observed right segment, so the rays meet exactly by construction and
+    reprojection error is ~1e-13 px however wrong the pairing is. A uniformly
+    shifted stripe is self-consistent in both directions too, so a mutual
+    left-right check would not catch it either.
+
+    What it does do is change the reconstructed DEPTH. Here a 40 px shift moves
+    the surface from 100 mm above the board to about 38 mm — plausible, and
+    wrong. Only a gross error leaves the scan volume.
+
+    The independent check that would catch this is the laser plane: a
+    triangulated point must lie on the plane the laser sweeps. That is not
+    calibrated yet. In practice both eyes look at one physical stripe, so the
+    stripes cannot drift apart the way this test makes them.
     """
     rig = _rig()
-    board_R, board_t = BOARD_R, BOARD_T
     left, right, _ = _laser_on_plane(rig, z_mm=500.0, y_mm=0.0)
-    good = scan_frame(rig, left, right, board_R, board_t).n_kept
-    assert good > 100
+    truthful = scan_frame(rig, left, right, BOARD_R, BOARD_T)
+    assert truthful.n_kept > 100
+    assert abs(np.median(truthful.points_board[:, 2]) - 100.0) < 1.0
 
-    shifted = LaserLine(points=right.points, inliers=right.inliers,
-                        point=right.point + np.array([25.0, 0.0]),
-                        direction=right.direction, rms_px=0.0, reason=None)
-    out = scan_frame(rig, left, shifted, board_R, board_t,
-                     ScanParams(max_reproj_px=1.5))
-    assert out.n_kept == 0
-    assert out.n_rejected_unconfirmed > 0
+    shifted = LaserPoints(points=(right.points + np.array([40.0, 0.0], np.float32)),
+                          along_x=right.along_x, reason=None)
+    out = scan_frame(rig, shifted and left, shifted, BOARD_R, BOARD_T)
+    assert out.n_kept > 0                       # still "agrees" — that is the point
+    moved = float(np.median(out.points_board[:, 2]))
+    assert abs(moved - 100.0) > 30.0, f"depth should have moved, got {moved:.1f}"
 
 
 def test_volume_edges() -> None:

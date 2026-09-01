@@ -58,6 +58,35 @@ class LaserParams:
 
 
 @dataclass
+class LaserPoints:
+    """Per-scanline stripe centroids, with NO shape assumed.
+
+    This is what scanning consumes. The stripe is only a straight line while it
+    falls on the flat calibration board; on an actual subject it is a broken
+    curve that steps at every depth discontinuity, and that shape IS the
+    measurement. Fitting a line to it would throw away precisely the signal the
+    scan exists to capture.
+    """
+
+    #: (N, 2) subpixel (x, y), ordered along the scan axis.
+    points: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 2), np.float32))
+    #: True when the centroids were taken per column, False when per row. The
+    #: correspondence search needs to know which way the samples run.
+    along_x: bool = True
+    ms: float = 0.0
+    reason: str | None = "no data"
+
+    @property
+    def ok(self) -> bool:
+        return self.reason is None and len(self.points) > 0
+
+    @property
+    def count(self) -> int:
+        return int(len(self.points))
+
+
+@dataclass
 class LaserLine:
     """A fitted stripe, in ORIGINAL (pre-orientation) image coordinates."""
 
@@ -186,13 +215,68 @@ def _ransac(pts: np.ndarray, p: LaserParams, seed: int) -> np.ndarray:
     return best
 
 
+def find_laser_points(
+    bgr: np.ndarray,
+    mask: np.ndarray | None = None,
+    p: LaserParams = LaserParams(),
+) -> LaserPoints:
+    """Subpixel stripe centroids, one per scanline, with no shape assumed.
+
+    The scanning path uses this directly. Pass `mask=None` — the subject stands
+    above the board, so restricting the search to the board's own outline would
+    discard most of the stripe that matters. Rejecting what is not wanted is the
+    3D volume filter's job, and it can do it because it works in millimetres
+    rather than pixels.
+    """
+    t0 = time.perf_counter()
+
+    def done(out: LaserPoints) -> LaserPoints:
+        out.ms = (time.perf_counter() - t0) * 1000.0
+        return out
+
+    if bgr.ndim != 3 or bgr.shape[2] != 3:
+        raise ValueError("the laser is red; this needs a colour frame")
+    if mask is not None and not mask.any():
+        return done(LaserPoints(reason="mask is empty"))
+
+    if mask is None:
+        y0, x0 = 0, 0
+        sub_bgr, sub_keep = bgr, None
+    else:
+        ys, xs = np.nonzero(mask)
+        y0, y1, x0, x1 = int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
+        sub_bgr = bgr[y0:y1, x0:x1]
+        sub_keep = mask[y0:y1, x0:x1]
+
+    red = redness(sub_bgr)
+    keep = red >= p.redness_min
+    if sub_keep is not None:
+        keep &= sub_keep
+    if not keep.any():
+        return done(LaserPoints(reason="no stripe above the redness threshold"))
+
+    ys, xs = np.nonzero(keep)
+    along_x = (xs.max() - xs.min()) >= (ys.max() - ys.min())
+    pts = _centroids(red, keep, along_x)
+    if len(pts) == 0:
+        return done(LaserPoints(along_x=along_x, reason="no stripe points"))
+    pts = pts + np.array([x0, y0], np.float32)
+    return done(LaserPoints(points=pts, along_x=along_x, reason=None))
+
+
 def find_laser_line(
     bgr: np.ndarray,
     mask: np.ndarray | None,
     p: LaserParams = LaserParams(),
     seed: int = 0,
 ) -> LaserLine:
-    """Find the laser stripe within `mask` and fit a straight line to it.
+    """Find the stripe within `mask` and fit a STRAIGHT LINE to it.
+
+    For CALIBRATION only. The straight-line model holds because the stripe is
+    falling on the flat board, and the fit both denoises it and proves it: an
+    RMS that will not come down means the frame is not a clean observation of a
+    plane. Scanning must use `find_laser_points` instead — on a real subject the
+    stripe is a broken curve and a line fit would discard its shape.
 
     `mask` is normally `board_mask(...)`. Passing None searches the whole frame,
     which is fine for aiming the laser but produces points that are NOT a

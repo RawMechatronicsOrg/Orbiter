@@ -34,7 +34,14 @@ from .config import Eye, RigConfig
 from .cvcore import BoardSpec
 from .detect import BoardDetector, BoardHit, draw_board
 from .intrinsics import ViewDescriptor, describe
-from .laser import LaserLine, LaserParams, board_mask, find_laser_line
+from .laser import (
+    LaserLine,
+    LaserParams,
+    LaserPoints,
+    board_mask,
+    find_laser_line,
+    find_laser_points,
+)
 from .laser import draw as draw_laser
 from .orient import Orientation, apply as orient_apply, map_point
 from .source import Frame, MjpegReader
@@ -66,6 +73,8 @@ class EyeStats:
     laser_rms_px: float = float("nan")
     laser_angle_deg: float = float("nan")
     laser_reason: str | None = None
+    #: Stripe points found in scan mode.
+    stripe_points: int = 0
     #: Server-side age of the last frame at send time, from `X-Age-Ms`.
     server_age_ms: float | None = None
     frames: int = 0
@@ -114,6 +123,9 @@ class EyeResult:
     stats: EyeStats
     board: BoardHit | None = None
     laser: LaserLine | None = None
+    #: Shape-free stripe points — what scanning consumes. Empty unless the
+    #: worker is in scan mode.
+    stripe: LaserPoints | None = None
     #: Frame size, needed to interpret corner coordinates and to check that a
     #: stored calibration was solved at this resolution.
     wh: tuple[int, int] = (0, 0)
@@ -149,6 +161,7 @@ class EyeWorker(QObject):
         self._board_spec: BoardSpec | None = None
         self._eye = None
         self._laser_on = False
+        self._scan_mode = False
         self._laser_params = LaserParams()
 
         self._recv_times: deque[float] = deque(maxlen=_WINDOW)
@@ -178,10 +191,25 @@ class EyeWorker(QObject):
             if params is not None:
                 self._laser_params = params
 
+    def set_scan_mode(self, on: bool) -> None:
+        """Switch the stripe detector between its two genuinely different jobs.
+
+        Calibration wants a straight line fitted to the stripe ON the board:
+        the model holds because the board is flat, and the fit denoises it and
+        proves it. Scanning wants the stripe's actual shape over the WHOLE
+        frame: on a subject it is a broken curve, that shape is the
+        measurement, and it mostly falls outside the board's outline anyway.
+        Measured on a real frame from this rig, the line fit kept 126 of 649
+        stripe points — the 523 it dropped were the object.
+        """
+        with self._cfg_lock:
+            self._scan_mode = on
+
     def _snapshot(self):
         with self._cfg_lock:
             return (self._url, self._orientation, self._board_spec,
-                    self._eye, self._laser_on, self._laser_params)
+                    self._eye, self._laser_on, self._laser_params,
+                    self._scan_mode)
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
@@ -263,7 +291,8 @@ class EyeWorker(QObject):
                 self._set_error(f"detector: {exc.__class__.__name__}: {exc}")
 
     def _detect_one(self, detector: BoardDetector, frame: Frame) -> None:
-        _, orientation, spec, eye, laser_on, laser_params = self._snapshot()
+        (_, orientation, spec, eye, laser_on, laser_params,
+         scan_mode) = self._snapshot()
         detector.set_spec(spec)
 
         h, w = frame.gray.shape
@@ -274,12 +303,23 @@ class EyeWorker(QObject):
         descriptor = (describe(board.corners, board.ids, detector.board, (w, h))
                       if board.corners is not None else None)
 
-        # The stripe is only searched for INSIDE the board. Off the board it
-        # is still a laser line, but it is not on the plane the calibration
-        # solves against, so those points would poison the fit.
+        # The stripe detector has two genuinely different jobs.
+        #
+        # CALIBRATION: the stripe falls on the flat board, so it IS a straight
+        # line; the fit denoises it and proves it, and the search is confined
+        # to the board because points off it are not on the plane being solved.
+        #
+        # SCANNING: the stripe falls on the subject, where it is a broken curve
+        # whose shape is the measurement, and most of it lands outside the
+        # board's outline. Measured on a real frame from this rig, the line fit
+        # kept 126 of 649 points — the 523 it dropped were the object. So no
+        # fit and no mask; the 3D volume does the rejecting, in millimetres.
         laser = LaserLine()
+        points = LaserPoints()
         hull = None
-        if laser_on:
+        if laser_on and scan_mode:
+            points = find_laser_points(frame.bgr, None, laser_params)
+        elif laser_on:
             mask = board_mask(board.corners, frame.gray.shape)
             if mask is None:
                 laser = LaserLine(reason="board not detected")
@@ -293,14 +333,20 @@ class EyeWorker(QObject):
         # a UI setting — useless to any calibration consumer.
         bgr = np.ascontiguousarray(orient_apply(frame.bgr, orientation))
         draw_board(bgr, _orient_board(board, orientation, w, h))
-        if laser_on:
+        if laser_on and scan_mode:
+            # Single pixels, not a polyline: the stripe breaks wherever the
+            # subject does, and a segment drawn across a break would show a
+            # surface that was never measured.
+            _draw_points(bgr, points.points if orientation.is_identity
+                         else _map_all(points.points, orientation, w, h))
+        elif laser_on:
             draw_laser(bgr, _orient_laser(laser, orientation, w, h),
                        _orient_hull(hull, orientation, w, h))
 
         self._det_times.append(time.monotonic())
-        self._publish(frame, board, laser, bgr, descriptor)
+        self._publish(frame, board, laser, bgr, descriptor, points)
 
-    def _publish(self, frame, board, laser, bgr, descriptor) -> None:
+    def _publish(self, frame, board, laser, bgr, descriptor, points) -> None:
         s = self._stats
         s.frames += 1
         s.recv_fps = _rate(self._recv_times)
@@ -313,16 +359,31 @@ class EyeWorker(QObject):
         s.laser_inliers = laser.n_inliers
         s.laser_rms_px = laser.rms_px
         s.laser_angle_deg = laser.angle_deg
-        s.laser_reason = laser.reason
+        s.laser_reason = points.reason if points.count or points.reason != "no data"             else laser.reason
+        s.stripe_points = points.count
         s.server_age_ms = frame.server_age_ms
         h, w = frame.gray.shape
         self.result.emit(EyeResult(
-            self.side, bgr, _copy_stats(s), board, laser,
+            self.side, bgr, _copy_stats(s), board, laser, stripe=points,
             wh=(w, h), descriptor=descriptor, capture_mono=frame.capture_mono,
         ))
 
 
 # ── helpers ───────────────────────────────────────────────────────────────
+
+
+def _draw_points(bgr: np.ndarray, pts: np.ndarray) -> None:
+    """Draw the raw stripe centroids — one pixel each, no line joining them.
+
+    Not a polyline: the stripe breaks wherever the subject does, and drawing a
+    segment across a break would show a surface that was never measured.
+    """
+    if not len(pts):
+        return
+    p = np.rint(pts).astype(np.int32)
+    ok = ((p[:, 0] >= 0) & (p[:, 0] < bgr.shape[1])
+          & (p[:, 1] >= 0) & (p[:, 1] < bgr.shape[0]))
+    bgr[p[ok, 1], p[ok, 0]] = (80, 235, 80)
 
 
 def _rate(times: "deque[float]") -> float:

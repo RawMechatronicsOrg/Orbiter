@@ -210,6 +210,8 @@ class MainWindow(QMainWindow):
         """Scanning without the laser detector finds nothing, so turn it on."""
         if on and not self._laser.isChecked():
             self._laser.setChecked(True)      # this also pushes it to the workers
+        for w in self.workers.values():
+            w.set_scan_mode(on)
 
     def _on_result(self, res: EyeResult) -> None:
         self.panels[res.side].on_result(res)
@@ -233,14 +235,14 @@ class MainWindow(QMainWindow):
             self.scan.note("no pair calibration for this frame size — "
                            "solve intrinsics and the stereo pair first")
             return
-        if left.laser is None or right.laser is None:
+        if left.stripe is None or right.stripe is None:
             self.scan.note("laser detector is off")
             return
         board = left.board
         if board is None or board.R is None or board.t is None:
             self.scan.note("board not visible — it is what defines the scan volume")
             return
-        self.scan.on_frame(scan_frame(rig, left.laser, right.laser,
+        self.scan.on_frame(scan_frame(rig, left.stripe, right.stripe,
                                       board.R, board.t, self.scan.params()))
 
     def _scan_rig(self, wh) -> StereoRig | None:

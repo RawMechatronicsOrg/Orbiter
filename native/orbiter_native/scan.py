@@ -2,34 +2,34 @@
 
 One sweep of the pipeline, per frame pair:
 
-  1. Each eye has already found its laser stripe (`laser.find_laser_line`).
-  2. For every stripe point in the LEFT image, its match in the right image is
-     where the epipolar line meets the right eye's stripe. Two lines meet in one
-     point, so the correspondence is exact — no descriptor, no search window,
-     no similarity threshold.
+  1. Each eye reports its stripe as per-scanline subpixel centroids, with NO
+     shape assumed (`laser.find_laser_points`).
+  2. For every stripe point in the LEFT image, its match is where that point's
+     epipolar line crosses the right eye's stripe — the actual observed
+     polyline, segment by segment.
   3. Triangulate.
-  4. Keep a point only where the right eye ACTUALLY OBSERVED laser — that is,
-     where the intersection lands on one of its detected stripe points and not
-     merely on the infinite line fitted through them.
+  4. Keep it only if it lies inside a box above the board, expressed in the
+     BOARD's frame so the box stays put while the board defines "up".
 
-     Reprojection error cannot do this job, and it is worth being explicit
-     about why, because it looks like it should. The match in step 2 is
-     constructed as a point ON the epipolar line of the left observation, so
-     the two rays meet exactly by construction and triangulation reprojects to
-     ~1e-13 px no matter where along that line the match landed. Sliding the
-     right eye's stripe sideways by 25 px was measured to change nothing: every
-     point still "agreed". Support on the observed stripe is the test with
-     content in it.
-  5. Keep it only if it lies inside a box above the board — expressed in the
-     BOARD's frame, not the camera's, so the box stays put while the board is
-     what defines "up".
+**The stripe is not a straight line and must not be modelled as one.** It is
+straight only while it falls on the flat calibration board. On a subject it is
+a broken curve that steps at every depth discontinuity, and that shape IS the
+measurement. Measured on a real scanning frame from this rig — a drill on the
+bench — a straight-line fit kept 126 of 649 stripe points and discarded 523;
+those 523 were the object. Hence step 2 intersects the observed polyline rather
+than a fitted line, and hence scanning does not mask to the board's outline:
+the subject stands above the board, so most of the interesting stripe falls
+outside it. Rejecting what is not wanted is the 3D volume filter's job, which
+it can do because it works in millimetres.
 
-Step 5 is what removes the bench, the operator's hands and the far wall without
-any of them needing to be recognised: they are simply not in the volume.
-
-The board must therefore be visible for scanning to work at all. That is a real
-constraint, and a deliberate one — the board is what defines where the scanning
-volume is.
+**What confirms a point.** Because the match is constructed as the crossing of
+an epipolar line with an actual observed segment, it is by definition somewhere
+the right camera saw laser. Reprojection error cannot add to that — the two
+rays meet by construction, so it is ~1e-13 px however wrong a match is. The
+real risk here is AMBIGUITY: a polyline can cross one epipolar line more than
+once, when the stripe is at two different depths along the same ray. Those
+points are genuinely undecidable from geometry alone and are dropped rather
+than guessed.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .laser import LaserLine
+from .laser import LaserPoints
 from .stereo import StereoRig
 
 log = logging.getLogger("orbiter_native.scan")
@@ -49,18 +49,21 @@ log = logging.getLogger("orbiter_native.scan")
 class ScanVolume:
     """The box, in board coordinates, in millimetres.
 
-    The board's own frame has z pointing out of its face, so `height_mm` is
-    "above the board" and the x/y extent is centred on the board's origin.
+    The board's own frame has z pointing out of its printed face, so
+    `height_mm` is "above the board" and the x/y extent is centred on the
+    board's origin.
     """
 
     height_mm: float = 400.0        # the 40 cm cube
     half_width_mm: float = 200.0
-    #: Points below this are the board's own surface — the stripe lying on the
-    #: board itself, which is the calibration target and not the subject.
+    #: Points below this are the board's own surface — the calibration target,
+    #: not the subject.
     floor_mm: float = 3.0
 
     def contains(self, xyz_board: np.ndarray) -> np.ndarray:
         """Boolean mask over (N, 3) points expressed in the board frame."""
+        if not len(xyz_board):
+            return np.zeros(0, bool)
         x, y, z = xyz_board[:, 0], xyz_board[:, 1], xyz_board[:, 2]
         return (
             (z >= self.floor_mm) & (z <= self.height_mm)
@@ -73,17 +76,18 @@ class ScanVolume:
 class ScanParams:
     """Acceptance thresholds for one frame's points."""
 
-    #: How close the epipolar match must land to a point the right eye actually
-    #: detected. This is the both-cameras-saw-it test — see the module note on
-    #: why reprojection error cannot serve as one here.
-    max_support_px: float = 3.0
-    #: Reprojection sanity. Near-zero by construction for a well-conditioned
-    #: intersection, so this only catches numerical trouble, not mismatches.
-    max_reproj_px: float = 1.5
-    #: A stripe point whose epipolar line meets the other eye's stripe at too
-    #: shallow an angle has an ill-conditioned intersection: a small error
-    #: along the line moves the match a long way. Degrees.
+    #: Two consecutive right-eye centroids are treated as one segment only if
+    #: their scan coordinates are this close. The stripe breaks where the
+    #: subject does, and interpolating across a break would invent a surface
+    #: spanning the gap.
+    max_segment_gap_px: float = 4.0
+    #: A stripe crossing an epipolar line at too shallow an angle gives an
+    #: ill-conditioned intersection: a small error along the line moves the
+    #: match a long way. Degrees.
     min_intersection_deg: float = 8.0
+    #: Reprojection sanity only. Near-zero by construction — see the module
+    #: note on why this cannot be the both-cameras-agree test.
+    max_reproj_px: float = 1.5
     volume: ScanVolume = field(default_factory=ScanVolume)
 
 
@@ -97,10 +101,11 @@ class ScanFrame:
         default_factory=lambda: np.empty((0, 3), np.float64))
     reproj_px: np.ndarray = field(default_factory=lambda: np.empty(0))
     n_candidates: int = 0
+    #: Left points whose epipolar line never crossed the right stripe.
+    n_rejected_nomatch: int = 0
+    #: Left points whose line crossed it more than once — undecidable.
+    n_rejected_ambiguous: int = 0
     n_rejected_geometry: int = 0
-    #: Matches the right eye did not actually observe laser at, plus any that
-    #: failed the reprojection sanity check.
-    n_rejected_unconfirmed: int = 0
     n_rejected_volume: int = 0
     reason: str | None = None
 
@@ -109,44 +114,74 @@ class ScanFrame:
         return len(self.points_board)
 
 
-def _intersect_with_line(lines: np.ndarray, point: np.ndarray,
-                         direction: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Intersect epipolar lines (a, b, c) with the right eye's stripe.
+def _cross_polyline(
+    lines: np.ndarray, pts: np.ndarray, along_x: bool, p: ScanParams
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Where each epipolar line crosses the observed stripe polyline.
 
-    The stripe is given as a point and a unit direction — the fitted line, not
-    the raw centroids, because the fit has already rejected the outliers and
-    averaged down the per-scanline noise.
+    Returns `(match, n_crossings, angle_deg)`. `match` is NaN where there was
+    no crossing; where there were several, the first is returned and
+    `n_crossings` says so, so the caller can drop it as ambiguous rather than
+    silently pick one.
 
-    Returns the intersections and the angle between each pair of lines, which
-    says how well-conditioned each intersection is.
+    Vectorised over all lines and all segments at once — the per-left-point
+    Python loop this replaces would run ~650 times per frame per eye.
     """
-    # Stripe as a homogeneous line: normal is perpendicular to its direction.
-    n = np.array([-direction[1], direction[0]], float)
-    c = -float(n @ point)
-    stripe = np.array([n[0], n[1], c], float)
+    n_lines = len(lines)
+    if len(pts) < 2:
+        return (np.full((n_lines, 2), np.nan), np.zeros(n_lines, int),
+                np.zeros(n_lines))
 
-    cross = np.cross(lines, stripe)                      # (N, 3) homogeneous
-    w = cross[:, 2]
-    ok = np.abs(w) > 1e-12
-    pts = np.full((len(lines), 2), np.nan)
-    pts[ok] = cross[ok, :2] / w[ok, None]
+    a, b = pts[:-1], pts[1:]
+    # Only join consecutive centroids that are actually adjacent along the scan
+    # axis; a gap means the stripe was interrupted and there is no surface
+    # between them to intersect.
+    scan_axis = 0 if along_x else 1
+    contiguous = np.abs(b[:, scan_axis] - a[:, scan_axis]) <= p.max_segment_gap_px
 
-    # Angle between each epipolar line and the stripe.
-    ln = lines[:, :2]
-    norms = np.linalg.norm(ln, axis=1)
-    good = norms > 1e-12
-    cosang = np.zeros(len(lines))
-    cosang[good] = np.abs(ln[good] @ n) / (norms[good] * np.linalg.norm(n))
-    angle = np.degrees(np.arccos(np.clip(cosang, 0.0, 1.0)))
-    # `angle` above is between the NORMALS, which equals the angle between the
-    # lines; 90 degrees means they are parallel and never usefully meet.
-    return pts, 90.0 - np.abs(90.0 - angle)
+    # Signed distance of every segment endpoint to every epipolar line.
+    ha = np.hstack([a, np.ones((len(a), 1))])
+    hb = np.hstack([b, np.ones((len(b), 1))])
+    da = lines @ ha.T                      # (n_lines, n_segments)
+    db = lines @ hb.T
+
+    straddles = ((da <= 0) & (db >= 0)) | ((da >= 0) & (db <= 0))
+    straddles &= contiguous[None, :]
+    denom = da - db
+    straddles &= np.abs(denom) > 1e-12
+
+    n_cross = straddles.sum(axis=1)
+    match = np.full((n_lines, 2), np.nan)
+    angle = np.zeros(n_lines)
+
+    hit = n_cross > 0
+    if hit.any():
+        first = np.argmax(straddles, axis=1)          # index of the first crossing
+        rows = np.flatnonzero(hit)
+        seg = first[rows]
+        t = da[rows, seg] / denom[rows, seg]
+        match[rows] = a[seg] + t[:, None] * (b[seg] - a[seg])
+
+        # Angle between the epipolar line and the segment it crossed.
+        d = b[seg] - a[seg]
+        d_norm = np.linalg.norm(d, axis=1)
+        ln = lines[rows, :2]
+        l_norm = np.linalg.norm(ln, axis=1)
+        good = (d_norm > 1e-9) & (l_norm > 1e-9)
+        # The line's normal against the segment direction: 90 degrees apart
+        # means the segment runs ALONG the line and never usefully meets it.
+        cosang = np.zeros(len(rows))
+        cosang[good] = np.abs(np.einsum("ij,ij->i", ln[good], d[good])) / (
+            l_norm[good] * d_norm[good])
+        angle[rows] = np.degrees(np.arccos(np.clip(cosang, 0.0, 1.0)))
+
+    return match, n_cross, angle
 
 
 def scan_frame(
     rig: StereoRig,
-    left: LaserLine,
-    right: LaserLine,
+    left: LaserPoints,
+    right: LaserPoints,
     board_R: np.ndarray | None,
     board_t: np.ndarray | None,
     params: ScanParams = ScanParams(),
@@ -154,58 +189,47 @@ def scan_frame(
     """Triangulate one frame pair's stripe into board-frame points.
 
     `board_R`/`board_t` are the board's pose in the LEFT camera's frame, as
-    `calibration.estimate_board_pose_disambiguated` returns it (t in mm).
+    `cvcore.estimate_pose` returns it (t in mm).
     """
     if not left.ok or not right.ok:
-        return ScanFrame(reason="both eyes need a fitted stripe")
+        return ScanFrame(reason="both eyes need stripe points")
     if board_R is None or board_t is None:
         return ScanFrame(reason="board pose unknown — it defines the scan volume")
 
-    src = left.inlier_points.astype(np.float64)
-    if len(src) == 0:
-        return ScanFrame(reason="no stripe points in the left eye")
+    lp = rig.undistort(left.points.astype(np.float64), "left")
+    rp_obs = rig.undistort(right.points.astype(np.float64), "right")
 
-    lp = rig.undistort(src, "left")
+    match, n_cross, angle = _cross_polyline(
+        rig.epipolar_lines(lp), rp_obs, right.along_x, params)
 
-    # The right eye's stripe, undistorted the same way so both live in the
-    # pinhole geometry triangulation assumes.
-    rp_pair = rig.undistort(
-        np.stack([right.point - right.direction * 100.0,
-                  right.point + right.direction * 100.0]), "right")
-    r_dir = rp_pair[1] - rp_pair[0]
-    r_norm = float(np.linalg.norm(r_dir))
-    if r_norm < 1e-9:
-        return ScanFrame(reason="right stripe is degenerate")
-    r_dir = r_dir / r_norm
+    n_none = int((n_cross == 0).sum())
+    n_amb = int((n_cross > 1).sum())
+    usable = (n_cross == 1) & np.isfinite(match).all(axis=1)
+    n_geom = int((usable & (angle < params.min_intersection_deg)).sum())
+    usable &= angle >= params.min_intersection_deg
 
-    matches, angles = _intersect_with_line(rig.epipolar_lines(lp), rp_pair[0], r_dir)
-
-    usable = np.isfinite(matches).all(axis=1) & (angles >= params.min_intersection_deg)
-    n_geom = int((~usable).sum())
     if not usable.any():
-        return ScanFrame(n_candidates=len(src), n_rejected_geometry=n_geom,
-                         reason="stripe runs along the epipolar lines — "
-                                "no conditioned intersections")
+        why = None
+        if n_none == len(lp):
+            why = "no epipolar crossings — is the right eye seeing the same stripe?"
+        elif n_geom and n_geom >= n_amb:
+            why = "stripe runs along the epipolar lines — rotate the laser ~90°"
+        return ScanFrame(n_candidates=len(lp), n_rejected_nomatch=n_none,
+                         n_rejected_ambiguous=n_amb, n_rejected_geometry=n_geom,
+                         reason=why)
 
-    lp_u, rp_u = lp[usable], matches[usable]
-
-    # Did the right eye actually see laser there? Distance from each epipolar
-    # match to the nearest point the right detector really reported.
-    observed = rig.undistort(right.inlier_points.astype(np.float64), "right")
-    support = np.min(
-        np.linalg.norm(rp_u[:, None, :] - observed[None, :, :], axis=2), axis=1)
-    seen = support <= params.max_support_px
-
+    lp_u, rp_u = lp[usable], match[usable]
     xyz_cam = rig.triangulate(lp_u, rp_u)
     err = rig.reprojection_error(xyz_cam, lp_u, rp_u)
+    sane = np.isfinite(xyz_cam).all(axis=1) & (err <= params.max_reproj_px)
+    xyz_cam, err = xyz_cam[sane], err[sane]
 
-    agree = seen & np.isfinite(xyz_cam).all(axis=1) & (err <= params.max_reproj_px)
-    n_reproj = int((~agree).sum())
-    xyz_cam, err = xyz_cam[agree], err[agree]
-
-    # Into the board's frame: the volume is defined relative to the board, so
-    # it stays put when the board moves and "above" keeps meaning above it.
-    xyz_board = (board_R.T @ (xyz_cam.T - board_t.reshape(3, 1))).T
+    # Into the board's frame: the volume is defined relative to the board, so it
+    # stays put when the board moves and "above" keeps meaning above it.
+    if len(xyz_cam):
+        xyz_board = (board_R.T @ (xyz_cam.T - board_t.reshape(3, 1))).T
+    else:
+        xyz_board = np.empty((0, 3))
 
     inside = params.volume.contains(xyz_board)
     n_vol = int((~inside).sum())
@@ -214,9 +238,10 @@ def scan_frame(
         points_board=xyz_board[inside],
         points_camera=xyz_cam[inside],
         reproj_px=err[inside],
-        n_candidates=len(src),
+        n_candidates=len(lp),
+        n_rejected_nomatch=n_none,
+        n_rejected_ambiguous=n_amb,
         n_rejected_geometry=n_geom,
-        n_rejected_unconfirmed=n_reproj,
         n_rejected_volume=n_vol,
     )
 
@@ -225,8 +250,8 @@ class PointCloud:
     """Accumulated scan points, in the board's frame.
 
     Board-frame rather than camera-frame on purpose: it is the one coordinate
-    system that stays fixed while the object turns on the board, so sweeps taken
-    at different times land in the same space.
+    system that stays fixed while the subject turns on the board, so sweeps
+    taken at different times land in the same space.
     """
 
     def __init__(self) -> None:

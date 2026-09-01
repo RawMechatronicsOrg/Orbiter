@@ -31,7 +31,9 @@ solve later uses the subset where both are.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -226,6 +228,73 @@ class SampleSet:
 
     def add(self, sample: PairSample) -> None:
         self.samples.append(sample)
+
+    # ── persistence ───────────────────────────────────────────────────────
+    #
+    # Captured views outlive the process on purpose. A board sweep is minutes
+    # of the operator's time, and losing it to a restart means sweeping again;
+    # worse, `stereoCalibrate` needs the SIMULTANEOUS views, so a session that
+    # solved intrinsics and then restarted could not solve the pair at all
+    # without redoing everything.
+
+    def save(self, path: str | os.PathLike) -> int:
+        """Write the captured views to `path` (npz). Returns the count."""
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        blob: dict[str, np.ndarray] = {}
+        for i, sample in enumerate(self.samples):
+            for side in ("left", "right"):
+                v = sample.side(side)
+                if v is None:
+                    continue
+                blob[f"{i}_{side}_corners"] = v.corners
+                blob[f"{i}_{side}_ids"] = v.ids
+                blob[f"{i}_{side}_wh"] = np.asarray(v.wh, np.int32)
+        blob["count"] = np.asarray([len(self.samples)], np.int32)
+        # Written to a temp file and renamed, so an interrupted save cannot
+        # leave a half-written set where a complete one used to be. The handle
+        # is passed rather than the path because `savez_compressed` appends
+        # `.npz` to any name that lacks it — which would write beside the temp
+        # name instead of to it.
+        tmp = p.with_name(p.name + ".tmp")
+        with open(tmp, "wb") as fh:
+            np.savez_compressed(fh, **blob)
+        os.replace(tmp, p)
+        return len(self.samples)
+
+    def load(self, path: str | os.PathLike, board) -> int:
+        """Replace the held views with those in `path`. Returns the count.
+
+        Descriptors are recomputed from the corners rather than stored: they
+        are derived data, and recomputing them keeps a loaded set honest if the
+        descriptor definition ever changes.
+        """
+        p = Path(path)
+        if not p.exists():
+            return 0
+        try:
+            with np.load(p) as blob:
+                n = int(blob["count"][0])
+                loaded: list[PairSample] = []
+                for i in range(n):
+                    sides: dict[str, EyeView | None] = {"left": None, "right": None}
+                    for side in ("left", "right"):
+                        key = f"{i}_{side}_corners"
+                        if key not in blob:
+                            continue
+                        corners = blob[key]
+                        ids = blob[f"{i}_{side}_ids"]
+                        wh = tuple(int(v) for v in blob[f"{i}_{side}_wh"])
+                        d = describe(corners, ids, board, wh)
+                        if d is not None:
+                            sides[side] = EyeView(corners, ids, wh, d)
+                    if sides["left"] is not None or sides["right"] is not None:
+                        loaded.append(PairSample(**sides))
+        except (OSError, KeyError, ValueError) as exc:
+            log.warning("could not load captured views from %s: %s", p, exc)
+            return 0
+        self.samples = loaded
+        return len(loaded)
 
     def coverage(self, side: str, grid: int = 6) -> np.ndarray:
         """Which cells of a `grid`x`grid` split of the frame the board has

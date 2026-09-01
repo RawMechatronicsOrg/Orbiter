@@ -137,8 +137,9 @@ class ScanPanel(QFrame):
             lines.append(f"frame   — {f.reason}")
         else:
             lines.append(f"frame   {f.n_kept}/{f.n_candidates} kept")
-            lines.append(f"dropped geom {f.n_rejected_geometry} · "
-                         f"unconfirmed {f.n_rejected_unconfirmed} · "
+            lines.append(f"no match {f.n_rejected_nomatch} · "
+                         f"ambiguous {f.n_rejected_ambiguous}")
+            lines.append(f"shallow  {f.n_rejected_geometry} · "
                          f"outside box {f.n_rejected_volume}")
             if f.n_kept:
                 lines.append(f"reproj  med {np.median(f.reproj_px):.2f} px")
