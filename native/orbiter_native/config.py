@@ -41,11 +41,27 @@ class Eye:
     side: str                      # "left" | "right"
     camera_id: str
     orientation: Orientation
-    intrinsics: Intrinsics | None  # None until the pair itself is calibrated
+    #: As stored on the server, or None until the pair itself is calibrated.
+    #: Kept raw because whether it is USABLE depends on the live frame size,
+    #: which config parsing does not know — see `intrinsics_for`.
+    intrinsics_raw: dict[str, Any] | None = None
 
     @property
     def configured(self) -> bool:
         return bool(self.camera_id)
+
+    @property
+    def has_intrinsics(self) -> bool:
+        return isinstance(self.intrinsics_raw, dict)
+
+    def intrinsics_for(self, frame_wh: tuple[int, int] | None) -> Intrinsics | None:
+        """Intrinsics usable at `frame_wh`, or None.
+
+        Resolved per frame rather than once at parse time: a camera matrix is
+        only valid at the resolution it was solved at, and camserver can be
+        reconfigured under a running app.
+        """
+        return intrinsics_from_eye({"intrinsics": self.intrinsics_raw}, frame_wh)
 
 
 @dataclass(frozen=True)
@@ -79,11 +95,12 @@ class RigConfig:
 
 def _eye_from(side: str, rig: dict[str, Any]) -> Eye:
     raw = rig.get(side) or {}
+    k = raw.get("intrinsics")
     return Eye(
         side=side,
         camera_id=str(raw.get("camera_id") or ""),
         orientation=Orientation.from_eye(raw),
-        intrinsics=intrinsics_from_eye(raw),
+        intrinsics_raw=k if isinstance(k, dict) else None,
     )
 
 

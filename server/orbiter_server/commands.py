@@ -173,7 +173,49 @@ _EYE_COERCE: dict[str, Callable[[Any], Any]] = {
     "quarter_turns_cw": lambda v: int(v) % 4,
     "flip_h": lambda v: bool(v),
     "flip_v": lambda v: bool(v),
+    "intrinsics": lambda v: _coerce_intrinsics(v),
 }
+
+
+def _coerce_intrinsics(v: Any) -> dict[str, Any] | None:
+    """One eye's solved intrinsics, or None to clear them.
+
+    `width`/`height` are REQUIRED and are not decoration: a camera matrix is
+    only valid for the frame size it was solved at. camserver can be
+    reconfigured to another resolution between runs, and applying 1280x720
+    intrinsics to a 1920x1080 frame yields poses that look plausible and are
+    wrong by the ratio of the two. Consumers compare these against the live
+    frame and refuse a mismatch.
+    """
+    if v is None:
+        return None
+    if not isinstance(v, dict):
+        raise CommandError("intrinsics must be an object or null")
+    try:
+        dist = [float(x) for x in v.get("dist", [])]
+        out: dict[str, Any] = {
+            "fx": float(v["fx"]), "fy": float(v["fy"]),
+            "cx": float(v["cx"]), "cy": float(v["cy"]),
+            "dist": dist,
+            "width": int(v["width"]), "height": int(v["height"]),
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CommandError(
+            f"intrinsics needs numeric fx, fy, cx, cy, width, height: {exc}"
+        ) from exc
+    if out["width"] <= 0 or out["height"] <= 0:
+        raise CommandError("intrinsics width/height must be positive")
+    if out["fx"] <= 0 or out["fy"] <= 0:
+        raise CommandError("intrinsics fx/fy must be positive")
+    # Provenance — how good the solve was and how many views it used. Carried
+    # so a later reader can judge the numbers instead of trusting them blindly.
+    for key, cast in (("rms_px", float), ("views", int), ("solved_at", str)):
+        if key in v and v[key] is not None:
+            try:
+                out[key] = cast(v[key])
+            except (TypeError, ValueError) as exc:
+                raise CommandError(f"intrinsics: bad {key!r}: {exc}") from exc
+    return out
 
 #: Rig-level fields (everything that is not one of the two eyes).
 _RIG_COERCE: dict[str, Callable[[Any], Any]] = {
@@ -204,7 +246,10 @@ async def _cmd_set_stereo_rig(args: dict[str, Any]) -> dict[str, Any]:
 
     Payload (all optional — only keys present are applied):
       `host`, `token`, `baseline_mm`,
-      `left` / `right`: `{camera_id, quarter_turns_cw, flip_h, flip_v}`.
+      `left` / `right`: `{camera_id, quarter_turns_cw, flip_h, flip_v,
+      intrinsics}`, where `intrinsics` is `{fx, fy, cx, cy, dist, width,
+      height}` (plus optional `rms_px`, `views`, `solved_at`) or null to
+      clear.
 
     Which upstream camera is the left eye cannot be derived: camserver's ids
     follow /dev/videoN enumeration and say nothing about physical placement.

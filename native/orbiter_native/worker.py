@@ -33,6 +33,7 @@ from PySide6.QtCore import QObject, Signal
 from .config import Eye, RigConfig
 from .cvcore import BoardSpec
 from .detect import BoardDetector, BoardHit, draw_board
+from .intrinsics import ViewDescriptor, describe
 from .laser import LaserLine, LaserParams, board_mask, find_laser_line
 from .laser import draw as draw_laser
 from .orient import Orientation, apply as orient_apply, map_point
@@ -113,6 +114,15 @@ class EyeResult:
     stats: EyeStats
     board: BoardHit | None = None
     laser: LaserLine | None = None
+    #: Frame size, needed to interpret corner coordinates and to check that a
+    #: stored calibration was solved at this resolution.
+    wh: tuple[int, int] = (0, 0)
+    #: Where/how the board sits, for the calibration capture's diversity test.
+    descriptor: ViewDescriptor | None = None
+    #: camserver's capture instant. Both cameras are timed by the SAME clock on
+    #: that machine, so this is what pairs a left frame with its right one —
+    #: our own arrival times are not comparable between two sockets.
+    capture_mono: float | None = None
 
 
 class EyeWorker(QObject):
@@ -137,7 +147,7 @@ class EyeWorker(QObject):
         self._url: str | None = None
         self._orientation = Orientation()
         self._board_spec: BoardSpec | None = None
-        self._intrinsics = None
+        self._eye = None
         self._laser_on = False
         self._laser_params = LaserParams()
 
@@ -159,7 +169,7 @@ class EyeWorker(QObject):
             self._url = url
             self._orientation = eye.orientation if eye else Orientation()
             self._board_spec = cfg.board
-            self._intrinsics = eye.intrinsics if eye else None
+            self._eye = eye
         return restart
 
     def set_laser(self, enabled: bool, params: LaserParams | None = None) -> None:
@@ -171,7 +181,7 @@ class EyeWorker(QObject):
     def _snapshot(self):
         with self._cfg_lock:
             return (self._url, self._orientation, self._board_spec,
-                    self._intrinsics, self._laser_on, self._laser_params)
+                    self._eye, self._laser_on, self._laser_params)
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
@@ -242,10 +252,16 @@ class EyeWorker(QObject):
             frame: Frame | None = self._latest.take(timeout=0.25)
             if frame is None:
                 continue
-            _, orientation, spec, intrinsics, laser_on, laser_params = self._snapshot()
+            _, orientation, spec, eye, laser_on, laser_params = self._snapshot()
             detector.set_spec(spec)
 
+            h, w = frame.gray.shape
+            # Resolved against THIS frame's size: intrinsics solved at another
+            # resolution are refused rather than silently misapplied.
+            intrinsics = eye.intrinsics_for((w, h)) if eye else None
             board = detector.detect(frame.gray, intrinsics) if detector.ready else BoardHit()
+            descriptor = (describe(board.corners, board.ids, detector.board, (w, h))
+                          if board.corners is not None else None)
 
             # The stripe is only searched for INSIDE the board. Off the board it
             # is still a laser line, but it is not on the plane the calibration
@@ -264,7 +280,6 @@ class EyeWorker(QObject):
             # detections into the oriented frame. Detecting on the oriented
             # image instead would report coordinates in a frame that depends on
             # a UI setting — useless to any calibration consumer.
-            h, w = frame.gray.shape
             bgr = np.ascontiguousarray(orient_apply(frame.bgr, orientation))
             draw_board(bgr, _orient_board(board, orientation, w, h))
             if laser_on:
@@ -272,9 +287,9 @@ class EyeWorker(QObject):
                            _orient_hull(hull, orientation, w, h))
 
             self._det_times.append(time.monotonic())
-            self._publish(frame, board, laser, bgr)
+            self._publish(frame, board, laser, bgr, descriptor)
 
-    def _publish(self, frame, board, laser, bgr) -> None:
+    def _publish(self, frame, board, laser, bgr, descriptor) -> None:
         s = self._stats
         s.frames += 1
         s.recv_fps = _rate(self._recv_times)
@@ -289,7 +304,11 @@ class EyeWorker(QObject):
         s.laser_angle_deg = laser.angle_deg
         s.laser_reason = laser.reason
         s.server_age_ms = frame.server_age_ms
-        self.result.emit(EyeResult(self.side, bgr, _copy_stats(s), board, laser))
+        h, w = frame.gray.shape
+        self.result.emit(EyeResult(
+            self.side, bgr, _copy_stats(s), board, laser,
+            wh=(w, h), descriptor=descriptor, capture_mono=frame.capture_mono,
+        ))
 
 
 # ── helpers ───────────────────────────────────────────────────────────────

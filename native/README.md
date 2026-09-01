@@ -68,13 +68,20 @@ the calibration actually uses, invisibly.
 
 ## Known limits
 
-**No board pose yet.** `model.camera_fx/fy/cx/cy` and `camera_distortion` were
-solved for the *phone* on the `camera_url` path — a different lens at a
-different resolution from either camera of this pair. Feeding them to
-`solvePnP` yields a plausible pose that is simply wrong. Until the pair has its
-own calibration the panel says `pose needs per-eye intrinsics` rather than
-showing a number. Per-eye intrinsics and `stereoCalibrate` are the next piece
-of work, and this workbench is where the corners they need are already visible.
+**Board pose needs a calibration first.** `model.camera_fx/fy/cx/cy` and
+`camera_distortion` were solved for the *phone* on the `camera_url` path — a
+different lens at a different resolution from either camera of this pair.
+Feeding them to `solvePnP` yields a plausible pose that is simply wrong, so the
+panel says `pose needs per-eye intrinsics` until this pair has its own. Run the
+calibration below; pose appears once the solve is saved. Stored intrinsics also
+carry the resolution they were solved at and are refused against a frame of any
+other size — camserver can be reconfigured under a running app, and 1280x720
+intrinsics on a 1080p frame put the principal point in the wrong place and
+scale the focal length by two thirds.
+
+**`stereoCalibrate` is not done yet.** Capture already stores paired views for
+it, so the sweep does not need repeating — but the mutual geometry of the two
+cameras, and the real baseline, are still unsolved.
 
 **The laser fit is not yet a calibration.** It produces the per-frame input —
 subpixel stripe points on the board, and the line they fit — but turning those
@@ -118,6 +125,53 @@ Per frame the detector yields the inlier points in original image coordinates.
 That is the calibration payload: back-project each point, intersect it with the
 board plane, accumulate across board poses, fit the plane the laser sweeps.
 Which needs intrinsics — see the known limits above.
+
+## Calibration
+
+Move the board around in front of the pair with **auto-capture** on. Views are
+kept only when they show the solve something new — a different place in the
+frame, a different distance, or a different tilt — and only when the board is
+still, because motion blur rounds corners off and biases the solve.
+
+They are captured in **pairs**, matched on camserver's capture clock (both
+cameras are timed by that same clock, so it is what makes two frames
+simultaneous; arrival times through two sockets are not comparable). Intrinsics
+do not need the pairing. `stereoCalibrate` does, and sweeping the board twice
+would be a waste of your time.
+
+### Why the panel nags about tilt
+
+`calibrateCamera` returns a confident answer from head-on views and that answer
+can be badly wrong, with a reprojection RMS that looks perfect. Measured on
+synthetic views of this board with 0.15 px corner noise:
+
+```
+tilt spread   RMS px   focal-length error
+     5.27      0.204        +108 px
+     5.45      0.204        +114 px
+     6.04      0.204         +31 px
+     8.12      0.205          +8 px
+    12.09      0.205          +3 px
+    16.06      0.206          +1 px
+```
+
+The RMS is flat to three decimals across a focal length wrong by 12%. With no
+noise at all, a fronto-parallel set solves to RMS 0.0000 px and a focal length
+27% low. Focal length and board distance are not separable in a head-on view —
+only tilt separates them. So the solve is **refused** below a tilt spread of 8,
+and the live figure is shown while you can still act on it. The coverage grids
+are the same idea for distortion, which is only measurable where the board
+actually went.
+
+The distortion model frees k1, k2, p1, p2 and fixes k3: k3 is only identifiable
+from views pushing the board into the frame corners, and left free on a modest
+set it absorbs error and destabilises the focal length. Tangential terms stay
+free because these are inexpensive sensors where a tilted element is real — the
+server's phone-lens solve fixes them, but that was a different lens.
+
+**Save to server** stores the result through `POST /command/set_stereo_rig`,
+the same command the web tab uses, so the server remains the one owner of this
+state.
 
 ## Measured on this machine
 

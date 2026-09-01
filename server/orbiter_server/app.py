@@ -33,7 +33,7 @@ from esp_proxy import esp
 from logsetup import install_loop_exception_handler, setup_logging
 from orbiter_model import PERSISTED_FIELDS, model
 from phone_sensor import phone_sensor
-from routes import captures, photos, scans, stereo, stream, ws
+from routes import captures, command, photos, scans, stereo, stream, ws
 from ws_hub import hub
 
 # Non-blocking queue → data/logs/server.log; uvicorn access log off. See
@@ -92,6 +92,7 @@ app.add_middleware(
 app.include_router(scans.router)
 app.include_router(photos.router)
 app.include_router(captures.router)
+app.include_router(command.router)
 app.include_router(stereo.router)
 app.include_router(stream.router)
 app.include_router(ws.router)

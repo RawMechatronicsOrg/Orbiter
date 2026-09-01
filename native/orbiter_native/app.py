@@ -23,6 +23,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import httpx
+
+from .calibpanel import CalibrationPanel
 from .config import ConfigClient, RigConfig
 from .laser import LaserParams
 from .panel import EyePanel
@@ -54,10 +57,14 @@ class MainWindow(QMainWindow):
             w.status.connect(self._on_status, Qt.ConnectionType.QueuedConnection)
             self.workers[side] = w
 
+        self.calib = CalibrationPanel()
+        self.calib.save_requested.connect(self._save_intrinsics)
+
         split = QSplitter(Qt.Orientation.Horizontal)
         split.addWidget(self.panels["left"])
         split.addWidget(self.panels["right"])
-        split.setSizes([750, 750])
+        split.addWidget(self.calib)
+        split.setSizes([620, 620, 260])
 
         root = QWidget()
         outer = QHBoxLayout(root)
@@ -136,16 +143,43 @@ class MainWindow(QMainWindow):
             f"(nominal) · {board}"
         )
 
+        self.calib.set_board_spec(cfg.board)
         for side, worker in self.workers.items():
             eye = getattr(cfg, side)
             self.panels[side].set_eye(eye)
             if worker.apply_config(cfg, eye):
                 worker.restart_stream()
 
+    def _save_intrinsics(self, per_side: dict) -> None:
+        """Store a solve on the server, through the same command the web tab uses.
+
+        The server is the owner of this state; writing it anywhere else would
+        give the rig two sources of truth for its own calibration. Sent over
+        HTTP rather than the WS command channel because this app is a read-only
+        client of the model otherwise and does not hold a socket for it.
+        """
+        args = {side: {"intrinsics": k} for side, k in per_side.items()}
+        try:
+            r = httpx.post(f"{self._client.server}/command/set_stereo_rig",
+                           json=args, timeout=5.0)
+            if r.status_code == 400:
+                # The handler's own message: both eyes on one camera, a
+                # malformed calibration. The reason is the useful part.
+                self.statusBar().showMessage(
+                    f"server refused: {r.json().get('detail')}")
+                return
+            r.raise_for_status()
+        except httpx.HTTPError as exc:
+            self.statusBar().showMessage(f"could not save intrinsics — {exc}")
+            return
+        self.statusBar().showMessage("intrinsics saved to the server")
+        self._poll_config()
+
     # ── worker signals ────────────────────────────────────────────────────
 
     def _on_result(self, res: EyeResult) -> None:
         self.panels[res.side].on_result(res)
+        self.calib.on_result(res)
 
     def _on_status(self, side: str, error: object) -> None:
         self.panels[side].on_status(error if isinstance(error, str) else None)

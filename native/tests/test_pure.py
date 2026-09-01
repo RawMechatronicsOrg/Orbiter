@@ -257,5 +257,27 @@ def test_intrinsics_absent_until_the_pair_is_calibrated() -> None:
         "camera_cx": 960.0, "camera_cy": 540.0,
         "camera_distortion": [0.0] * 5,
     })
-    assert cfg.left.intrinsics is None
-    assert cfg.right.intrinsics is None
+    assert not cfg.left.has_intrinsics
+    assert not cfg.right.has_intrinsics
+    assert cfg.left.intrinsics_for((1280, 720)) is None
+
+
+def test_intrinsics_are_refused_at_a_different_resolution() -> None:
+    """A camera matrix is only valid at the size it was solved at.
+
+    Applying 1280x720 intrinsics to a 1080p frame moves the principal point
+    and scales the focal length by two thirds — a pose that looks plausible
+    and is wrong. Rescaling instead would be a guess about crop-vs-scale
+    behaviour that nobody has verified, so a mismatch yields nothing.
+    """
+    k = {"fx": 900.0, "fy": 905.0, "cx": 646.0, "cy": 358.0,
+         "dist": [-0.28, 0.09, 0.0, 0.0, 0.0], "width": 1280, "height": 720}
+    cfg = cfgmod.parse({
+        "stereo_rig": {"host": "http://cam:8088",
+                       "left": {"camera_id": "cam2", "intrinsics": k},
+                       "right": {"camera_id": "cam4"}},
+    })
+    assert cfg.left.has_intrinsics
+    got = cfg.left.intrinsics_for((1280, 720))
+    assert got is not None and got.fx == 900.0
+    assert cfg.left.intrinsics_for((1920, 1080)) is None

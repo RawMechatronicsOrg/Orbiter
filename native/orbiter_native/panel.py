@@ -63,7 +63,12 @@ class EyePanel(QFrame):
             bits.append("flip H")
         if o.flip_v:
             bits.append("flip V")
-        bits.append("intrinsics ✓" if eye.intrinsics else "no intrinsics")
+        if eye.has_intrinsics:
+            k = eye.intrinsics_raw or {}
+            bits.append(f"K {k.get('width')}x{k.get('height')} "
+                        f"rms {k.get('rms_px', float('nan')):.2f}px")
+        else:
+            bits.append("no intrinsics")
         self.subtitle.setText(" · ".join(bits))
 
     # ── live updates ──────────────────────────────────────────────────────
@@ -95,7 +100,7 @@ class EyePanel(QFrame):
         if res.board is not None and res.board.t is not None:
             t = res.board.t
             lines.append(f"pose   {t[0]:+.0f} {t[1]:+.0f} {t[2]:+.0f} mm")
-        elif s.corners and self._eye is not None and self._eye.intrinsics is None:
+        elif s.corners and self._eye is not None and not self._eye.has_intrinsics:
             # Say why, rather than leaving a blank the operator has to guess at.
             lines.append("pose   needs per-eye intrinsics")
         lines += self._laser_lines(s)

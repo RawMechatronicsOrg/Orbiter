@@ -98,8 +98,10 @@ def board_spec_from_config(cfg: dict[str, Any]) -> BoardSpec | None:
         return None
 
 
-def intrinsics_from_eye(eye: dict[str, Any] | None) -> Intrinsics | None:
-    """Per-eye intrinsics, when the eye's config carries them.
+def intrinsics_from_eye(
+    eye: dict[str, Any] | None, frame_wh: tuple[int, int] | None = None
+) -> Intrinsics | None:
+    """Per-eye intrinsics, when the eye's config carries usable ones.
 
     IMPORTANT: this deliberately does NOT fall back to the model's
     `camera_fx/fy/cx/cy` + `camera_distortion`. Those were solved for the
@@ -108,12 +110,25 @@ def intrinsics_from_eye(eye: dict[str, Any] | None) -> Intrinsics | None:
     would produce a plausible-looking pose that is simply wrong, and wrong
     quietly. Until the pair has its own calibration, no pose is the honest
     answer, and the UI says so.
+
+    `frame_wh` guards the same failure one step further on. A camera matrix is
+    only valid at the resolution it was solved at, and camserver can be
+    reconfigured between runs; 1280x720 intrinsics applied to a 1080p frame
+    put the principal point in the wrong place and scale the focal length by
+    two thirds, which again yields a plausible, wrong pose. When the size does
+    not match, this returns None rather than rescaling — rescaling would be a
+    guess about the sensor's crop-vs-scale behaviour that nobody has verified.
     """
     if not eye:
         return None
+    k = eye.get("intrinsics")
+    if not isinstance(k, dict):
+        return None
     try:
-        k = eye["intrinsics"]
-        dist = tuple(float(v) for v in k.get("dist", (0.0,) * 5))
+        stored_wh = (int(k["width"]), int(k["height"]))
+        if frame_wh is not None and tuple(frame_wh) != stored_wh:
+            return None
+        dist = tuple(float(v) for v in k.get("dist") or (0.0,) * 5)
         return Intrinsics(
             fx=float(k["fx"]), fy=float(k["fy"]),
             cx=float(k["cx"]), cy=float(k["cy"]),
