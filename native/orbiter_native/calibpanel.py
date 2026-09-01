@@ -146,6 +146,10 @@ class CalibrationPanel(QFrame):
         # and the board's pose is known. Nothing else needs to be aimed or
         # measured: the board already tells us where those points are in 3D.
         self._plane_pts = PlaneCollector()
+        #: Whether the stripe detector is running. Collection is silent
+        #: without it, so the panel has to be able to say which of the two
+        #: 'no laser' cases it is looking at.
+        self._laser_active = False
         #: Intrinsics currently known for each eye — from a fresh solve here,
         #: or from the server when a previous run already stored them.
         self._known_k: dict[str, object] = {}
@@ -245,6 +249,9 @@ class CalibrationPanel(QFrame):
     @property
     def _left_k(self):
         return self._known_k.get("left")
+
+    def set_laser_active(self, on: bool) -> None:
+        self._laser_active = on
 
     def set_intrinsics(self, side: str, k) -> None:
         """Adopt intrinsics the server already holds, so the stereo solve does
@@ -367,7 +374,8 @@ class CalibrationPanel(QFrame):
         self._stat_labels["novelty"].setText(
             "—" if not np.isfinite(nov) else f"{nov:.3f}")
         self._stat_labels["laser pts"].setText(
-            f"{len(self._plane_pts)} / {self._plane_pts.frames}f")
+            f"{len(self._plane_pts)} / {self._plane_pts.frames}f"
+            if self._laser_active else "detector off")
         self._stat_labels["views"].setText(str(len(self.samples)))
         self._stat_labels["paired"].setText(str(len(self.samples.paired())))
         spreads = [self.samples.tilt_spread(s) for s in ("left", "right")]
@@ -527,9 +535,14 @@ class CalibrationPanel(QFrame):
             self.report.setText("laser plane needs left-eye intrinsics first")
             return
         if len(self._plane_pts) == 0:
+            # Distinguish the two cases, because they need opposite actions and
+            # look identical from here: the detector being off, versus the beam
+            # simply not crossing the board.
             self.report.setText(
-                "no stripe-on-board points yet — switch the laser on and let "
-                "it fall across the board from a few different poses")
+                "the stripe detector is off — tick 'laser line' in the toolbar"
+                if not self._laser_active else
+                "no stripe on the board yet — the beam has to fall ACROSS the "
+                "board. Move the board into it, from a few different tilts.")
             return
         wh = (self.samples.views("left")[0].wh if self.samples.views("left")
               else (0, 0))

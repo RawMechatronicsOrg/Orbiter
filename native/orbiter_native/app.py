@@ -139,8 +139,10 @@ class MainWindow(QMainWindow):
 
     def _apply_laser(self) -> None:
         params = LaserParams(redness_min=self._threshold.value())
+        on = self._laser.isChecked()
         for w in self.workers.values():
-            w.set_laser(self._laser.isChecked(), params)
+            w.set_laser(on, params)
+        self.calib.set_laser_active(on)
 
     # ── config ────────────────────────────────────────────────────────────
 
