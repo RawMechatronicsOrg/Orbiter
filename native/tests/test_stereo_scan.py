@@ -317,3 +317,29 @@ def test_point_cloud_accumulates_and_writes(tmp_path) -> None:
 
     pc.clear()
     assert len(pc) == 0
+
+
+def test_stereo_drops_pairs_from_before_the_rig_moved(board) -> None:
+    """A set holding two rig geometries must yield the majority one.
+
+    Seen on the rig: the cameras were adjusted after the first captures. The
+    first 20 of 140 pairs solved at 132.8 px against 2.0 px for the rest, and
+    all together refused at 62.8 px. Correspondence was correct in every pair
+    and freeing the intrinsics made it worse — the data, not the model.
+    """
+    good = _sweep(board, n=16, seed=4)
+    # The same board poses seen by a rig whose right eye sat somewhere else.
+    global R_TRUE, T_TRUE
+    saved = (R_TRUE, T_TRUE)
+    try:
+        R_TRUE = cv2.Rodrigues(np.array([0.0, 0.25, 0.0]))[0]
+        T_TRUE = np.array([-120.0, 30.0, 0.0])
+        stale = _sweep(board, n=4, seed=9)
+    finally:
+        R_TRUE, T_TRUE = saved
+
+    res, why = calibrate(stale + good, board, KL, KR, WH)
+    assert res is not None, why
+    assert res.rms_px < 0.1
+    assert abs(res.baseline_mm - 200.0) < 1.0
+    assert sorted(res.dropped) == list(range(len(stale)))
