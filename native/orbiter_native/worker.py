@@ -25,14 +25,17 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
+import cv2
 import httpx
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 
 from .config import Eye, RigConfig
 from .cvcore import BoardSpec
-from .detect import BoardDetector, BoardHit, LaserHit, LaserParams, find_laser
-from .orient import Orientation
+from .detect import BoardDetector, BoardHit, draw_board
+from .laser import LaserLine, LaserParams, board_mask, find_laser_line
+from .laser import draw as draw_laser
+from .orient import Orientation, apply as orient_apply, map_point
 from .source import Frame, MjpegReader
 
 log = logging.getLogger("orbiter_native.worker")
@@ -52,12 +55,16 @@ class EyeStats:
 
     recv_fps: float = 0.0
     detect_fps: float = 0.0
-    decode_ms: float = 0.0
     detect_ms: float = 0.0
     laser_ms: float = 0.0
     corners: int = 0
     coverage: float = 0.0
-    laser_cols: int = 0
+    #: Laser fit, when the frame produced a usable one.
+    laser_inliers: int = 0
+    laser_points: int = 0
+    laser_rms_px: float = float("nan")
+    laser_angle_deg: float = float("nan")
+    laser_reason: str | None = None
     #: Server-side age of the last frame at send time, from `X-Age-Ms`.
     server_age_ms: float | None = None
     frames: int = 0
@@ -105,7 +112,7 @@ class EyeResult:
     bgr: np.ndarray
     stats: EyeStats
     board: BoardHit | None = None
-    laser: LaserHit | None = None
+    laser: LaserLine | None = None
 
 
 class EyeWorker(QObject):
@@ -230,10 +237,6 @@ class EyeWorker(QObject):
     # ── detector thread ───────────────────────────────────────────────────
 
     def _detect_loop(self) -> None:
-        import cv2                                   # local: keeps import cost off startup
-
-        from .detect import draw_board, draw_laser
-
         detector = BoardDetector()
         while not self._stop.is_set():
             frame: Frame | None = self._latest.take(timeout=0.25)
@@ -243,23 +246,35 @@ class EyeWorker(QObject):
             detector.set_spec(spec)
 
             board = detector.detect(frame.gray, intrinsics) if detector.ready else BoardHit()
-            laser = find_laser(frame.gray, laser_params) if laser_on else LaserHit()
+
+            # The stripe is only searched for INSIDE the board. Off the board it
+            # is still a laser line, but it is not on the plane the calibration
+            # solves against, so those points would poison the fit.
+            laser = LaserLine()
+            hull = None
+            if laser_on:
+                mask = board_mask(board.corners, frame.gray.shape)
+                if mask is None:
+                    laser = LaserLine(reason="board not detected")
+                else:
+                    laser = find_laser_line(frame.bgr, mask, laser_params)
+                    hull = cv2.convexHull(board.corners.reshape(-1, 2).astype(np.int32))
 
             # Detect on ORIGINAL pixels, then orient for display, then map the
             # detections into the oriented frame. Detecting on the oriented
-            # image instead would report corner coordinates in a frame that
-            # depends on a UI setting — useless to any calibration consumer.
+            # image instead would report coordinates in a frame that depends on
+            # a UI setting — useless to any calibration consumer.
             h, w = frame.gray.shape
-            bgr = cv2.cvtColor(_orient(orientation, frame.gray), cv2.COLOR_GRAY2BGR)
+            bgr = np.ascontiguousarray(orient_apply(frame.bgr, orientation))
             draw_board(bgr, _orient_board(board, orientation, w, h))
             if laser_on:
-                draw_laser(bgr, _orient_laser(laser, orientation, w, h))
+                draw_laser(bgr, _orient_laser(laser, orientation, w, h),
+                           _orient_hull(hull, orientation, w, h))
 
-            now = time.monotonic()
-            self._det_times.append(now)
-            self._publish(frame, board, laser, bgr, now)
+            self._det_times.append(time.monotonic())
+            self._publish(frame, board, laser, bgr)
 
-    def _publish(self, frame, board, laser, bgr, now) -> None:
+    def _publish(self, frame, board, laser, bgr) -> None:
         s = self._stats
         s.frames += 1
         s.recv_fps = _rate(self._recv_times)
@@ -268,7 +283,11 @@ class EyeWorker(QObject):
         s.laser_ms = laser.ms
         s.corners = board.count
         s.coverage = board.coverage(*frame.gray.shape[::-1])
-        s.laser_cols = laser.count
+        s.laser_points = int(len(laser.points))
+        s.laser_inliers = laser.n_inliers
+        s.laser_rms_px = laser.rms_px
+        s.laser_angle_deg = laser.angle_deg
+        s.laser_reason = laser.reason
         s.server_age_ms = frame.server_age_ms
         self.result.emit(EyeResult(self.side, bgr, _copy_stats(s), board, laser))
 
@@ -288,28 +307,45 @@ def _copy_stats(s: EyeStats) -> EyeStats:
     return EyeStats(**vars(s))
 
 
-def _orient(o: Orientation, img: np.ndarray) -> np.ndarray:
-    from .orient import apply
-    return apply(img, o)
+def _map_all(pts: np.ndarray, o: Orientation, w: int, h: int) -> np.ndarray:
+    """Map an (N, 2) array of (x, y) into oriented coordinates."""
+    return np.array([map_point(float(x), float(y), w, h, o) for x, y in pts],
+                    dtype=np.float32)
 
 
 def _orient_board(hit: BoardHit, o: Orientation, w: int, h: int) -> BoardHit:
     """Copy of `hit` with corners mapped into oriented coordinates, for drawing."""
     if hit.corners is None or o.is_identity:
         return hit
-    from .orient import map_point
-    pts = hit.corners.reshape(-1, 2)
-    mapped = np.array([map_point(float(x), float(y), w, h, o) for x, y in pts],
-                      dtype=np.float32).reshape(-1, 1, 2)
+    mapped = _map_all(hit.corners.reshape(-1, 2), o, w, h).reshape(-1, 1, 2)
     return BoardHit(corners=mapped, ids=hit.ids, R=hit.R, t=hit.t, ms=hit.ms)
 
 
-def _orient_laser(hit: LaserHit, o: Orientation, w: int, h: int) -> LaserHit:
-    if hit.count == 0 or o.is_identity:
-        return hit
-    from .orient import map_point
-    pts = [map_point(float(x), float(y), w, h, o) for x, y in zip(hit.xs, hit.ys)]
-    if not pts:
-        return hit
-    arr = np.asarray(pts, dtype=np.float32)
-    return LaserHit(xs=arr[:, 0].astype(np.int32), ys=arr[:, 1], ms=hit.ms)
+def _orient_laser(line: LaserLine, o: Orientation, w: int, h: int) -> LaserLine:
+    """Copy of `line` in oriented coordinates, for drawing only.
+
+    The line handed to any calibration consumer stays in original coordinates —
+    this is purely so the overlay lands on the pixels it describes.
+    """
+    if o.is_identity or line.points.size == 0:
+        return line
+    pts = _map_all(line.points, o, w, h)
+    out = LaserLine(points=pts, inliers=line.inliers, rms_px=line.rms_px,
+                    ms=line.ms, reason=line.reason)
+    if line.point is not None and line.direction is not None:
+        # Map two points on the line and rebuild it, rather than trying to
+        # rotate a direction vector through a transform that also mirrors.
+        a = line.point - line.direction * 100.0
+        b = line.point + line.direction * 100.0
+        ma, mb = _map_all(np.stack([a, b]), o, w, h)
+        d = mb - ma
+        n = float(np.hypot(d[0], d[1]))
+        if n > 1e-6:
+            out.point, out.direction = ma, d / n
+    return out
+
+
+def _orient_hull(hull: np.ndarray | None, o: Orientation, w: int, h: int):
+    if hull is None or o.is_identity:
+        return hull
+    return _map_all(hull.reshape(-1, 2), o, w, h).astype(np.int32).reshape(-1, 1, 2)

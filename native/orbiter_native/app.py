@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from .config import ConfigClient, RigConfig
-from .detect import LaserParams
+from .laser import LaserParams
 from .panel import EyePanel
 from .worker import EyeResult, EyeWorker
 
@@ -85,24 +85,25 @@ class MainWindow(QMainWindow):
         bar = self.addToolBar("controls")
         bar.setMovable(False)
 
-        # The laser is off by default: this rig has no line laser fitted right
-        # now, and on a normally lit scene the detector would happily report a
-        # confident centroid for the brightest thing in every column.
+        # Off by default — it costs a few ms per frame and only means anything
+        # while the laser is actually on.
         self._laser = QCheckBox("laser line")
         self._laser.setToolTip(
-            "Per-column subpixel centroid. Needs an actual line laser — on a lit "
-            "scene without one it tracks the scene, not a stripe."
+            "Find the red stripe where it crosses the ChArUco board and fit a "
+            "straight line to it. Restricted to the board: points on the bench "
+            "are not on the board plane and would poison the calibration."
         )
         self._laser.toggled.connect(self._apply_laser)
         bar.addWidget(self._laser)
 
-        bar.addWidget(QLabel("  threshold "))
+        bar.addWidget(QLabel("  redness "))
         self._threshold = QSpinBox()
         self._threshold.setRange(1, 255)
-        self._threshold.setValue(LaserParams().min_intensity)
+        self._threshold.setValue(LaserParams().redness_min)
         self._threshold.setToolTip(
-            "Minimum peak brightness (0-255) for a column to count as carrying "
-            "the line. A laser saturates the sensor, so this belongs near 255."
+            "Minimum r - max(g, b) for a pixel to count as stripe. Redness, not "
+            "brightness: on this board the white squares are as bright as the "
+            "laser but not remotely as red."
         )
         self._threshold.valueChanged.connect(lambda _v: self._apply_laser())
         bar.addWidget(self._threshold)
@@ -113,7 +114,7 @@ class MainWindow(QMainWindow):
         bar.addAction(reload_act)
 
     def _apply_laser(self) -> None:
-        params = LaserParams(min_intensity=self._threshold.value())
+        params = LaserParams(redness_min=self._threshold.value())
         for w in self.workers.values():
             w.set_laser(self._laser.isChecked(), params)
 

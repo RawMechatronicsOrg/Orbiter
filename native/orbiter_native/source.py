@@ -6,12 +6,12 @@ Reads the multipart stream itself instead of handing the URL to
 latency number possible, and VideoCapture throws the headers away. camserver's
 own web UI parses the stream for exactly this reason.
 
-The reader also decodes straight to grayscale. Measured on this machine on a
-live 1080p frame: 2.20 ms for `IMREAD_GRAYSCALE` against 4.02 ms for
-`IMREAD_COLOR`. Both detectors downstream work on luminance, so the colour
-frame would be decoded only to be discarded — the display gets grayscale
-promoted back to BGR, which is cheaper than decoding colour and honest about
-what the pipeline actually saw.
+The reader decodes colour, and derives the grayscale view from it rather than
+decoding twice. The laser is red and the board is black and white, so the
+stripe is only separable in colour — see `laser.redness`. Measured at 720p on
+this machine: colour decode 2.23 ms plus 0.20 ms for the BGR→GRAY conversion,
+against 1.36 ms for a grayscale-only decode. About 1 ms per frame per camera
+buys the only channel in which the stripe exists.
 """
 
 from __future__ import annotations
@@ -44,6 +44,9 @@ _READ_TIMEOUT_S = 10.0
 class Frame:
     """One decoded frame plus what is needed to time it."""
 
+    #: Colour, as decoded. The laser needs it; the board does not.
+    bgr: np.ndarray
+    #: Luminance view, derived from `bgr` — what ChArUco detection consumes.
     gray: np.ndarray
     #: camserver's capture instant on ITS monotonic clock. Not comparable to
     #: our clock directly — see `MjpegReader.age_ms` for why this app reports
@@ -128,8 +131,8 @@ class MjpegReader:
 
     @staticmethod
     def _decode(payload: bytes, hdr: dict[str, str]) -> Frame | None:
-        gray = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_GRAYSCALE)
-        if gray is None:
+        bgr = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_COLOR)
+        if bgr is None:
             # A torn frame. Skip it; the next one is ~33 ms away and a dropped
             # frame is far better than propagating garbage into the detectors.
             return None
@@ -141,7 +144,8 @@ class MjpegReader:
                 return None
 
         return Frame(
-            gray=gray,
+            bgr=bgr,
+            gray=cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY),
             capture_mono=num("x-capture-monotonic"),
             seq=hdr.get("x-frame-seq"),
             server_age_ms=num("x-age-ms"),

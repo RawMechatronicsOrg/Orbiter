@@ -12,7 +12,12 @@ import numpy as np
 import pytest
 
 from orbiter_native import config as cfgmod
-from orbiter_native.detect import LaserParams, find_laser
+from orbiter_native.laser import (
+    LaserParams,
+    board_mask,
+    find_laser_line,
+    redness,
+)
 from orbiter_native.orient import Orientation, apply, map_point
 from orbiter_native.source import MjpegReader
 
@@ -67,30 +72,110 @@ def test_orientation_matches_the_css_contract() -> None:
     )
 
 
-def test_laser_finds_a_known_line_subpixel() -> None:
-    """A synthetic stripe on a known row must come back at that row."""
-    img = np.zeros((200, 320), np.uint8)
-    img[100, :] = 255
-    img[99, :] = 255            # symmetric two-pixel stripe → centroid at 99.5
-    hit = find_laser(img, LaserParams(min_intensity=200))
-    assert hit.count == 320
-    assert np.allclose(hit.ys, 99.5, atol=1e-3)
+def _stripe_frame(y0: float = 60.0, slope: float = 0.05, w: int = 320, h: int = 200):
+    """A red stripe on a bright neutral background, laid on a known line.
 
-
-def test_laser_ignores_a_scene_with_no_line() -> None:
-    """A dim, textured frame must yield nothing at the shipped threshold.
-
-    Regression guard for the default that was originally too low: on a lit
-    workbench frame from the rig it reported a confident centroid in every one
-    of 1280 columns, tracking the scene rather than a stripe.
+    Neutral-but-bright on purpose: it is the case a luminance detector gets
+    wrong and this one must not — the background is as bright as the stripe.
     """
-    rng = np.random.default_rng(0)
-    img = rng.integers(0, 120, size=(200, 320), dtype=np.uint8)
-    assert find_laser(img).count == 0
+    import cv2
+    bgr = np.full((h, w, 3), 200, np.uint8)          # bright, neutral
+    for x in range(w):
+        y = y0 + slope * x
+        lo, hi = int(np.floor(y)), int(np.floor(y)) + 1
+        frac = y - lo
+        for row, weight in ((lo, 1.0 - frac), (hi, frac)):
+            if 0 <= row < h:
+                bgr[row, x, 2] = 255                                  # red up
+                bgr[row, x, 0] = bgr[row, x, 1] = int(200 * (1 - weight))
+    return bgr, cv2
 
 
-def test_laser_tolerates_a_blank_frame() -> None:
-    assert find_laser(np.zeros((32, 32), np.uint8)).count == 0
+def test_redness_ignores_bright_neutral_pixels() -> None:
+    """White is not red. This is the property the whole detector rests on."""
+    white = np.full((4, 4, 3), 255, np.uint8)
+    assert int(redness(white).max()) == 0
+    red = np.zeros((4, 4, 3), np.uint8)
+    red[:, :, 2] = 255
+    assert int(redness(red).min()) == 255
+
+
+def test_laser_fits_a_known_line_subpixel() -> None:
+    bgr, _ = _stripe_frame(y0=60.0, slope=0.05)
+    line = find_laser_line(bgr, None, LaserParams(redness_min=40))
+    assert line.ok, line.reason
+    assert line.n_inliers > 250
+    assert line.rms_px < 0.5
+    # The synthetic slope is 0.05 -> atan(0.05) = 2.86 degrees.
+    assert abs(line.angle_deg - np.degrees(np.arctan(0.05))) < 0.2
+    # And the fitted line must pass through the stripe at both ends.
+    p, d = line.point, line.direction
+    for x in (10.0, 300.0):
+        t = (x - p[0]) / d[0]
+        assert abs((p + d * t)[1] - (60.0 + 0.05 * x)) < 0.5
+
+
+def test_laser_needs_colour() -> None:
+    with pytest.raises(ValueError):
+        find_laser_line(np.zeros((16, 16), np.uint8), None)
+
+
+def test_laser_reports_why_it_found_nothing() -> None:
+    """Each refusal names its own cause — the fixes are different."""
+    neutral = np.full((64, 64, 3), 180, np.uint8)
+    assert find_laser_line(neutral, None).reason is not None
+
+    bgr, _ = _stripe_frame()
+    empty = np.zeros(bgr.shape[:2], bool)
+    assert find_laser_line(bgr, empty).reason == "board not visible"
+
+
+def test_laser_mask_confines_the_search() -> None:
+    """Points outside the mask must not reach the fit.
+
+    This is what keeps the stripe's continuation on the workbench — which is
+    not on the board plane — out of the calibration sample.
+    """
+    bgr, _ = _stripe_frame(y0=60.0, slope=0.0)
+    mask = np.zeros(bgr.shape[:2], bool)
+    mask[:, 100:200] = True
+    line = find_laser_line(bgr, mask, LaserParams(redness_min=40))
+    assert line.ok, line.reason
+    xs = line.points[:, 0]
+    assert xs.min() >= 100 and xs.max() < 200
+
+
+def test_ransac_rejects_an_outlier_cluster() -> None:
+    """A bright blob off the line must not drag the fit.
+
+    On real frames the stripe's centroid wanders where it crosses a dark
+    square; measured there, robust fitting cut RMS from 1.88 px to 0.67 px.
+    """
+    bgr, _ = _stripe_frame(y0=60.0, slope=0.0)
+    bgr[150:158, 40:70, 2] = 255            # a red blob far from the stripe
+    bgr[150:158, 40:70, 0:2] = 0
+    line = find_laser_line(bgr, None, LaserParams(redness_min=40))
+    assert line.ok, line.reason
+    assert line.rms_px < 0.5
+    assert abs(line.point[1] + line.direction[1] * 0 - 60.0) < 1.5
+    assert int((~line.inliers).sum()) >= 20   # the blob's columns were rejected
+
+
+def test_laser_is_deterministic() -> None:
+    """Same frame in, same fit out — RANSAC is seeded for this reason."""
+    bgr, _ = _stripe_frame()
+    a = find_laser_line(bgr, None)
+    b = find_laser_line(bgr, None)
+    assert a.n_inliers == b.n_inliers
+    assert np.allclose(a.point, b.point) and np.allclose(a.direction, b.direction)
+
+
+def test_board_mask_needs_enough_corners() -> None:
+    assert board_mask(None, (32, 32)) is None
+    assert board_mask(np.zeros((2, 1, 2), np.float32), (32, 32)) is None
+    corners = np.array([[[4, 4]], [[28, 4]], [[28, 28]], [[4, 28]]], np.float32)
+    m = board_mask(corners, (32, 32))
+    assert m is not None and m[16, 16] and not m[0, 0]
 
 
 def _part(payload: bytes, extra: bytes = b"") -> bytes:

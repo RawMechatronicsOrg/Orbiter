@@ -98,6 +98,23 @@ class EyePanel(QFrame):
         elif s.corners and self._eye is not None and self._eye.intrinsics is None:
             # Say why, rather than leaving a blank the operator has to guess at.
             lines.append("pose   needs per-eye intrinsics")
-        if s.laser_cols:
-            lines.append(f"laser  {s.laser_cols} cols   {_fmt(s.laser_ms)} ms")
+        lines += self._laser_lines(s)
         return lines
+
+    @staticmethod
+    def _laser_lines(s: EyeStats) -> list[str]:
+        """The laser fit, or why this frame is not a usable calibration sample.
+
+        The reason is shown rather than a blank line: "no stripe above the
+        redness threshold" and "board not detected" call for opposite fixes,
+        and an operator staring at an empty row cannot tell them apart.
+        """
+        if s.laser_reason is not None:
+            return [f"laser  — {s.laser_reason}"]
+        if not s.laser_inliers:
+            return []
+        return [
+            f"laser  {s.laser_inliers}/{s.laser_points} pts   "
+            f"RMS {s.laser_rms_px:.2f} px   {_fmt(s.laser_ms)} ms",
+            f"       angle {s.laser_angle_deg:+.2f}°",
+        ]
