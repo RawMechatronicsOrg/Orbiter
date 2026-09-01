@@ -223,7 +223,43 @@ _RIG_COERCE: dict[str, Callable[[Any], Any]] = {
     "token": lambda v: str(v).strip(),
     "baseline_mm": lambda v: float(v),
     "extrinsics": lambda v: _coerce_extrinsics(v),
+    "laser_plane": lambda v: _coerce_laser_plane(v),
 }
+
+
+def _coerce_laser_plane(v: Any) -> dict[str, Any] | None:
+    """The laser sheet as `n . X = d` in the left camera's frame, mm.
+
+    Meaningful only while the cameras and the laser stay rigidly coupled: the
+    plane is fixed in the cameras' frame, not in the world. `width`/`height`
+    travel with it for the same reason as on the intrinsics — the frame it is
+    expressed in is defined by a camera matrix valid at one resolution.
+    """
+    if v is None:
+        return None
+    if not isinstance(v, dict):
+        raise CommandError("laser_plane must be an object or null")
+    try:
+        n = [float(x) for x in v["n"]]
+        out: dict[str, Any] = {
+            "n": n, "d": float(v["d"]),
+            "width": int(v["width"]), "height": int(v["height"]),
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CommandError(f"laser_plane needs n (3), d, width, height: {exc}") from exc
+    if len(n) != 3:
+        raise CommandError("laser_plane: n must have 3 components")
+    if sum(x * x for x in n) < 1e-12:
+        raise CommandError("laser_plane: n must not be the zero vector")
+    if out["width"] <= 0 or out["height"] <= 0:
+        raise CommandError("laser_plane width/height must be positive")
+    for key, cast in (("rms_mm", float), ("points", int), ("frames", int)):
+        if key in v and v[key] is not None:
+            try:
+                out[key] = cast(v[key])
+            except (TypeError, ValueError) as exc:
+                raise CommandError(f"laser_plane: bad {key!r}: {exc}") from exc
+    return out
 
 
 def _coerce_extrinsics(v: Any) -> dict[str, Any] | None:
@@ -280,7 +316,7 @@ async def _cmd_set_stereo_rig(args: dict[str, Any]) -> dict[str, Any]:
     """Update the binocular pair config — the per-run baseline.
 
     Payload (all optional — only keys present are applied):
-      `host`, `token`, `baseline_mm`, `extrinsics`,
+      `host`, `token`, `baseline_mm`, `extrinsics`, `laser_plane`,
       `left` / `right`: `{camera_id, quarter_turns_cw, flip_h, flip_v,
       intrinsics}`, where `intrinsics` is `{fx, fy, cx, cy, dist, width,
       height}` (plus optional `rms_px`, `views`, `solved_at`) or null to

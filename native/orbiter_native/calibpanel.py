@@ -49,6 +49,7 @@ from .intrinsics import (
     SolveResult,
 )
 from .intrinsics import solve as solve_intrinsics
+from .laserplane import LaserPlane, PlaneCollector
 from .stereo import StereoResult
 from .stereo import calibrate as solve_stereo
 from .worker import EyeResult
@@ -140,6 +141,11 @@ class CalibrationPanel(QFrame):
         self._last_corners: dict[str, np.ndarray] = {}
         self._results: dict[str, SolveResult] = {}
         self._stereo: StereoResult | None = None
+        self._plane: LaserPlane | None = None
+        # Stripe-on-board samples, gathered live whenever the laser is on
+        # and the board's pose is known. Nothing else needs to be aimed or
+        # measured: the board already tells us where those points are in 3D.
+        self._plane_pts = PlaneCollector()
         #: Intrinsics currently known for each eye — from a fresh solve here,
         #: or from the server when a previous run already stored them.
         self._known_k: dict[str, object] = {}
@@ -176,7 +182,8 @@ class CalibrationPanel(QFrame):
         grid = QGridLayout()
         grid.setHorizontalSpacing(10)
         self._stat_labels: dict[str, QLabel] = {}
-        for r, key in enumerate(("views", "paired", "tilt", "novelty")):
+        for r, key in enumerate(("views", "paired", "tilt", "novelty",
+                                 "laser pts")):
             name = QLabel(key)
             name.setStyleSheet("color:#8b9aac; font-size:11px;")
             val = QLabel("—")
@@ -211,6 +218,16 @@ class CalibrationPanel(QFrame):
         self.btn_stereo.clicked.connect(self._solve_stereo)
         root.addWidget(self.btn_stereo)
 
+        self.btn_plane = QPushButton("Solve laser plane")
+        self.btn_plane.setToolTip(
+            "Fit the sheet the laser projects, from where it crosses the board. "
+            "Needs the laser detector on and per-eye intrinsics. Gives the only "
+            "independent check on a scanned point, and lets one camera alone "
+            "produce points where the other cannot see the stripe."
+        )
+        self.btn_plane.clicked.connect(self._solve_plane)
+        root.addWidget(self.btn_plane)
+
         self.btn_save = QPushButton("Save to server")
         self.btn_save.setEnabled(False)
         self.btn_save.clicked.connect(self._save)
@@ -224,6 +241,10 @@ class CalibrationPanel(QFrame):
         root.addStretch(1)
 
     # ── config ────────────────────────────────────────────────────────────
+
+    @property
+    def _left_k(self):
+        return self._known_k.get("left")
 
     def set_intrinsics(self, side: str, k) -> None:
         """Adopt intrinsics the server already holds, so the stereo solve does
@@ -256,7 +277,25 @@ class CalibrationPanel(QFrame):
 
     def on_result(self, res: EyeResult) -> None:
         """Take one eye's result and, when a partner frame exists, capture."""
+        self._collect_plane(res)
         self._still(res)                 # keep the stillness history current
+
+    def _collect_plane(self, res: EyeResult) -> None:
+        """Bank stripe-on-board points from the LEFT eye.
+
+        Left only: the plane is expressed in that camera's frame, which is the
+        frame the scan works in, and mixing the right eye's points would need
+        the pair extrinsics to be already solved and correct.
+        """
+        if res.side != "left" or self._left_k is None:
+            return
+        line = res.laser
+        board = res.board
+        if (line is None or not line.ok or board is None
+                or board.R is None or board.t is None):
+            return
+        self._plane_pts.add_frame(line.inlier_points, self._left_k,
+                                  board.R, board.t)
         if res.board is not None and res.board.corners is not None:
             self._recent[res.side].append(res)
         self._refresh_live(res)
@@ -327,6 +366,8 @@ class CalibrationPanel(QFrame):
         )
         self._stat_labels["novelty"].setText(
             "—" if not np.isfinite(nov) else f"{nov:.3f}")
+        self._stat_labels["laser pts"].setText(
+            f"{len(self._plane_pts)} / {self._plane_pts.frames}f")
         self._stat_labels["views"].setText(str(len(self.samples)))
         self._stat_labels["paired"].setText(str(len(self.samples.paired())))
         spreads = [self.samples.tilt_spread(s) for s in ("left", "right")]
@@ -395,6 +436,8 @@ class CalibrationPanel(QFrame):
         self.samples.clear()
         self._results.clear()
         self._stereo = None
+        self._plane = None
+        self._plane_pts.clear()
         self.btn_save.setEnabled(False)
         self._persist()
         self.report.setText("cleared")
@@ -478,12 +521,40 @@ class CalibrationPanel(QFrame):
         )
         self.btn_save.setEnabled(True)
 
+    def _solve_plane(self) -> None:
+        """Fit the laser sheet from the banked stripe-on-board points."""
+        if self._left_k is None:
+            self.report.setText("laser plane needs left-eye intrinsics first")
+            return
+        if len(self._plane_pts) == 0:
+            self.report.setText(
+                "no stripe-on-board points yet — switch the laser on and let "
+                "it fall across the board from a few different poses")
+            return
+        wh = (self.samples.views("left")[0].wh if self.samples.views("left")
+              else (0, 0))
+        plane, why = self._plane_pts.fit(wh)
+        if plane is None:
+            self._plane = None
+            self.report.setText(f"laser plane: {why}")
+            return
+        self._plane = plane
+        n = plane.normal
+        self.report.setText(
+            f"laser plane: rms {plane.rms_mm:.2f} mm\n"
+            f"  {plane.n_points} points over {plane.n_frames} frames\n"
+            f"  n=({n[0]:+.3f},{n[1]:+.3f},{n[2]:+.3f}) d={plane.d:.1f} mm"
+        )
+        self.btn_save.setEnabled(True)
+
     def _save(self) -> None:
-        if not self._results and self._stereo is None:
+        if not self._results and self._stereo is None and self._plane is None:
             return
         payload: dict = {side: res.as_config() for side, res in self._results.items()}
         if self._stereo is not None:
             payload["_extrinsics"] = self._stereo.as_config()
+        if self._plane is not None:
+            payload["_laser_plane"] = self._plane.as_config()
         self.save_requested.emit(payload)
         # Replace, never append: a stale "sent to server" line left under a
         # later failure reads as if the failed solve had been saved.

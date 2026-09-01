@@ -77,6 +77,8 @@ class RigConfig:
     #: Solved pair geometry as stored, or None. Raw for the same reason the
     #: intrinsics are: usability depends on the live frame size.
     extrinsics_raw: dict[str, Any] | None = None
+    #: Solved laser plane as stored, or None.
+    laser_plane_raw: dict[str, Any] | None = None
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @property
@@ -129,6 +131,8 @@ def parse(cfg: dict[str, Any]) -> RigConfig:
         board=board_spec_from_config(cfg),
         extrinsics_raw=(rig.get("extrinsics")
                         if isinstance(rig.get("extrinsics"), dict) else None),
+        laser_plane_raw=(rig.get("laser_plane")
+                         if isinstance(rig.get("laser_plane"), dict) else None),
         raw=cfg,
     )
 

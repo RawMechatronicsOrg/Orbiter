@@ -31,6 +31,7 @@ from .laser import LaserParams
 from .panel import EyePanel
 from .scan import scan_frame
 from .scanpanel import ScanPanel
+from .laserplane import from_config as plane_from_config
 from .stereo import StereoRig, result_from_config
 from .worker import EyeResult, EyeWorker
 
@@ -181,7 +182,10 @@ class MainWindow(QMainWindow):
         # The pair geometry is a rig-level field, not an eye's; the panel
         # flags it with a reserved key so one save covers both solves.
         extr = per_side.pop("_extrinsics", None)
+        plane = per_side.pop("_laser_plane", None)
         args: dict = {side: {"intrinsics": k} for side, k in per_side.items()}
+        if plane is not None:
+            args["laser_plane"] = plane
         if extr is not None:
             args["extrinsics"] = extr
             # The measured baseline supersedes whatever nominal value was typed
@@ -242,8 +246,11 @@ class MainWindow(QMainWindow):
         if board is None or board.R is None or board.t is None:
             self.scan.note("board not visible — it is what defines the scan volume")
             return
+        plane = plane_from_config(
+            self._config.laser_plane_raw if self._config else None, left.wh)
         self.scan.on_frame(scan_frame(rig, left.stripe, right.stripe,
-                                      board.R, board.t, self.scan.params()))
+                                      board.R, board.t, self.scan.params(),
+                                      plane))
 
     def _scan_rig(self, wh) -> StereoRig | None:
         """Build the projection geometry, reusing it until the calibration changes."""

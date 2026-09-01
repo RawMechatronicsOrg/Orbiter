@@ -142,6 +142,9 @@ class ScanPanel(QFrame):
                          f"ambiguous {f.n_rejected_ambiguous}")
             lines.append(f"shallow  {f.n_rejected_geometry} · "
                          f"outside box {f.n_rejected_volume}")
+            if f.n_rejected_plane or f.n_single_eye:
+                lines.append(f"off-plane {f.n_rejected_plane} · "
+                             f"one-eye {f.n_single_eye}")
             if f.n_kept:
                 lines.append(f"reproj  med {np.median(f.reproj_px):.2f} px")
         self.stats.setText("\n".join(lines))

@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .laser import LaserPoints
+from .laserplane import LaserPlane
 from .stereo import StereoRig
 
 log = logging.getLogger("orbiter_native.scan")
@@ -88,6 +89,17 @@ class ScanParams:
     #: Reprojection sanity only. Near-zero by construction — see the module
     #: note on why this cannot be the both-cameras-agree test.
     max_reproj_px: float = 1.5
+    #: How far a triangulated point may sit from the laser plane, in mm.
+    #:
+    #: This is the ONE independent check available. Stereo correspondence is
+    #: built by intersecting an epipolar line with the other eye's observation,
+    #: so the rays meet by construction whatever the pairing; only the plane
+    #: was not assumed by that construction. Ignored when no plane is
+    #: calibrated.
+    max_plane_mm: float = 2.0
+    #: Take points from one eye alone where the other cannot see the stripe, by
+    #: meeting its ray with the laser plane. Needs a calibrated plane.
+    single_eye: bool = True
     volume: ScanVolume = field(default_factory=ScanVolume)
 
 
@@ -107,6 +119,10 @@ class ScanFrame:
     n_rejected_ambiguous: int = 0
     n_rejected_geometry: int = 0
     n_rejected_volume: int = 0
+    #: Triangulated points that did not lie on the laser plane.
+    n_rejected_plane: int = 0
+    #: Points recovered from one eye alone via the plane.
+    n_single_eye: int = 0
     reason: str | None = None
 
     @property
@@ -185,6 +201,7 @@ def scan_frame(
     board_R: np.ndarray | None,
     board_t: np.ndarray | None,
     params: ScanParams = ScanParams(),
+    plane: LaserPlane | None = None,
 ) -> ScanFrame:
     """Triangulate one frame pair's stripe into board-frame points.
 
@@ -224,6 +241,31 @@ def scan_frame(
     sane = np.isfinite(xyz_cam).all(axis=1) & (err <= params.max_reproj_px)
     xyz_cam, err = xyz_cam[sane], err[sane]
 
+    # The independent check. Everything above was consistent by construction.
+    n_plane = 0
+    if plane is not None and len(xyz_cam):
+        on_sheet = np.abs(plane.distance(xyz_cam)) <= params.max_plane_mm
+        n_plane = int((~on_sheet).sum())
+        xyz_cam, err = xyz_cam[on_sheet], err[on_sheet]
+
+    # Points the other eye could not confirm are not lost when the plane is
+    # known: one ray meets one sheet in one place. On a subject this is most
+    # of the shadowed flank.
+    n_single = 0
+    if plane is not None and params.single_eye:
+        alone = ~usable
+        if alone.any():
+            d = lp[alone] - np.array([rig.left_k.cx, rig.left_k.cy])
+            d = np.hstack([d / np.array([rig.left_k.fx, rig.left_k.fy]),
+                           np.ones((int(alone.sum()), 1))])
+            d = d / np.linalg.norm(d, axis=1, keepdims=True)
+            solo = plane.intersect_rays(np.zeros_like(d), d)
+            solo = solo[np.isfinite(solo).all(axis=1)]
+            if len(solo):
+                n_single = len(solo)
+                xyz_cam = np.vstack([xyz_cam, solo])
+                err = np.concatenate([err, np.full(len(solo), np.nan)])
+
     # Into the board's frame: the volume is defined relative to the board, so it
     # stays put when the board moves and "above" keeps meaning above it.
     if len(xyz_cam):
@@ -243,6 +285,8 @@ def scan_frame(
         n_rejected_ambiguous=n_amb,
         n_rejected_geometry=n_geom,
         n_rejected_volume=n_vol,
+        n_rejected_plane=n_plane,
+        n_single_eye=n_single,
     )
 
 
