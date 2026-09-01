@@ -222,7 +222,42 @@ _RIG_COERCE: dict[str, Callable[[Any], Any]] = {
     "host": lambda v: str(v).strip().rstrip("/"),
     "token": lambda v: str(v).strip(),
     "baseline_mm": lambda v: float(v),
+    "extrinsics": lambda v: _coerce_extrinsics(v),
 }
+
+
+def _coerce_extrinsics(v: Any) -> dict[str, Any] | None:
+    """The right eye's pose in the left eye's frame, or None to clear.
+
+    `R` is 3x3 and `T` is in MILLIMETRES. `width`/`height` are required for the
+    same reason as on intrinsics: this geometry was solved alongside a specific
+    pair of camera matrices, which are only valid at one frame size, so it must
+    be refused rather than reused when the resolution changes.
+    """
+    if v is None:
+        return None
+    if not isinstance(v, dict):
+        raise CommandError("extrinsics must be an object or null")
+    try:
+        R = [[float(x) for x in row] for row in v["R"]]
+        T = [float(x) for x in v["T"]]
+        out: dict[str, Any] = {
+            "R": R, "T": T,
+            "width": int(v["width"]), "height": int(v["height"]),
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CommandError(f"extrinsics needs R (3x3), T (3), width, height: {exc}") from exc
+    if len(R) != 3 or any(len(row) != 3 for row in R) or len(T) != 3:
+        raise CommandError("extrinsics: R must be 3x3 and T must have 3 elements")
+    if out["width"] <= 0 or out["height"] <= 0:
+        raise CommandError("extrinsics width/height must be positive")
+    for key, cast in (("rms_px", float), ("views", int), ("baseline_mm", float)):
+        if key in v and v[key] is not None:
+            try:
+                out[key] = cast(v[key])
+            except (TypeError, ValueError) as exc:
+                raise CommandError(f"extrinsics: bad {key!r}: {exc}") from exc
+    return out
 
 
 def _merge_eye(current: Any, patch: Any, side: str) -> dict[str, Any]:
@@ -245,7 +280,7 @@ async def _cmd_set_stereo_rig(args: dict[str, Any]) -> dict[str, Any]:
     """Update the binocular pair config — the per-run baseline.
 
     Payload (all optional — only keys present are applied):
-      `host`, `token`, `baseline_mm`,
+      `host`, `token`, `baseline_mm`, `extrinsics`,
       `left` / `right`: `{camera_id, quarter_turns_cw, flip_h, flip_v,
       intrinsics}`, where `intrinsics` is `{fx, fy, cx, cy, dist, width,
       height}` (plus optional `rms_px`, `views`, `solved_at`) or null to

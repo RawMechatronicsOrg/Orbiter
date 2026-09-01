@@ -79,14 +79,9 @@ other size — camserver can be reconfigured under a running app, and 1280x720
 intrinsics on a 1080p frame put the principal point in the wrong place and
 scale the focal length by two thirds.
 
-**`stereoCalibrate` is not done yet.** Capture already stores paired views for
-it, so the sweep does not need repeating — but the mutual geometry of the two
-cameras, and the real baseline, are still unsolved.
-
-**The laser fit is not yet a calibration.** It produces the per-frame input —
-subpixel stripe points on the board, and the line they fit — but turning those
-into the camera↔laser geometry needs per-eye intrinsics first, for the same
-reason board pose does. See "Laser" below.
+**The laser plane is not solved.** Scanning does not need it — triangulation
+from two cameras gives the 3D point directly — but it would be a second,
+independent check on every point, and it is not implemented.
 
 **OpenCV version skew.** The server image pins `opencv-python-headless>=4.7`
 and resolves to 4.x; this venv resolved 5.0. Both work — the aruco API and a
@@ -172,6 +167,44 @@ server's phone-lens solve fixes them, but that was a different lens.
 **Save to server** stores the result through `POST /command/set_stereo_rig`,
 the same command the web tab uses, so the server remains the one owner of this
 state.
+
+## Scanning
+
+With the pair calibrated and the laser detector on, **scanning** triangulates
+the stripe and accumulates a cloud.
+
+Correspondence is epipolar: a point in the left image lies on a known line in
+the right one, the laser gives a second line, and two lines meet in one point.
+No descriptor, no search window, no similarity threshold.
+
+**What "confirmed by both cameras" actually means here.** Not reprojection
+error — that check is vacuous, and it is worth knowing why because it looks
+like it should work. The match is *constructed* as a point on the left
+observation's epipolar line, so the two rays meet exactly by construction and
+every point reprojects to ~1e-13 px however wrong the match is. Sliding the
+right eye's stripe sideways by 25 px was measured to change nothing: every
+point still "agreed". The real test is whether the intersection lands where the
+right eye **actually detected laser**, not merely on the infinite line fitted
+through its detections.
+
+The volume filter is expressed in the **board's** frame, so it stays put as the
+board moves and "above" keeps meaning above the board. The bench, your hands
+and the far wall fall outside it without any of them needing to be recognised.
+Points below a 3 mm floor are the stripe lying on the board itself — the
+calibration target, not the subject.
+
+The board must be visible for scanning to work: it is what defines where the
+volume is.
+
+### The one geometric trap
+
+**A laser line parallel to the stereo baseline cannot be triangulated this way.**
+It runs along the epipolar lines, so a point in one image has no unique match
+in the other, and no amount of calibration quality fixes it. The scan reports
+`stripe runs along the epipolar lines` rather than producing garbage.
+
+If that appears, rotate the laser roughly 90 degrees. The stripe wants to cross
+the baseline, not follow it.
 
 ## Measured on this machine
 

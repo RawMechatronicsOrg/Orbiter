@@ -35,6 +35,9 @@ class BoardHit:
     #: None until the pair itself is calibrated — see `cvcore.intrinsics_from_eye`.
     R: np.ndarray | None = None
     t: np.ndarray | None = None
+    #: Geodesic angle between the two planar-PnP candidates. Large means the
+    #: view was genuinely ambiguous and the temporal prior did the deciding.
+    ambiguity_deg: float = 0.0
     ms: float = 0.0
 
     @property
@@ -65,6 +68,9 @@ class BoardDetector:
     def __init__(self, spec=None) -> None:
         self._spec = None
         self._board = None
+        #: Last accepted rotation, used as the prior that breaks the flat-board
+        #: pose ambiguity on the next frame.
+        self._last_R = None
         self.set_spec(spec)
 
     def set_spec(self, spec) -> None:
@@ -77,6 +83,7 @@ class BoardDetector:
             return
         self._spec = spec
         self._board = build_board(spec)
+        self._last_R = None
 
     @property
     def ready(self) -> bool:
@@ -94,9 +101,16 @@ class BoardDetector:
         corners, ids = charuco_detect(gray, self._board)
         hit = BoardHit(corners=corners, ids=ids)
         if corners is not None and intrinsics is not None:
-            pose = estimate_pose(corners, ids, self._board, intrinsics)
+            pose = estimate_pose(corners, ids, self._board, intrinsics,
+                                 self._last_R)
             if pose is not None:
-                hit.R, hit.t = pose
+                hit.R, hit.t, hit.ambiguity_deg = pose
+                self._last_R = hit.R
+        elif corners is None:
+            # The board left the view; the old rotation is no longer a prior
+            # for whatever comes back, and reusing it could lock in the wrong
+            # twin for the rest of the session.
+            self._last_R = None
         hit.ms = (time.perf_counter() - t0) * 1000.0
         return hit
 

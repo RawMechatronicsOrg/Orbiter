@@ -42,6 +42,7 @@ try:
         Intrinsics,
         _build_board,
         detect_board,
+        estimate_board_pose,
         estimate_board_pose_disambiguated,
     )
 except ImportError as exc:  # pragma: no cover - environment problem, not logic
@@ -70,14 +71,27 @@ def charuco_detect(gray: np.ndarray, board):
     return detect_board(gray, board)
 
 
-def estimate_pose(corners, ids, board, intrinsics: Intrinsics):
-    """Board→camera (R, t in mm), with the planar twin resolved, or None.
+def estimate_pose(corners, ids, board, intrinsics: Intrinsics,
+                  R_predicted=None) -> tuple[np.ndarray, np.ndarray, float] | None:
+    """Board→camera `(R, t_mm, ambiguity_deg)`, or None.
 
-    Uses the disambiguated solver rather than a bare `solvePnP` for the reason
-    in the module docstring — a flat board admits two poses that fit the
-    corners almost equally well.
+    A flat board admits TWO poses that reproject almost identically, and a bare
+    `solvePnP` flips between them — a ~10-30 degree rotation error with only a
+    modest translation error. On this rig that would flip the scanning volume.
+
+    `R_predicted` breaks the tie. The caller supplies the previous frame's
+    rotation: at 30 fps the board barely moves between frames, so the last pose
+    is a good prior for the next. With no prior — the first frame after the
+    board appears — this falls back to the plain solve, whose answer is
+    IPPE's best-reprojection candidate. `ambiguity_deg` reports how far apart
+    the two candidates were, so a pose that depended heavily on the prior is
+    visible rather than implied.
     """
-    return estimate_board_pose_disambiguated(corners, ids, board, intrinsics)
+    if R_predicted is None:
+        out = estimate_board_pose(corners, ids, board, intrinsics)
+        return None if out is None else (out[0], out[1], 0.0)
+    return estimate_board_pose_disambiguated(corners, ids, board, intrinsics,
+                                             R_predicted)
 
 
 def board_spec_from_config(cfg: dict[str, Any]) -> BoardSpec | None:

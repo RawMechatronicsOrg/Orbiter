@@ -252,42 +252,53 @@ class EyeWorker(QObject):
             frame: Frame | None = self._latest.take(timeout=0.25)
             if frame is None:
                 continue
-            _, orientation, spec, eye, laser_on, laser_params = self._snapshot()
-            detector.set_spec(spec)
+            try:
+                self._detect_one(detector, frame)
+            except Exception as exc:                     # noqa: BLE001
+                # One bad frame, or one unforeseen shape, must not silently
+                # end this eye for the rest of the session — the window would
+                # keep showing the last image with no hint that detection had
+                # stopped.
+                log.exception("%s detector raised; continuing", self.side)
+                self._set_error(f"detector: {exc.__class__.__name__}: {exc}")
 
-            h, w = frame.gray.shape
-            # Resolved against THIS frame's size: intrinsics solved at another
-            # resolution are refused rather than silently misapplied.
-            intrinsics = eye.intrinsics_for((w, h)) if eye else None
-            board = detector.detect(frame.gray, intrinsics) if detector.ready else BoardHit()
-            descriptor = (describe(board.corners, board.ids, detector.board, (w, h))
-                          if board.corners is not None else None)
+    def _detect_one(self, detector: BoardDetector, frame: Frame) -> None:
+        _, orientation, spec, eye, laser_on, laser_params = self._snapshot()
+        detector.set_spec(spec)
 
-            # The stripe is only searched for INSIDE the board. Off the board it
-            # is still a laser line, but it is not on the plane the calibration
-            # solves against, so those points would poison the fit.
-            laser = LaserLine()
-            hull = None
-            if laser_on:
-                mask = board_mask(board.corners, frame.gray.shape)
-                if mask is None:
-                    laser = LaserLine(reason="board not detected")
-                else:
-                    laser = find_laser_line(frame.bgr, mask, laser_params)
-                    hull = cv2.convexHull(board.corners.reshape(-1, 2).astype(np.int32))
+        h, w = frame.gray.shape
+        # Resolved against THIS frame's size: intrinsics solved at another
+        # resolution are refused rather than silently misapplied.
+        intrinsics = eye.intrinsics_for((w, h)) if eye else None
+        board = detector.detect(frame.gray, intrinsics) if detector.ready else BoardHit()
+        descriptor = (describe(board.corners, board.ids, detector.board, (w, h))
+                      if board.corners is not None else None)
 
-            # Detect on ORIGINAL pixels, then orient for display, then map the
-            # detections into the oriented frame. Detecting on the oriented
-            # image instead would report coordinates in a frame that depends on
-            # a UI setting — useless to any calibration consumer.
-            bgr = np.ascontiguousarray(orient_apply(frame.bgr, orientation))
-            draw_board(bgr, _orient_board(board, orientation, w, h))
-            if laser_on:
-                draw_laser(bgr, _orient_laser(laser, orientation, w, h),
-                           _orient_hull(hull, orientation, w, h))
+        # The stripe is only searched for INSIDE the board. Off the board it
+        # is still a laser line, but it is not on the plane the calibration
+        # solves against, so those points would poison the fit.
+        laser = LaserLine()
+        hull = None
+        if laser_on:
+            mask = board_mask(board.corners, frame.gray.shape)
+            if mask is None:
+                laser = LaserLine(reason="board not detected")
+            else:
+                laser = find_laser_line(frame.bgr, mask, laser_params)
+                hull = cv2.convexHull(board.corners.reshape(-1, 2).astype(np.int32))
 
-            self._det_times.append(time.monotonic())
-            self._publish(frame, board, laser, bgr, descriptor)
+        # Detect on ORIGINAL pixels, then orient for display, then map the
+        # detections into the oriented frame. Detecting on the oriented
+        # image instead would report coordinates in a frame that depends on
+        # a UI setting — useless to any calibration consumer.
+        bgr = np.ascontiguousarray(orient_apply(frame.bgr, orientation))
+        draw_board(bgr, _orient_board(board, orientation, w, h))
+        if laser_on:
+            draw_laser(bgr, _orient_laser(laser, orientation, w, h),
+                       _orient_hull(hull, orientation, w, h))
+
+        self._det_times.append(time.monotonic())
+        self._publish(frame, board, laser, bgr, descriptor)
 
     def _publish(self, frame, board, laser, bgr, descriptor) -> None:
         s = self._stats

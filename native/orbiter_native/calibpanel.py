@@ -47,6 +47,8 @@ from .intrinsics import (
     SolveResult,
 )
 from .intrinsics import solve as solve_intrinsics
+from .stereo import StereoResult
+from .stereo import calibrate as solve_stereo
 from .worker import EyeResult
 
 log = logging.getLogger("orbiter_native.calibpanel")
@@ -115,6 +117,10 @@ class CalibrationPanel(QFrame):
         self._pending: dict[str, _Pending] = {}
         self._last_corners: dict[str, np.ndarray] = {}
         self._results: dict[str, SolveResult] = {}
+        self._stereo: StereoResult | None = None
+        #: Intrinsics currently known for each eye — from a fresh solve here,
+        #: or from the server when a previous run already stored them.
+        self._known_k: dict[str, object] = {}
 
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 8, 10, 10)
@@ -173,6 +179,15 @@ class CalibrationPanel(QFrame):
         self.btn_solve.clicked.connect(self._solve)
         root.addWidget(self.btn_solve)
 
+        self.btn_stereo = QPushButton("Solve stereo pair")
+        self.btn_stereo.setToolTip(
+            "Needs intrinsics for both eyes and views where BOTH saw the board "
+            "at the same instant. Gives the real baseline and the geometry "
+            "triangulation runs on."
+        )
+        self.btn_stereo.clicked.connect(self._solve_stereo)
+        root.addWidget(self.btn_stereo)
+
         self.btn_save = QPushButton("Save to server")
         self.btn_save.setEnabled(False)
         self.btn_save.clicked.connect(self._save)
@@ -186,6 +201,12 @@ class CalibrationPanel(QFrame):
         root.addStretch(1)
 
     # ── config ────────────────────────────────────────────────────────────
+
+    def set_intrinsics(self, side: str, k) -> None:
+        """Adopt intrinsics the server already holds, so the stereo solve does
+        not require re-running the per-eye one in this session."""
+        if k is not None:
+            self._known_k.setdefault(side, k)
 
     def set_board_spec(self, spec) -> None:
         """Adopt the board spec from the server. Captured views are dropped on
@@ -302,6 +323,7 @@ class CalibrationPanel(QFrame):
                 lines.append(f"{side}: {why}")
                 continue
             self._results[side] = res
+            self._known_k[side] = res.intrinsics
             i = res.intrinsics
             lines.append(
                 f"{side}: fx {i.fx:.1f} fy {i.fy:.1f} cx {i.cx:.1f} cy {i.cy:.1f}\n"
@@ -312,11 +334,43 @@ class CalibrationPanel(QFrame):
         self.report.setText("\n".join(lines) or "nothing to solve")
         self.btn_save.setEnabled(bool(self._results))
 
-    def _save(self) -> None:
-        if not self._results:
+    def _solve_stereo(self) -> None:
+        """Solve the pair geometry from the simultaneous views."""
+        if self._board is None:
+            self.report.setText("no board spec from the server")
             return
-        self.save_requested.emit(
-            {side: res.as_config() for side, res in self._results.items()})
+        missing = [s for s in ("left", "right") if s not in self._known_k]
+        if missing:
+            self.report.setText(
+                f"stereo needs intrinsics for {', '.join(missing)} — solve those "
+                "first, or load a calibration the server already has")
+            return
+        pairs = self.samples.paired()
+        if not pairs:
+            self.report.setText(
+                "no views where both eyes saw the board at the same instant")
+            return
+        wh = pairs[0].left.wh
+        res, why = solve_stereo(pairs, self._board,
+                                self._known_k["left"], self._known_k["right"], wh)
+        if res is None:
+            self._stereo = None
+            self.report.setText(f"stereo: {why}")
+            return
+        self._stereo = res
+        self.report.setText(
+            f"stereo: baseline {res.baseline_mm:.1f} mm  rms {res.rms_px:.3f} px\n"
+            f"  over {res.n_views} simultaneous views @ {res.wh[0]}x{res.wh[1]}"
+        )
+        self.btn_save.setEnabled(True)
+
+    def _save(self) -> None:
+        if not self._results and self._stereo is None:
+            return
+        payload: dict = {side: res.as_config() for side, res in self._results.items()}
+        if self._stereo is not None:
+            payload["_extrinsics"] = self._stereo.as_config()
+        self.save_requested.emit(payload)
         self.report.setText(
             self.report.text() + "\n\nsent to server — the panels will show "
             "board pose once it comes back")

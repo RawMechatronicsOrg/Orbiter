@@ -74,6 +74,9 @@ class RigConfig:
     left: Eye | None = None
     right: Eye | None = None
     board: BoardSpec | None = None
+    #: Solved pair geometry as stored, or None. Raw for the same reason the
+    #: intrinsics are: usability depends on the live frame size.
+    extrinsics_raw: dict[str, Any] | None = None
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @property
@@ -124,6 +127,8 @@ def parse(cfg: dict[str, Any]) -> RigConfig:
         left=_eye_from("left", rig),
         right=_eye_from("right", rig),
         board=board_spec_from_config(cfg),
+        extrinsics_raw=(rig.get("extrinsics")
+                        if isinstance(rig.get("extrinsics"), dict) else None),
         raw=cfg,
     )
 
