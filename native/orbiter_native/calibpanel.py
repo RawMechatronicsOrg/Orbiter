@@ -302,7 +302,7 @@ class CalibrationPanel(QFrame):
                 or board.R is None or board.t is None):
             return
         self._plane_pts.add_frame(line.inlier_points, self._left_k,
-                                  board.R, board.t)
+                                  board.R, board.t, line.rms_px)
         if res.board is not None and res.board.corners is not None:
             self._recent[res.side].append(res)
         self._refresh_live(res)
@@ -373,9 +373,13 @@ class CalibrationPanel(QFrame):
         )
         self._stat_labels["novelty"].setText(
             "—" if not np.isfinite(nov) else f"{nov:.3f}")
-        self._stat_labels["laser pts"].setText(
-            f"{len(self._plane_pts)} / {self._plane_pts.frames}f"
-            if self._laser_active else "detector off")
+        if not self._laser_active:
+            self._stat_labels["laser pts"].setText("detector off")
+        else:
+            sk = self._plane_pts.skipped
+            self._stat_labels["laser pts"].setText(
+                f"{len(self._plane_pts)} / {self._plane_pts.frames}f"
+                + (f"  (moving {sk['moving']})" if sk["moving"] else ""))
         self._stat_labels["views"].setText(str(len(self.samples)))
         self._stat_labels["paired"].setText(str(len(self.samples.paired())))
         spreads = [self.samples.tilt_spread(s) for s in ("left", "right")]

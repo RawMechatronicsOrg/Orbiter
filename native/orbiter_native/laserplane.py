@@ -50,6 +50,19 @@ MAX_RMS_MM = 2.0
 
 MIN_POINTS = 200
 
+#: The stripe lies on a FLAT board during this calibration, so its image is a
+#: straight line. A frame whose line fit is worse than this was taken while the
+#: board was moving — a smeared centroid and a lagging pose — and its points do
+#: not belong on the sheet.
+MAX_STRIPE_RMS_PX = 1.0
+
+#: Minimum change in board pose before another frame is banked, in mm of
+#: translation. Collecting every frame at 30 fps piles up tens of thousands of
+#: points from whatever pose was held longest, which does not constrain the
+#: plane any better and does bias it: measured on this rig, 2586 frames yielded
+#: 424452 points and a fit that would not converge.
+MIN_POSE_STEP_MM = 4.0
+
 
 @dataclass
 class LaserPlane:
@@ -177,7 +190,10 @@ def fit(points: np.ndarray, wh: tuple[int, int],
 
     normal, d = _plane(pts)
     resid = np.abs(pts @ normal - d)
-    keep = resid <= max(OUTLIER_MM, 3.0 * float(np.median(resid)))
+    # An absolute cut, not a multiple of the median: a contaminated set has a
+    # large median and a relative cut then removes nothing, which is exactly
+    # how a set of 424452 points failed to converge.
+    keep = resid <= OUTLIER_MM
     if keep.sum() >= MIN_POINTS and keep.sum() < len(pts):
         pts = pts[keep]
         normal, d = _plane(pts)
@@ -187,7 +203,8 @@ def fit(points: np.ndarray, wh: tuple[int, int],
         return None, "plane fit produced a non-finite residual"
     if rms > MAX_RMS_MM:
         return None, (f"plane fit RMS {rms:.2f} mm exceeds {MAX_RMS_MM} mm — "
-                      "the samples are not all on one sheet")
+                      "the samples are not all on one sheet. Collect with the "
+                      "board held STILL at each pose, not while moving it.")
 
     # Point the normal towards the camera so the signed distance has a
     # consistent meaning for every consumer.
@@ -204,6 +221,10 @@ class PlaneCollector:
         self._chunks: list[np.ndarray] = []
         self._frames = 0
         self._n = 0
+        self._last_t: np.ndarray | None = None
+        #: Frames offered but not banked, by reason — so the panel can say what
+        #: is wrong rather than just showing a counter that will not move.
+        self.skipped: dict[str, int] = {"moving": 0, "same pose": 0}
 
     def __len__(self) -> int:
         return self._n
@@ -216,13 +237,33 @@ class PlaneCollector:
         self._chunks.clear()
         self._frames = 0
         self._n = 0
+        self._last_t = None
+        self.skipped = {"moving": 0, "same pose": 0}
 
     def add_frame(self, pixels: np.ndarray, k: Intrinsics,
-                  board_R: np.ndarray, board_t: np.ndarray) -> int:
-        """Contribute one frame's stripe. Returns how many points it added."""
+                  board_R: np.ndarray, board_t: np.ndarray,
+                  stripe_rms_px: float | None = None) -> int:
+        """Contribute one frame's stripe. Returns how many points it added.
+
+        Two gates, both learned from a set that would not fit. A frame taken
+        while the board was moving carries a smeared stripe and a lagging pose,
+        and `stripe_rms_px` reveals it because the stripe must be straight on a
+        flat board. And a pose barely different from the last banked one adds
+        no constraint while adding weight, so the plane ends up decided by
+        wherever the operator paused longest.
+        """
+        if stripe_rms_px is not None and stripe_rms_px > MAX_STRIPE_RMS_PX:
+            self.skipped["moving"] += 1
+            return 0
+        t = np.asarray(board_t, float).ravel()
+        if (self._last_t is not None
+                and float(np.linalg.norm(t - self._last_t)) < MIN_POSE_STEP_MM):
+            self.skipped["same pose"] += 1
+            return 0
         pts = points_on_board(pixels, k, board_R, board_t)
         if not len(pts):
             return 0
+        self._last_t = t
         self._chunks.append(pts)
         self._frames += 1
         self._n += len(pts)
