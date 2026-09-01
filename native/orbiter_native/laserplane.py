@@ -63,6 +63,13 @@ MAX_STRIPE_RMS_PX = 1.0
 #: 424452 points and a fit that would not converge.
 MIN_POSE_STEP_MM = 4.0
 
+#: Hard ceiling on banked points. A plane has three degrees of freedom; tens of
+#: thousands of samples already over-determine it, and letting the collection
+#: grow without bound is how a live session ended up holding 424452 points.
+#: Once full, the oldest chunk is dropped so the set keeps following the most
+#: recent poses rather than freezing on the first ones.
+MAX_POINTS = 60_000
+
 
 @dataclass
 class LaserPlane:
@@ -184,7 +191,13 @@ def fit(points: np.ndarray, wh: tuple[int, int],
     def _plane(p):
         centre = p.mean(axis=0)
         # Smallest singular direction is the plane normal.
-        normal = np.linalg.svd(p - centre)[2][-1]
+        #
+        # full_matrices=False is NOT optional here. The default builds U at
+        # (N, N), and N is the number of stripe points: a live collection of
+        # 424452 points asks for a 424452-squared array — about 1.4 TB — which
+        # took the whole machine down with it. Only the 3 right-singular
+        # vectors are wanted, and this asks for just those.
+        normal = np.linalg.svd(p - centre, full_matrices=False)[2][-1]
         normal = normal / np.linalg.norm(normal)
         return normal, float(normal @ centre)
 
@@ -267,6 +280,8 @@ class PlaneCollector:
         self._chunks.append(pts)
         self._frames += 1
         self._n += len(pts)
+        while self._n > MAX_POINTS and len(self._chunks) > 1:
+            self._n -= len(self._chunks.pop(0))
         return len(pts)
 
     def points(self) -> np.ndarray:

@@ -180,3 +180,37 @@ def test_stored_plane_is_refused_at_another_resolution() -> None:
     assert from_config(None, WH) is None
     assert from_config({"n": [0, 0, 0], "d": 1, "width": WH[0], "height": WH[1]},
                        WH) is None
+
+
+def test_fit_handles_a_large_collection_without_exhausting_memory() -> None:
+    """Regression: the SVD default builds an (N, N) matrix.
+
+    A live collection reached 424452 points, and `np.linalg.svd` without
+    full_matrices=False asks for a 424452-squared array — roughly 1.4 TB. It
+    took the machine down. Only the three right-singular vectors are needed.
+    """
+    rng = np.random.default_rng(11)
+    n = 120_000
+    pts = np.column_stack([rng.uniform(-80, 80, n), rng.uniform(-80, 80, n),
+                           np.zeros(n)]) + np.array([0.0, 0.0, 500.0])
+    pts[:, 2] += rng.normal(0.0, 0.05, n)
+    plane, why = fit(pts, WH)
+    assert plane is not None, why
+    assert abs(abs(float(plane.normal @ np.array([0.0, 0.0, 1.0]))) - 1.0) < 1e-3
+
+
+def test_collector_is_bounded() -> None:
+    """Unbounded growth is what produced the 424452-point collection."""
+    from orbiter_native.laserplane import MAX_POINTS
+
+    col = PlaneCollector()
+    board_R, board_t = _board((0.2, -0.1, 0.0), (0.0, 0.0, 500.0))
+    step = 0.0
+    for _ in range(400):
+        step += 10.0                      # always a new pose, so nothing is skipped
+        R, t = _board((0.2, -0.1, 0.0), (0.0, 0.0, 500.0 + step))
+        px, _ = _stripe_on_board(R, t)
+        if len(px):
+            col.add_frame(px, K, R, t)
+    assert len(col) <= MAX_POINTS
+    assert len(col.points()) == len(col)
