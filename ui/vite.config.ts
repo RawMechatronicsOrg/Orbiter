@@ -4,9 +4,9 @@ import tailwindcss from '@tailwindcss/vite';
 
 // Dev-time reverse proxy to the storage-api so the browser can hit
 // same-origin URLs (no CORS dance). Routes mirror what the v0.1 UI
-// actually calls: /ws/scene (WebSocket), /scans, /captures, /config, and the
-// live MJPEG camera stream under /camera (long-lived multipart response —
-// http-proxy pipes it without buffering).
+// actually calls: /ws/scene (WebSocket), /scans, /captures, /config, /stereo,
+// and the live MJPEG camera stream under /camera (long-lived multipart
+// response — http-proxy pipes it without buffering).
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
@@ -18,6 +18,9 @@ export default defineConfig({
       '/scans': { target: 'http://127.0.0.1:8000', changeOrigin: true },
       '/config': { target: 'http://127.0.0.1:8000', changeOrigin: true },
       '/camera': { target: 'http://127.0.0.1:8000', changeOrigin: true },
+      // Stereo tab: JSON passthrough to camserver. Only the JSON is proxied —
+      // the MJPEG previews point straight at camserver, bypassing us entirely.
+      '/stereo': { target: 'http://127.0.0.1:8000', changeOrigin: true },
     },
   },
 });

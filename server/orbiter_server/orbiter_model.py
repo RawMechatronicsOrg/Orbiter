@@ -47,6 +47,9 @@ PERSISTED_FIELDS: frozenset[str] = frozenset({
     # EL encoder scale k (el_true = k·el) from the refine.
     "el_encoder_scale",
     "motion_plan",
+    # Binocular pair config — the per-run baseline the operator sets in the
+    # Stereo tab (which camera is left/right, per-eye flips + rotation).
+    "stereo_rig",
     # Per-axis closed-loop top step rate (Hz) — the UI speed knobs.
     "move_hz_max_az", "move_hz_max_el",
     "show_axes", "scan_preview", "hide_back_facing", "mirror_photo_on_frustum",
@@ -65,6 +68,37 @@ def _default_motion_plan() -> dict[str, Any]:
             "az_step_deg": 20.0,
             "actions": ["photo"],
         },
+    }
+
+
+#: One eye's orientation policy. `quarter_turns_cw` is 0..3; flips are applied
+#: in the sensor frame BEFORE the rotation. See `commands._cmd_set_stereo_rig`
+#: for the authoritative ordering contract.
+_DEFAULT_EYE: dict[str, Any] = {
+    "camera_id": "",
+    "quarter_turns_cw": 0,
+    "flip_h": False,
+    "flip_v": False,
+}
+
+
+def _default_stereo_rig() -> dict[str, Any]:
+    """Defaults for the binocular camserver pair (see `stereo_proxy.py`).
+
+    `camera_id` starts empty on purpose: the ids camserver reports (`cam2`,
+    `cam5`, ...) follow /dev/videoN enumeration order and say nothing about
+    which lens is physically on the left. The UI seeds the selects from the
+    upstream camera list but writes nothing until the operator applies.
+    """
+    return {
+        "host": "http://192.168.0.222:8088",
+        "token": "",
+        "left":  dict(_DEFAULT_EYE),
+        "right": dict(_DEFAULT_EYE),
+        # Nominal inter-camera distance from a tape measure. A real
+        # stereoCalibrate supersedes this; it exists so the rig has a sane
+        # scale before any calibration has been run.
+        "baseline_mm": 200.0,
     }
 
 
@@ -196,6 +230,13 @@ class ModelState:
     # The MotionPlanner — the active scan-loop plan (discrete sweep).
     # See `models.MotionPlan`; persisted with the other config-like fields.
     motion_plan: dict[str, Any] = field(default_factory=_default_motion_plan)
+
+    # ── binocular camera pair (camserver) ──────────────────────────────────
+    # Which upstream camera is the left/right eye plus each eye's orientation
+    # policy. Independent of the phone capture path (`camera_url`); see
+    # stereo_proxy.py and routes/stereo.py.
+    stereo_rig: dict[str, Any] = field(default_factory=_default_stereo_rig)
+
     scan_running: bool = False
     scan_progress: int = 0
     scan_total: int = 0

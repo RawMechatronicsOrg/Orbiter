@@ -13,6 +13,7 @@ export type { ViewerTab } from './uiStore';
 
 const TABS: ReadonlyArray<readonly [ViewerTab, string]> = [
   ['scaner', 'Scaner'],
+  ['stereo', 'Stereo'],
   ['library', 'Library'],
   ['help', 'Help'],
 ];

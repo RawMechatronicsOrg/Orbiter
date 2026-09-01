@@ -12,6 +12,22 @@ import { num } from './ui';
 
 export type Axis = 'az' | 'el' | 'both';
 
+/**
+ * One eye of the binocular pair. Mirrors `orbiter_model._DEFAULT_EYE`.
+ *
+ * ORIENTATION ORDER: flips act in the sensor frame and are applied BEFORE
+ * `quarter_turns_cw`. See `StereoView.eyeTransform` for the CSS that renders
+ * it and `commands._cmd_set_stereo_rig` for the authoritative contract.
+ */
+export interface StereoEye {
+  /** Upstream camserver id (`cam2`, `cam5`, ...). Empty until assigned. */
+  camera_id: string;
+  /** 0..3 — clockwise 90° steps applied after the flips. */
+  quarter_turns_cw: number;
+  flip_h: boolean;
+  flip_v: boolean;
+}
+
 export interface Commands {
   move(az?: number, el?: number): void;
   motors(enabled: boolean): void;
@@ -42,6 +58,16 @@ export interface Commands {
    *  forwards the value to the firmware with the next /move. */
   setMoveSpeed(azHzMax?: number, elHzMax?: number): void;
   setRenderPref(prefs: Record<string, boolean>): void;
+  /** Update the binocular pair config (Stereo tab). Only the keys present are
+   *  applied server-side; each eye merges onto its current values. The server
+   *  refuses a payload that points both eyes at the same camera. */
+  setStereoRig(rig: {
+    host?: string;
+    token?: string;
+    baseline_mm?: number;
+    left?: Partial<StereoEye>;
+    right?: Partial<StereoEye>;
+  }): void;
   takeShot(): void;
   /** Delete one capture from the active scan session by its `capture_id`.
    *  Server removes it from `model.captures`, deletes the pool files and
@@ -89,6 +115,7 @@ export function makeCommands(client: WsClient): Commands {
       client.sendCommand('set_move_speed', args);
     },
     setRenderPref: (prefs) => client.sendCommand('set_render_pref', prefs),
+    setStereoRig: (rig) => client.sendCommand('set_stereo_rig', rig),
     takeShot: () => client.sendCommand('take_shot'),
     deleteCapture: (captureId) =>
       client.sendCommand('delete_capture', { capture_id: captureId }),

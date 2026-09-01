@@ -149,6 +149,98 @@ async def _cmd_set_board_params(args: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True}
 
 
+# ── binocular pair (camserver) ─────────────────────────────────────────────
+#
+# ORIENTATION CONTRACT — the whole point of this config, so read it before
+# changing anything here.
+#
+# An eye's orientation is **flip first, then rotate**: `flip_h` / `flip_v` act
+# in the sensor's own frame, and `quarter_turns_cw` is applied to the already
+# flipped image. The Stereo tab renders exactly that order with
+#
+#     transform: rotate(<90*n>deg) scaleX(<±1>) scaleY(<±1>)
+#
+# (CSS composes right-to-left, so that reads flip-then-rotate). Any future
+# server-side path — folding these into the `cv2.remap` map alongside
+# undistort and stereo rectification — MUST use the same order. If the preview
+# and the CV path disagree, the operator lines the rig up against a picture
+# that does not match what the solver sees, and it surfaces later as an
+# inexplicable calibration error rather than as an obvious mirror.
+
+#: Per-eye orientation fields and their coercions.
+_EYE_COERCE: dict[str, Callable[[Any], Any]] = {
+    "camera_id": lambda v: str(v).strip(),
+    "quarter_turns_cw": lambda v: int(v) % 4,
+    "flip_h": lambda v: bool(v),
+    "flip_v": lambda v: bool(v),
+}
+
+#: Rig-level fields (everything that is not one of the two eyes).
+_RIG_COERCE: dict[str, Callable[[Any], Any]] = {
+    "host": lambda v: str(v).strip().rstrip("/"),
+    "token": lambda v: str(v).strip(),
+    "baseline_mm": lambda v: float(v),
+}
+
+
+def _merge_eye(current: Any, patch: Any, side: str) -> dict[str, Any]:
+    """Apply the present keys of `patch` onto one eye's current config."""
+    merged = dict(current) if isinstance(current, dict) else {}
+    if not isinstance(patch, dict):
+        raise CommandError(f"set_stereo_rig: {side!r} must be an object")
+    for key, coerce in _EYE_COERCE.items():
+        if key in patch:
+            try:
+                merged[key] = coerce(patch[key])
+            except (TypeError, ValueError) as exc:
+                raise CommandError(
+                    f"set_stereo_rig: bad {side}.{key!r}: {exc}"
+                ) from exc
+    return merged
+
+
+async def _cmd_set_stereo_rig(args: dict[str, Any]) -> dict[str, Any]:
+    """Update the binocular pair config — the per-run baseline.
+
+    Payload (all optional — only keys present are applied):
+      `host`, `token`, `baseline_mm`,
+      `left` / `right`: `{camera_id, quarter_turns_cw, flip_h, flip_v}`.
+
+    Which upstream camera is the left eye cannot be derived: camserver's ids
+    follow /dev/videoN enumeration and say nothing about physical placement.
+    The operator asserts it here and it persists across restarts.
+    """
+    rig = dict(model.stereo_rig or {})
+
+    for key, coerce in _RIG_COERCE.items():
+        if key in args:
+            try:
+                rig[key] = coerce(args[key])
+            except (TypeError, ValueError) as exc:
+                raise CommandError(f"set_stereo_rig: bad {key!r}: {exc}") from exc
+
+    if "baseline_mm" in args and rig["baseline_mm"] <= 0:
+        raise CommandError("set_stereo_rig: baseline_mm must be positive")
+
+    for side in ("left", "right"):
+        if side in args:
+            rig[side] = _merge_eye(rig.get(side), args[side], side)
+
+    # Both eyes pointing at one camera is silently wrong rather than visibly
+    # broken: the tab shows two live panes that happen to be identical, and
+    # every downstream stereo result is nonsense. Refuse it.
+    left_id = str((rig.get("left") or {}).get("camera_id") or "")
+    right_id = str((rig.get("right") or {}).get("camera_id") or "")
+    if left_id and left_id == right_id:
+        raise CommandError(
+            f"set_stereo_rig: left and right are both {left_id!r} — "
+            "the two eyes must be different cameras"
+        )
+
+    model.update(stereo_rig=rig)
+    return rig
+
+
 async def _cmd_calibrate_geometry(args: dict[str, Any]) -> dict[str, Any]:
     """Run a ChArUco hand-eye sweep and return derived rig geometry.
 
@@ -500,6 +592,7 @@ _COMMANDS: dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]] = {
     "set_camera_url": _cmd_set_camera_url,
     "set_board_params": _cmd_set_board_params,
     "set_endpoints": _cmd_set_endpoints,
+    "set_stereo_rig": _cmd_set_stereo_rig,
     "calibrate_geometry": _cmd_calibrate_geometry,
     "test_calibration_accuracy": _cmd_test_calibration_accuracy,
 }

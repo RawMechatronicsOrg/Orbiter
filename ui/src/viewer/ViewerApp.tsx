@@ -17,6 +17,7 @@ import { PositionOverlay } from './PositionOverlay';
 import { CameraThumbnail } from './CameraThumbnail';
 import { SceneExplorerPanel } from './SceneExplorerPanel';
 import { LibraryView } from './LibraryView';
+import { StereoView } from './StereoView';
 import { HelpView } from './HelpView';
 import { LogPanel } from './LogPanel';
 import { CaptureProgressModal } from './CaptureProgressModal';
@@ -69,6 +70,12 @@ export function ViewerApp() {
           <PositionOverlay commands={commands} />
         </div>
         <RightBar commands={commands} />
+      </TabsContent>
+      <TabsContent
+        value="stereo"
+        className="m-0 flex min-h-0 min-w-0 flex-1 data-[state=inactive]:hidden"
+      >
+        <StereoView commands={commands} />
       </TabsContent>
       <TabsContent
         value="library"

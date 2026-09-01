@@ -7,7 +7,7 @@
 import { create } from 'zustand';
 
 /** The top-level views of the app. */
-export type ViewerTab = 'scaner' | 'library' | 'help';
+export type ViewerTab = 'scaner' | 'stereo' | 'library' | 'help';
 
 interface UiState {
   activeTab: ViewerTab;
