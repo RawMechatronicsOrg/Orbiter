@@ -29,6 +29,7 @@ class EyePanel(QFrame):
         self.side = side
         self._eye: Eye | None = None
 
+        self.setObjectName("panel")   # see the stylesheet in __main__
         self.setFrameShape(QFrame.Shape.StyledPanel)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 6, 8, 8)

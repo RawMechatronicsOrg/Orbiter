@@ -21,6 +21,7 @@ it would be a waste of the operator's time to sweep the board twice.
 from __future__ import annotations
 
 import logging
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -54,10 +55,23 @@ from .worker import EyeResult
 
 log = logging.getLogger("orbiter_native.calibpanel")
 
-#: Two frames count as simultaneous within this much of camserver's clock. The
-#: pair is held to about 0.05 ms by camserver itself, so this is generous; it
-#: only has to be tighter than the ~33 ms frame interval.
+#: Two frames count as simultaneous within this much of camserver's capture
+#: clock — the one clock that times both cameras, which holds the pair to about
+#: 0.05 ms. Well under the ~33 ms frame interval, so it still names one frame.
 _PAIR_WINDOW_S = 0.010
+
+#: How many recent results to keep per eye while looking for a partner frame.
+#:
+#: Requiring the two NEWEST results to be simultaneous does not work, and the
+#: reason is worth stating: camserver's synchrony is a property of the CAMERAS,
+#: while what arrives here is whatever each detector thread last finished.
+#: Detection takes 13-20 ms and the two threads drift independently. Measured
+#: on this rig over 269 attempts, the newest left and newest right results were
+#: a median 144 ms apart and 496 ms at the 90th percentile — four or more
+#: frames — so 238 attempts were rejected and nothing was ever captured. The
+#: frames were perfectly paired; only our view of them was skewed. At ~30 fps
+#: this buffer spans about half a second, covering that p90.
+_PAIR_HISTORY = 16
 
 #: The board must be this still before a view is captured, measured as median
 #: corner movement between consecutive detections. Motion blur rounds corners
@@ -101,14 +115,6 @@ class CoverageMap(QWidget):
         p.end()
 
 
-@dataclass
-class _Pending:
-    """The newest result from one eye, waiting for its partner."""
-
-    result: EyeResult
-    prev_corners: np.ndarray | None = None
-
-
 class CalibrationPanel(QFrame):
     """Capture controls, live diversity guidance, and the solve."""
 
@@ -117,11 +123,13 @@ class CalibrationPanel(QFrame):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self.setObjectName("panel")   # see the stylesheet in __main__
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.samples = SampleSet()
         self._board = None
         self._board_spec = None
-        self._pending: dict[str, _Pending] = {}
+        self._recent: dict[str, deque] = {"left": deque(maxlen=_PAIR_HISTORY),
+                                          "right": deque(maxlen=_PAIR_HISTORY)}
         self._last_corners: dict[str, np.ndarray] = {}
         self._results: dict[str, SolveResult] = {}
         self._stereo: StereoResult | None = None
@@ -240,30 +248,75 @@ class CalibrationPanel(QFrame):
     # ── live feed ─────────────────────────────────────────────────────────
 
     def on_result(self, res: EyeResult) -> None:
-        """Take one eye's newest result and, when both eyes line up, capture."""
-        if res.descriptor is not None or res.board is not None:
-            self._pending[res.side] = _Pending(res)
+        """Take one eye's result and, when a partner frame exists, capture."""
+        self._still(res)                 # keep the stillness history current
+        if res.board is not None and res.board.corners is not None:
+            self._recent[res.side].append(res)
         self._refresh_live(res)
         if self.auto.isChecked():
             self._capture(force=False)
 
+    def _find_pair(self):
+        """The closest-in-capture-time result from each eye, if they pair up.
+
+        Searches the recent history rather than comparing only the newest of
+        each — see `_PAIR_HISTORY` for why the newest two are usually from
+        different frames.
+        """
+        left, right = self._recent["left"], self._recent["right"]
+        if not left or not right:
+            # No partner to pair with. Deliberately NOT falling back to "take
+            # whichever eye has something": the history is cleared after every
+            # capture, so the next result to arrive would always find the other
+            # side empty and be stored as a one-eyed view. Every sample came out
+            # unpaired that way, and stereoCalibrate needs the paired ones.
+            return None, None
+        best = None
+        for a in left:
+            if a.capture_mono is None:
+                continue
+            for b in right:
+                if b.capture_mono is None:
+                    continue
+                gap = abs(a.capture_mono - b.capture_mono)
+                if best is None or gap < best[0]:
+                    best = (gap, a, b)
+        if best is None or best[0] > _PAIR_WINDOW_S:
+            return None, None
+        return best[1], best[2]
+
     def _still(self, res: EyeResult) -> bool:
-        """True when the board has barely moved since the previous detection."""
-        if res.board is None or res.board.corners is None:
+        """True when the board has barely moved since the previous detection.
+
+        Compared by corner ID, not by position in the list. The corner COUNT
+        flickers frame to frame as marginal corners drop in and out — measured
+        here across a live run — and treating a changed count as motion would
+        block capture for no reason.
+        """
+        if res.board is None or res.board.corners is None or res.board.ids is None:
             return False
         cur = res.board.corners.reshape(-1, 2)
+        cur_ids = res.board.ids.ravel()
         prev = self._last_corners.get(res.side)
-        self._last_corners[res.side] = cur
-        if prev is None or len(prev) != len(cur):
+        self._last_corners[res.side] = (cur_ids, cur)
+        if prev is None:
             return False
-        return float(np.median(np.linalg.norm(cur - prev, axis=1))) <= _STILL_PX
+        prev_ids, prev_pts = prev
+        common = np.intersect1d(prev_ids, cur_ids)
+        if len(common) < 4:
+            return False
+        a = prev_pts[np.isin(prev_ids, common)]
+        b = cur[np.isin(cur_ids, common)]
+        # np.isin preserves each array's own order, and both id arrays are
+        # sorted ascending by the detector, so the two selections correspond.
+        return float(np.median(np.linalg.norm(b - a, axis=1))) <= _STILL_PX
 
     def _refresh_live(self, res: EyeResult) -> None:
-        left = self._pending.get("left")
-        right = self._pending.get("right")
+        left = self._recent["left"][-1] if self._recent["left"] else None
+        right = self._recent["right"][-1] if self._recent["right"] else None
         nov = max(
-            self.samples.novelty("left", left.result.descriptor if left else None),
-            self.samples.novelty("right", right.result.descriptor if right else None),
+            self.samples.novelty("left", left.descriptor if left else None),
+            self.samples.novelty("right", right.descriptor if right else None),
         )
         self._stat_labels["novelty"].setText(
             "—" if not np.isfinite(nov) else f"{nov:.3f}")
@@ -280,24 +333,22 @@ class CalibrationPanel(QFrame):
     # ── capture ───────────────────────────────────────────────────────────
 
     def _capture(self, force: bool) -> None:
-        left = self._pending.get("left")
-        right = self._pending.get("right")
-        if self._board is None or (left is None and right is None):
+        if self._board is None:
             return
+        left, right = self._find_pair()
+        if left is None or right is None:
+            if not force:
+                return
+            # Manual capture takes whatever is there — the operator asked.
+            left = left or (self._recent["left"][-1] if self._recent["left"] else None)
+            right = right or (self._recent["right"][-1] if self._recent["right"] else None)
+            if left is None and right is None:
+                return
 
-        # Simultaneity is judged on camserver's clock, which times both
-        # cameras. Frames from two sockets have unrelated arrival times.
-        lm = left.result.capture_mono if left else None
-        rm = right.result.capture_mono if right else None
-        if lm is not None and rm is not None and abs(lm - rm) > _PAIR_WINDOW_S:
-            return
-
-        views: dict[str, EyeView | None] = {"left": None, "right": None}
-        for side, pend in (("left", left), ("right", right)):
-            if pend is None:
-                continue
-            r = pend.result
-            if r.board is None or r.board.corners is None or r.descriptor is None:
+        views = {"left": None, "right": None}
+        for side, r in (("left", left), ("right", right)):
+            if (r is None or r.board is None or r.board.corners is None
+                    or r.descriptor is None):
                 continue
             if not force and not self._still(r):
                 return
@@ -312,7 +363,10 @@ class CalibrationPanel(QFrame):
             return
 
         self.samples.add(PairSample(left=views["left"], right=views["right"]))
-        self._pending.clear()
+        # Consumed: drop the history so the same frames cannot be captured
+        # again while the operator holds the board still.
+        for q in self._recent.values():
+            q.clear()
         self._persist()
         self.report.setText(f"captured view {len(self.samples)}")
 

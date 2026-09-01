@@ -39,6 +39,7 @@ class ScanPanel(QFrame):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self.setObjectName("panel")   # see the stylesheet in __main__
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.cloud = PointCloud()
         self._last: ScanFrame | None = None
