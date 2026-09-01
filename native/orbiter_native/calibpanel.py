@@ -398,6 +398,7 @@ class CalibrationPanel(QFrame):
             self.report.setText("no board spec from the server")
             return
         self._results.clear()
+        self._extra: list[str] = []
         lines: list[str] = []
         for side in ("left", "right"):
             views = self.samples.views(side)
@@ -411,6 +412,20 @@ class CalibrationPanel(QFrame):
                 continue
             self._results[side] = res
             self._known_k[side] = res.intrinsics
+            # Per-view residuals and coverage, because the overall rms cannot
+            # tell a uniformly mediocre set from a good one with two bad views
+            # in it — and those call for opposite responses: better coverage
+            # versus finding and dropping the offenders.
+            pv = sorted(res.per_view_rms)
+            cov = int(self.samples.coverage(side, 6).sum())
+            if pv:
+                spread = (f"  per-view rms {pv[0]:.2f} / {pv[len(pv) // 2]:.2f}"
+                          f" / {pv[-1]:.2f}  (best/median/worst)")
+                outliers = sum(1 for v in pv if v > 2 * pv[len(pv) // 2])
+                verdict = (f"{outliers} view(s) far above median — drop those"
+                           if outliers else
+                           f"no outliers; coverage {cov}/36 is the lever")
+                self._extra.append(spread + "\n  " + verdict)
             i = res.intrinsics
             lines.append(
                 f"{side}: fx {i.fx:.1f} fy {i.fy:.1f} cx {i.cx:.1f} cy {i.cy:.1f}\n"
@@ -418,7 +433,7 @@ class CalibrationPanel(QFrame):
                 f"@ {res.wh[0]}x{res.wh[1]}\n"
                 f"  k1 {i.dist[0]:+.4f} k2 {i.dist[1]:+.4f}"
             )
-        self.report.setText("\n".join(lines) or "nothing to solve")
+        self.report.setText("\n".join(lines + self._extra) or "nothing to solve")
         self.btn_save.setEnabled(bool(self._results))
 
     def _solve_stereo(self) -> None:
