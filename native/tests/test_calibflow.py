@@ -102,6 +102,26 @@ def test_a_still_pair_becomes_a_view_and_a_duplicate_does_not(board) -> None:
     assert note is None and len(flow.samples) == 1          # nothing new to see
 
 
+def test_a_pair_is_judged_by_the_board_it_saw_not_by_the_clock(board) -> None:
+    """The cameras free-run and the offset between the eyes walks: a fixed few
+    millisecond window takes nothing for tens of seconds at a stretch. A board
+    held still is the same board 12 ms later, and a sliding one is not."""
+    flow = _flow(board)
+    pose = ((0.2, -0.1, 0.05), (0.0, 0.0, 0.5))
+    for i in (0, 1):
+        flow.offer(_result(board, "left", *pose, 1.000 + 0.033 * i))
+        note = flow.offer(_result(board, "right", *pose, 1.012 + 0.033 * i))
+    assert note == "view 1", note                     # 12 ms apart, and still
+
+    sliding = _flow(board)
+    for i in range(4):
+        sliding.offer(_result(board, "left", *pose, 1.000 + 0.033 * i, shift_px=6.0 * i))
+        sliding.offer(_result(board, "right", *pose, 1.012 + 0.033 * i, shift_px=6.0 * i))
+    # 6 px a frame is 180 px/s: 2 px of board across the same 12 ms gap.
+    assert sliding._find_pair() == (None, None)
+    assert len(sliding.samples) == 0
+
+
 def test_a_moving_board_feeds_the_readout_not_the_views(board) -> None:
     flow = _flow(board)
     pose = ((0.3, -0.2, 0.1), (0.0, 0.0, 0.5))

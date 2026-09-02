@@ -62,12 +62,20 @@ from .stereo import calibrate as solve_stereo
 
 log = logging.getLogger("orbiter_native.calibflow")
 
-#: Two frames count as simultaneous within this much of camserver's capture
-#: clock — the one clock that times both cameras, which holds the pair to about
-#: 0.05 ms. Well under the ~33 ms frame interval, so it still names one frame.
-#: (Measured median gap in practice 3.75 ms: camserver reports the pair as
-#: free-running, and a hand-held board keeps moving during that gap.)
-PAIR_WINDOW_S = 0.004
+#: What makes two frames one view is not the clock but the board: how far it
+#: moved between the two exposures, in px, at the speed the corners were last
+#: measured moving. The cameras free-run — camserver times both from one clock
+#: to about 0.05 ms, but nothing holds them in phase, so the offset between the
+#: eyes sits wherever it lands and walks slowly. Measured on this rig at 29
+#: fps: 11 ms for fourteen seconds at a stretch, then 3-7 ms for the next
+#: twelve. A fixed few-millisecond window pairs 3-8% of frames through the bad
+#: half of that walk and 40-57% through the good half; this gate instead widens
+#: as the board is held steadier, which is exactly when a wider one is safe.
+#: 0.3 px against a stereo residual of ~2 px adds nothing that can be measured.
+PAIR_MOVE_PX = 0.3
+#: ...and never further apart than half a frame interval, past which the
+#: nearest frame in the other eye is a different moment, not this one.
+PAIR_MAX_GAP_S = 0.016
 
 #: Recent results kept per eye while looking for a partner frame. Detection
 #: takes 5-20 ms and the two threads drift independently; measured over 269
@@ -239,8 +247,10 @@ class CalibrationFlow:
             "plane": None, "readout": solve_readout}
         self._recent: dict[str, deque] = {"left": deque(maxlen=PAIR_HISTORY),
                                           "right": deque(maxlen=PAIR_HISTORY)}
-        self._last_corners: dict[str, tuple[np.ndarray, np.ndarray] | None] = {}
+        self._last_corners: dict[str, tuple[np.ndarray, np.ndarray, float | None] | None] = {}
         self._moved: dict[str, float | None] = {"left": None, "right": None}
+        #: Corner speed per eye, px/s, for what a pair's gap costs.
+        self._speed: dict[str, float | None] = {"left": None, "right": None}
         self._running = False
         self._last_cycle_end = -1e9
         self._seen = self._counts()
@@ -322,21 +332,26 @@ class CalibrationFlow:
         board = res.board
         if board is None or board.corners is None or board.ids is None:
             self._last_corners[res.side] = None
-            self._moved[res.side] = None
+            self._moved[res.side] = self._speed[res.side] = None
             return None
         cur = board.corners.reshape(-1, 2)
         cur_ids = board.ids.ravel()
         prev = self._last_corners.get(res.side)
-        self._last_corners[res.side] = (cur_ids, cur)
-        moved = None
+        self._last_corners[res.side] = (cur_ids, cur, res.capture_mono)
+        moved = speed = None
         if prev is not None:
-            prev_ids, prev_pts = prev
+            prev_ids, prev_pts, prev_t = prev
             common = np.intersect1d(prev_ids, cur_ids)
             if len(common) >= 4:
                 a = prev_pts[np.isin(prev_ids, common)]
                 b = cur[np.isin(cur_ids, common)]
                 moved = float(np.median(np.linalg.norm(b - a, axis=1)))
+                dt = (res.capture_mono - prev_t
+                      if prev_t is not None and res.capture_mono is not None else None)
+                if dt is not None and dt > 0:
+                    speed = moved / dt
         self._moved[res.side] = moved
+        self._speed[res.side] = speed
         return moved
 
     def _bank_plane(self, res, moved: float | None) -> bool:
@@ -369,9 +384,20 @@ class CalibrationFlow:
                 gap = abs(a.capture_mono - b.capture_mono)
                 if best is None or gap < best[0]:
                     best = (gap, a, b)
-        if best is None or best[0] > PAIR_WINDOW_S:
+        if best is None or best[0] > PAIR_MAX_GAP_S:
+            return None, None
+        if self._drift_px(best[0]) > PAIR_MOVE_PX:
             return None, None
         return best[1], best[2]
+
+    def _drift_px(self, gap: float) -> float:
+        """How far the board moves between two exposures `gap` apart, px, at
+        the faster eye's measured corner speed. An unmeasured speed counts as
+        none: `_still` is what refuses a board that is moving, and it runs on
+        every automatic capture."""
+        speeds = [s for s in (self._speed.get("left"), self._speed.get("right"))
+                  if s is not None]
+        return max(speeds) * gap if speeds else 0.0
 
     def _still(self, side: str) -> bool:
         m = self._moved.get(side)
