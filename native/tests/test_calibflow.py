@@ -234,11 +234,27 @@ def test_a_worse_solve_is_kept_off_the_server(board) -> None:
 
 def test_better_judges_more_data_and_lower_residual() -> None:
     assert _better(10, 0.5, None)
-    assert _better(10, 0.4, Saved(10, 0.5))               # lower residual
-    assert _better(20, 0.55, Saved(10, 0.5))              # more data, a little worse
-    assert not _better(20, 0.7, Saved(10, 0.5))           # more data, much worse
-    assert not _better(10, 0.5, Saved(10, 0.5))           # the same thing
-    assert _better(10, 0.5, Saved(10, float("nan")))      # unknown residual on the server
+    assert _better(10, 0.4, Saved.first(10, 0.5))         # lower residual
+    assert _better(20, 0.55, Saved.first(10, 0.5))        # more data, a little worse
+    assert not _better(20, 0.7, Saved.first(10, 0.5))     # more data, much worse
+    assert not _better(10, 0.5, Saved.first(10, 0.5))     # the same thing
+    assert _better(10, 0.5, Saved.first(10, float("nan")))   # unknown on the server
+
+
+def test_the_tolerance_is_spent_once_and_not_again_every_cycle() -> None:
+    """More data at a slightly worse residual is worth saving. Measured
+    against the residual in hand it would be worth saving again next cycle,
+    and again — 15% at a time walks the calibration away from its best. The
+    floor is what the tolerance is measured against, so it cannot."""
+    saved = Saved.first(10, 0.50)
+    assert _better(20, 0.55, saved)
+    saved = saved.adopt(20, 0.55)
+    assert saved.residual == 0.55 and saved.floor == 0.50
+    assert not _better(30, 0.60, saved)               # 0.60 > 0.50 * 1.15, refused
+    assert _better(30, 0.54, saved)                   # inside the floor's tolerance
+    assert saved.adopt(40, 0.42).floor == 0.42        # a better solve lowers it
+    seeded = Saved.first(10, float("nan"))            # the server said no residual
+    assert seeded.adopt(20, 0.9).floor == 0.9
 
 
 def test_cycles_are_paced_and_need_new_data(board) -> None:
@@ -337,10 +353,31 @@ def test_expected_error_falls_as_calibration_fills_in(board) -> None:
     before = flow.expected_error(400.0, 0.5)
     assert not any("focal" in a for a in before.assumed)
     assert np.isclose(before.scale_mm, 0.9 / (0.5 * (K.fx + K.fy)) * 150.0)
-    flow.results["readout:left"] = Readout(0.021, *WH, sigma_s=1e-4, views=100)
+    flow.finish(Outcome(results={"readout:left": Readout(0.021, *WH, sigma_s=1e-4,
+                                                        views=100)}), now=1.0)
     after = flow.expected_error(400.0, 0.5)
     assert after.shutter_mm == 0.0 and after.total_mm < before.total_mm
     assert not after.assumed
+
+
+def test_the_number_uses_the_sheet_in_force_not_the_newest_solve(board) -> None:
+    """A plane solve the flow refuses belongs on the scoreboard, but not in
+    the budget: reading the newest solve is what made the error climb while
+    the calibration the server holds stood still."""
+    flow = _flow(board)
+    flow.set_known_intrinsics("left", K, {"views": 40, "rms_px": 0.3, "sigma_f": 0.9})
+    good = LaserPlane(np.array([0.0, 1.0, 0.0]), 74.0, 0.30, 5000, 300, WH)
+    assert flow.finish(Outcome(results={"plane": good}), now=1.0) is not None
+    assert flow.plane_known is good
+    before = flow.expected_error(400.0, 0.5)
+
+    worse = LaserPlane(np.array([0.0, 1.0, 0.0]), 74.0, 0.90, 5000, 310, WH)
+    assert flow.finish(Outcome(results={"plane": worse}), now=2.0) is None
+    assert flow.results["plane"] is worse                   # shown, marked unsaved
+    assert not any(line.startswith("laser") and "saved" in line
+                   for line in flow.scoreboard())
+    assert flow.plane_known is good                         # but not in force
+    assert flow.expected_error(400.0, 0.5).total_mm == before.total_mm
 
 
 def test_expected_error_assumes_a_distance_and_a_stripe_when_not_told(board) -> None:

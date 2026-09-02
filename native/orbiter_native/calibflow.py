@@ -172,20 +172,43 @@ class Outcome:
 
 @dataclass(frozen=True)
 class Saved:
-    """What the server holds for one solve, enough to judge a challenger."""
+    """What the server holds for one solve, enough to judge a challenger.
+
+    `floor` is the best residual this solve has ever reached. It is what
+    the tolerance below is measured against — never the residual in hand,
+    which would let a run of within-tolerance regressions walk the
+    calibration away from its best one cycle at a time.
+    """
 
     count: int
     residual: float
+    floor: float
+
+    @staticmethod
+    def first(count: int, residual: float) -> "Saved":
+        """The first thing known for a solve: it is its own floor."""
+        return Saved(int(count), float(residual), float(residual))
+
+    def adopt(self, count: int, residual: float) -> "Saved":
+        """This solve once `count`/`residual` has been saved over it."""
+        floor = self.floor
+        if not np.isfinite(floor) or (np.isfinite(residual) and residual < floor):
+            floor = residual
+        return Saved(int(count), float(residual), float(floor))
 
 
 def _better(new_count: int, new_res: float, old: Saved | None) -> bool:
+    """Should this solve replace what is saved? A lower residual always
+    wins. More data at a slightly worse residual wins too — but against
+    `old.floor`, the best this solve has ever reached, so the tolerance
+    cannot be spent again every cycle and ratchet the calibration up."""
     if old is None:
         return True
     if not np.isfinite(old.residual):
         return True
     if new_res < old.residual:
         return True
-    return new_count > old.count and new_res <= old.residual * WORSE_TOLERANCE
+    return new_count > old.count and new_res <= old.floor * WORSE_TOLERANCE
 
 
 class CalibrationFlow:
@@ -207,8 +230,10 @@ class CalibrationFlow:
         self.saved: dict[str, Saved] = {}
         #: The focal length's one-sigma uncertainty per eye, px, when known.
         self.sigma_f: dict[str, float] = {}
-        #: The plane the server holds, until one is solved here.
+        #: The plane the server holds, until a solve here is accepted.
         self.stored_plane: LaserPlane | None = None
+        #: The best sheet solved here, the counterpart of `known_k`.
+        self.solved_plane: LaserPlane | None = None
         self.solvers = solvers or {
             "intrinsics": solve_intrinsics, "stereo": solve_stereo,
             "plane": None, "readout": solve_readout}
@@ -250,11 +275,11 @@ class CalibrationFlow:
         if key not in self.saved:
             n = int((raw or {}).get("views", 0) or 0)
             rms = float((raw or {}).get("rms_px", float("nan")) or float("nan"))
-            self.saved[key] = Saved(n, rms)
+            self.saved[key] = Saved.first(n, rms)
 
     def set_stored(self, key: str, count: int, residual: float) -> None:
         """A stereo / plane / readout figure the server holds."""
-        self.saved.setdefault(key, Saved(count, residual))
+        self.saved.setdefault(key, Saved.first(count, residual))
 
     def clear(self) -> None:
         self.samples.clear()
@@ -523,7 +548,9 @@ class CalibrationFlow:
             count, resid = _measure(key, res)
             if not _better(count, resid, self.saved.get(key)):
                 continue
-            self.saved[key] = Saved(count, resid)
+            was = self.saved.get(key)
+            self.saved[key] = (was.adopt(count, resid) if was is not None
+                               else Saved.first(count, resid))
             kind, _, side = key.partition(":")
             if kind == "intrinsics":
                 self.known_k[side] = res.intrinsics
@@ -532,6 +559,7 @@ class CalibrationFlow:
             elif kind == "stereo":
                 payload["_extrinsics"] = res.as_config()
             elif kind == "plane":
+                self.solved_plane = res
                 payload["_laser_plane"] = res.as_config()
             elif kind == "readout":
                 payload.setdefault(side, {})["readout"] = res.as_config()
@@ -541,11 +569,15 @@ class CalibrationFlow:
 
     @property
     def plane_known(self) -> LaserPlane | None:
-        return self.results.get("plane") or self.stored_plane
+        """The sheet a scan would use: the best solve accepted here, else
+        the server's. Never the newest solve — a challenger the flow
+        refused must not move the number the panel shows."""
+        return self.solved_plane or self.stored_plane
 
     def readout_known(self, side: str = "left") -> bool:
-        key = f"readout:{side}"
-        return key in self.results or key in self.saved
+        """Whether a readout is in force, for the same reason: a refused
+        readout solve does not zero the shutter term."""
+        return f"readout:{side}" in self.saved
 
     def expected_error(self, z_mm: float | None = None,
                        stripe_px: float | None = None) -> ErrorBudget | None:
