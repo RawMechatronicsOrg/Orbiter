@@ -164,6 +164,11 @@ class ScanPanel(QFrame):
             lines.append(f"pixels  {f.n_confirmed}/{f.n_pixels} confirmed by the right eye")
             lines.append(f"unconfirmed {f.n_rejected_unconfirmed} · "
                          f"outside {f.n_rejected_volume}")
+            if f.rs_note:
+                lines.append(f"rolling — {f.rs_note}")
+            else:
+                lines.append(f"rolling ≤ {f.rs_max_mm:.2f} mm corrected · board "
+                             f"{f.speed_mm_s:.0f} mm/s {f.spin_deg_s:.0f}°/s")
         self.stats.setText("\n".join(lines))
 
     # ── actions ───────────────────────────────────────────────────────────

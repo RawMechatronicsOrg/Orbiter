@@ -50,6 +50,7 @@ from .intrinsics import (
 )
 from .intrinsics import solve as solve_intrinsics
 from .laserplane import LaserPlane, PlaneCollector
+from .rolling import MotionView, Readout, solve_readout
 from .stereo import StereoResult
 from .stereo import calibrate as solve_stereo
 from .worker import EyeResult
@@ -85,6 +86,13 @@ _PAIR_HISTORY = 16
 #: corner movement between consecutive detections. Motion blur rounds corners
 #: off and quietly biases the solve.
 _STILL_PX = 1.0
+
+#: Frames per eye the readout solve collects before solving on its own.
+#: Five seconds of twisting the board; the solve wants motion, not variety.
+_READOUT_FRAMES = 150
+#: A frame is worth feeding the readout solve from this many corners: the
+#: pose has to be sound before its slide across the rows can be measured.
+_READOUT_MIN_CORNERS = 12
 
 #: Captured views live here between runs. A board sweep costs the operator
 #: minutes, and losing it to a restart also loses the SIMULTANEOUS views that
@@ -126,7 +134,8 @@ class CoverageMap(QWidget):
 class CalibrationPanel(QFrame):
     """Capture controls, live diversity guidance, and the solve."""
 
-    #: Emitted with `{side: intrinsics-dict}` when the operator saves a solve.
+    #: Emitted when the operator saves: `{side: {"intrinsics": ..., "readout":
+    #: ...}}` with only the solved keys, plus `_extrinsics` / `_laser_plane`.
     save_requested = Signal(dict)
 
     def __init__(self, parent=None) -> None:
@@ -142,6 +151,9 @@ class CalibrationPanel(QFrame):
         self._results: dict[str, SolveResult] = {}
         self._stereo: StereoResult | None = None
         self._plane: LaserPlane | None = None
+        # Corners under motion for the rolling-shutter solve, and its result.
+        self._motion: dict[str, list[MotionView]] = {"left": [], "right": []}
+        self._readout: dict[str, Readout] = {}
         # Stripe-on-board samples, gathered live whenever the laser is on
         # and the board's pose is known. Nothing else needs to be aimed or
         # measured: the board already tells us where those points are in 3D.
@@ -232,6 +244,19 @@ class CalibrationPanel(QFrame):
         self.btn_plane.clicked.connect(self._solve_plane)
         root.addWidget(self.btn_plane)
 
+        self.btn_readout = QPushButton("Measure readout")
+        self.btn_readout.setCheckable(True)
+        self.btn_readout.setToolTip(
+            "The sensor's rolling-shutter readout time, from the board in "
+            "motion. While this is down, twist and tilt the board briskly in "
+            "front of both eyes; it solves on its own after "
+            f"{_READOUT_FRAMES} frames per eye. Needs per-eye intrinsics. "
+            "With it, scanning takes every point into the board's frame at "
+            "its own row's instant instead of the corners'."
+        )
+        self.btn_readout.toggled.connect(self._toggle_readout)
+        root.addWidget(self.btn_readout)
+
         self.btn_save = QPushButton("Save to server")
         self.btn_save.setEnabled(False)
         self.btn_save.clicked.connect(self._save)
@@ -293,6 +318,8 @@ class CalibrationPanel(QFrame):
         state at the start of every calibration — nothing ever captured.
         """
         self._collect_plane(res)
+        if self.btn_readout.isChecked():
+            self._collect_motion(res)
         self._still(res)                 # keep the stillness history current
         if res.board is not None and res.board.corners is not None:
             self._recent[res.side].append(res)
@@ -316,6 +343,71 @@ class CalibrationPanel(QFrame):
             return
         self._plane_pts.add_frame(line.inlier_points, self._left_k,
                                   board.R, board.t, line.rms_px)
+
+    def _collect_motion(self, res: EyeResult) -> None:
+        """Bank this frame's corners for the readout solve. Every frame with
+        a sound board, moving or not — the solve measures motion itself."""
+        board = res.board
+        if (board is None or board.corners is None or board.ids is None
+                or board.count < _READOUT_MIN_CORNERS or res.capture_mono is None):
+            return
+        views = self._motion[res.side]
+        if len(views) >= _READOUT_FRAMES:
+            return
+        views.append(MotionView(np.array(board.corners, np.float32),
+                                np.array(board.ids, np.int32), res.capture_mono, res.wh))
+        nl, nr = len(self._motion["left"]), len(self._motion["right"])
+        self.report.setText(f"readout: L {nl}/{_READOUT_FRAMES}  R {nr}/{_READOUT_FRAMES} "
+                            "— twist and tilt the board briskly")
+        if nl >= _READOUT_FRAMES and nr >= _READOUT_FRAMES:
+            self.btn_readout.setChecked(False)       # solves, see _toggle_readout
+
+    def _toggle_readout(self, on: bool) -> None:
+        if on:
+            missing = [s for s in ("left", "right") if s not in self._known_k]
+            if missing:
+                self.btn_readout.setChecked(False)
+                self.report.setText(
+                    f"readout needs intrinsics for {', '.join(missing)} — solve those "
+                    "first, or load a calibration the server already has")
+                return
+            for v in self._motion.values():
+                v.clear()
+            self.report.setText("readout: twist and tilt the board briskly in front "
+                                "of both eyes — it solves on its own")
+            return
+        self._solve_readout()
+
+    def _solve_readout(self) -> None:
+        if self._board is None:
+            self.report.setText("no board spec from the server")
+            return
+        lines: list[str] = []
+        for side in ("left", "right"):
+            views, k = self._motion[side], self._known_k.get(side)
+            if not views or k is None:
+                lines.append(f"{side}: nothing collected")
+                continue
+            r, why = solve_readout(views, self._board, k)
+            if r is None:
+                self._readout.pop(side, None)
+                lines.append(f"{side}: {why}")
+                continue
+            self._readout[side] = r
+            lines.append(
+                f"{side}: readout {r.seconds * 1000:+.2f} ± {r.sigma_s * 1000:.2f} ms "
+                f"@ {r.width}x{r.height}\n"
+                f"  over {r.views} frames, {why}, skew {r.skew_px:.1f} px")
+        both = [self._readout.get(s) for s in ("left", "right")]
+        if all(r is not None for r in both):
+            # Same sensor model on both eyes: the two figures cross-check each
+            # other, sign included.
+            a, b = both
+            lines.append("  the two eyes agree" if abs(a.seconds - b.seconds) <= 0.1 * abs(a.seconds)
+                         else "  the two eyes DISAGREE by more than 10% — measure again")
+        self.report.setText("\n".join(lines))
+        self.btn_save.setEnabled(bool(self._readout) or bool(self._results)
+                                 or self._stereo is not None or self._plane is not None)
 
     def _find_pair(self):
         """The closest-in-capture-time result from each eye, if they pair up.
@@ -461,6 +553,9 @@ class CalibrationPanel(QFrame):
         self._results.clear()
         self._stereo = None
         self._plane = None
+        self._readout.clear()
+        for v in self._motion.values():
+            v.clear()
         self._plane_pts.clear()
         self.btn_save.setEnabled(False)
         self._persist()
@@ -587,9 +682,14 @@ class CalibrationPanel(QFrame):
         self.btn_save.setEnabled(True)
 
     def _save(self) -> None:
-        if not self._results and self._stereo is None and self._plane is None:
+        if (not self._results and self._stereo is None and self._plane is None
+                and not self._readout):
             return
-        payload: dict = {side: res.as_config() for side, res in self._results.items()}
+        payload: dict = {}
+        for side, res in self._results.items():
+            payload.setdefault(side, {})["intrinsics"] = res.as_config()
+        for side, r in self._readout.items():
+            payload.setdefault(side, {})["readout"] = r.as_config()
         if self._stereo is not None:
             payload["_extrinsics"] = self._stereo.as_config()
         if self._plane is not None:

@@ -53,7 +53,7 @@ _PAINT_MS = 33
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, server: str) -> None:
+    def __init__(self, server: str, gpu: bool = False) -> None:
         super().__init__()
         self.setWindowTitle("Orbiter — native CV workbench")
         self.resize(1500, 780)
@@ -67,13 +67,13 @@ class MainWindow(QMainWindow):
         self.panels = {"left": EyePanel("left"), "right": EyePanel("right")}
         self.workers: dict[str, EyeWorker] = {}
         for side, panel in self.panels.items():
-            w = EyeWorker(side)
+            w = EyeWorker(side, gpu=gpu)
             # Errors are rare, so a queued signal is fine for them; results
             # are not, so they go to mailboxes the timer drains.
             w.status.connect(self._on_status, Qt.ConnectionType.QueuedConnection)
             w.add_sink(self._inbox[side].put)
             w.add_sink(self.scanner.offer)
-            w.set_overlay(self.scanner.overlay)
+            panel.set_overlay(self.scanner.overlay)
             self.workers[side] = w
 
         self.calib = CalibrationPanel()
@@ -199,7 +199,8 @@ class MainWindow(QMainWindow):
         # flags it with a reserved key so one save covers both solves.
         extr = per_side.pop("_extrinsics", None)
         plane = per_side.pop("_laser_plane", None)
-        args: dict = {side: {"intrinsics": k} for side, k in per_side.items()}
+        # Per-eye fields as the panel keyed them: intrinsics, readout.
+        args: dict = {side: dict(fields) for side, fields in per_side.items()}
         if plane is not None:
             args["laser_plane"] = plane
         if extr is not None:
@@ -232,6 +233,8 @@ class MainWindow(QMainWindow):
             self._laser.setChecked(True)      # this also pushes it to the workers
         for w in self.workers.values():
             w.set_scan_mode(on)
+        for panel in self.panels.values():
+            panel.set_scanning(on)
 
     def _paint(self) -> None:
         """Show whatever is newest. Anything older was skipped, not queued."""

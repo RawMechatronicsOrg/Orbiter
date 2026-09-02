@@ -14,6 +14,14 @@ One sweep of the pipeline, per frame pair:
   5. Keep it only if it lies inside a cylinder above the board, expressed in
      the BOARD's frame so the cylinder stays put while the board defines "up".
 
+The step into the board's frame is where the rolling shutter is paid for.
+The sensor reads row by row, so the stripe at the bottom of the frame was
+seen a readout later than the corners that gave the pose; with a `Motion`
+— the pose's twist from the previous frame, and the sensor's readout time —
+each point goes through the pose at its own row's instant (`rolling.py`).
+Without one, every point goes through the corners' pose, and moves with the
+board by however far it turned during the readout.
+
 **Why the plane, not stereo triangulation.** The first version matched each
 left stripe point to the right eye's stripe along its epipolar line and
 triangulated. Two things were wrong with it on this rig. The correspondence
@@ -47,6 +55,7 @@ import numpy as np
 
 from .laser import StripePixels
 from .laserplane import LaserPlane, rays
+from .rolling import Motion
 from .stereo import StereoRig
 
 log = logging.getLogger("orbiter_native.scan")
@@ -117,6 +126,12 @@ class ScanFrame:
     n_rejected_unconfirmed: int = 0
     n_rejected_volume: int = 0
     reason: str | None = None
+    #: Rolling shutter: the largest shift the per-row poses made to a kept
+    #: point, the board's speed the twist implied, or why none was applied.
+    rs_max_mm: float = 0.0
+    speed_mm_s: float = 0.0
+    spin_deg_s: float = 0.0
+    rs_note: str | None = None
 
     @property
     def n_kept(self) -> int:
@@ -153,11 +168,15 @@ def scan_frame(
     board_R: np.ndarray | None,
     board_t: np.ndarray | None,
     params: ScanParams = ScanParams(),
+    motion: Motion | None = None,
+    rs_note: str | None = None,
 ) -> ScanFrame:
     """One frame pair's stripe into board-frame points.
 
     `board_R`/`board_t` are the board's pose in the LEFT camera's frame, as
-    `cvcore.estimate_pose` returns it (t in mm).
+    `cvcore.estimate_pose` returns it (t in mm), valid at the instant of the
+    corners' mean row. `motion`, when known, slides it to every point's own
+    row; `rs_note` says why it is not known, for the panel.
     """
     if plane is None:
         return ScanFrame(reason="no laser plane — scanning meets each ray with "
@@ -204,13 +223,23 @@ def scan_frame(
 
     xyz_cam = (_on_plane(rig.left_k, plane, centroids) if len(centroids)
                else np.empty((0, 3)))
-    xyz_cam = xyz_cam[np.isfinite(xyz_cam).all(axis=1)]
+    finite = np.isfinite(xyz_cam).all(axis=1)
+    xyz_cam = xyz_cam[finite]
+    rows = centroids[finite, 1] if len(centroids) else np.empty(0)
 
     # Into the board's frame: the volume is defined relative to the board, so
     # it stays put when the board moves and "above" keeps meaning above it.
+    rs_max = 0.0
     if len(xyz_cam):
         xyz_board = (np.asarray(board_R, float).T
                      @ (xyz_cam.T - np.asarray(board_t, float).reshape(3, 1))).T
+        if motion is not None:
+            # Each point through the pose at its own row's instant, not the
+            # corners'. The shift against the static transform is what the
+            # rolling shutter would have cost.
+            corrected = motion.to_board(xyz_cam, rows, board_R, board_t)
+            rs_max = float(np.linalg.norm(corrected - xyz_board, axis=1).max())
+            xyz_board = corrected
     else:
         xyz_board = np.empty((0, 3))
     inside = params.volume.contains(xyz_board)
@@ -223,6 +252,10 @@ def scan_frame(
         n_confirmed=int(confirmed.sum()),
         n_rejected_unconfirmed=n_unconfirmed,
         n_rejected_volume=int((~inside).sum()),
+        rs_max_mm=rs_max,
+        speed_mm_s=0.0 if motion is None else motion.speed_mm_s,
+        spin_deg_s=0.0 if motion is None else motion.spin_deg_s,
+        rs_note=None if motion is not None else (rs_note or "no motion estimate"),
     )
 
 

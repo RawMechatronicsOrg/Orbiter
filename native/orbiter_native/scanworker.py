@@ -29,6 +29,7 @@ import numpy as np
 from .config import RigConfig
 from .laser import StripePixels
 from .laserplane import LaserPlane, from_config as plane_from_config
+from .rolling import Motion, Readout
 from .scan import CloudOverlay, PointCloud, ScanFrame, ScanParams, scan_frame
 from .stereo import StereoRig, result_from_config
 from .worker import EyeResult, Latest
@@ -48,6 +49,10 @@ _HISTORY = 16
 #: about 1 ms per 30k, per eye, per frame.
 OVERLAY_MAX = 40000
 
+#: Two left poses further apart than this say nothing about the motion
+#: inside one readout: a hand changes its mind in less. No correction then.
+MAX_TWIST_GAP_S = 0.2
+
 
 @dataclass
 class ScanInput:
@@ -58,6 +63,9 @@ class ScanInput:
     board_R: np.ndarray | None
     board_t: np.ndarray | None
     wh: tuple[int, int]
+    #: Mean row of the corners the pose came from: the instant, within the
+    #: frame's readout, that the pose holds for. NaN without a board.
+    pose_row: float = float("nan")
 
 
 @dataclass
@@ -90,7 +98,12 @@ class ScanWorker:
         # Projection geometry, rebuilt only when the calibration or the frame
         # size changes. Touched by the scan thread alone.
         self._geom_key = None
-        self._geom: tuple[StereoRig | None, LaserPlane | None] = (None, None)
+        self._geom: tuple[StereoRig | None, LaserPlane | None, Readout | None] = (
+            None, None, None)
+        # The previous left result that carried a pose: with the current one
+        # it gives the board's twist, which is what slides the pose to each
+        # stripe row's instant.
+        self._prev_left: ScanInput | None = None
 
         self.cloud = PointCloud()
         self.overlay = CloudOverlay()
@@ -113,6 +126,7 @@ class ScanWorker:
             if not on:
                 for q in self._hist.values():
                     q.clear()
+                self._prev_left = None
 
     def clear(self) -> None:
         with self._lock:
@@ -133,9 +147,12 @@ class ScanWorker:
         if res.capture_mono is None:
             return
         board = res.board
+        row = float("nan")
+        if board is not None and board.corners is not None and board.R is not None:
+            row = float(np.asarray(board.corners).reshape(-1, 2)[:, 1].mean())
         item = ScanInput(res.capture_mono, res.stripe,
                          None if board is None else board.R,
-                         None if board is None else board.t, res.wh)
+                         None if board is None else board.t, res.wh, pose_row=row)
         with self._lock:
             if not self._active:
                 return
@@ -205,7 +222,7 @@ class ScanWorker:
 
     def _process(self, a: ScanInput, b: ScanInput, cfg: RigConfig | None,
                  params: ScanParams) -> None:
-        rig, plane = self._geometry(cfg, a.wh)
+        rig, plane, readout = self._geometry(cfg, a.wh)
         if rig is None:
             self._publish(None, "no pair calibration for this frame size — "
                                 "solve intrinsics and the stereo pair first")
@@ -214,9 +231,13 @@ class ScanWorker:
             self._publish(None, "laser detector is off")
             return
         if a.board_R is None or a.board_t is None:
+            self._prev_left = None
             self._publish(None, "board not visible — it is what defines the scan volume")
             return
-        frame = scan_frame(rig, plane, a.stripe, b.stripe, a.board_R, a.board_t, params)
+        motion, note = self._motion(a, readout)
+        self._prev_left = a
+        frame = scan_frame(rig, plane, a.stripe, b.stripe, a.board_R, a.board_t, params,
+                           motion=motion, rs_note=note)
         snap = None
         with self._lock:
             self._pairs += 1
@@ -227,6 +248,23 @@ class ScanWorker:
             self.overlay.publish(snap)
         self._publish(frame, None)
 
+    def _motion(self, a: ScanInput, readout: Readout | None):
+        """The board's twist into this frame from the previous left pose, or
+        why there is none. Touched by the scan thread alone."""
+        if readout is None:
+            return None, "no readout time for this frame size — measure it in CALIBRATION"
+        prev = self._prev_left
+        if prev is None or prev.board_R is None or not np.isfinite(prev.pose_row):
+            return None, "waiting for a second board pose"
+        gap = a.capture_mono - prev.capture_mono
+        if not 0 < gap <= MAX_TWIST_GAP_S:
+            return None, f"previous pose {gap * 1000:.0f} ms ago — too long to infer the motion"
+        if not np.isfinite(a.pose_row):
+            return None, "no corners to time the pose by"
+        motion = Motion.between(prev.board_R, prev.board_t, prev.capture_mono, prev.pose_row,
+                                a.board_R, a.board_t, a.capture_mono, a.pose_row, readout)
+        return motion, None if motion is not None else "poses out of order"
+
     def _geometry(self, cfg: RigConfig | None, wh: tuple[int, int]):
         """Projection geometry for this calibration and frame size, cached.
 
@@ -235,11 +273,12 @@ class ScanWorker:
         in it, and an object id can be reused after the old one is freed.
         """
         if cfg is None:
-            return None, None
+            return None, None, None
         key = (wh,
                cfg.left.intrinsics_raw if cfg.left else None,
                cfg.right.intrinsics_raw if cfg.right else None,
-               cfg.extrinsics_raw, cfg.laser_plane_raw)
+               cfg.extrinsics_raw, cfg.laser_plane_raw,
+               cfg.left.readout_raw if cfg.left else None)
         if key != self._geom_key:
             rig = None
             if cfg.left is not None and cfg.right is not None:
@@ -249,7 +288,8 @@ class ScanWorker:
                 if kl is not None and kr is not None and geom is not None:
                     rig = StereoRig(kl, kr, geom)
             self._geom_key = key
-            self._geom = (rig, plane_from_config(cfg.laser_plane_raw, wh))
+            self._geom = (rig, plane_from_config(cfg.laser_plane_raw, wh),
+                          Readout.from_config(cfg.left.readout_raw if cfg.left else None, wh))
         return self._geom
 
     def _publish(self, frame: ScanFrame | None, note: str | None) -> None:

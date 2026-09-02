@@ -464,21 +464,3 @@ def find_laser_line(
     return done(line)
 
 
-def draw(bgr: np.ndarray, line: LaserLine, mask_hull: np.ndarray | None = None) -> None:
-    """Overlay the fit on an oriented BGR frame, in place.
-
-    Inliers green, rejected points red, the fitted line cyan — so a bad frame
-    is recognisable at a glance rather than only in the numbers.
-    """
-    if mask_hull is not None and len(mask_hull):
-        cv2.polylines(bgr, [mask_hull], True, (0, 190, 255), 1)
-    if line.points.size:
-        pts = np.rint(line.points).astype(np.int32)
-        ok = (pts[:, 0] >= 0) & (pts[:, 0] < bgr.shape[1]) & \
-             (pts[:, 1] >= 0) & (pts[:, 1] < bgr.shape[0])
-        inl = line.inliers if line.inliers.size == len(pts) else np.zeros(len(pts), bool)
-        for colour, sel in (((60, 60, 235), ok & ~inl), ((80, 235, 80), ok & inl)):
-            bgr[pts[sel, 1], pts[sel, 0]] = colour
-    if line.point is not None and line.direction is not None:
-        a, b = line.endpoints()
-        cv2.line(bgr, a, b, (235, 235, 60), 1, cv2.LINE_AA)
