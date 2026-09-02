@@ -446,3 +446,30 @@ def test_board_pose_frame_is_centred_with_z_toward_the_camera() -> None:
     # 180° or 144 mm.
     R2, t2, _ = estimate_pose(corners, ids, board, k, R_predicted=R)
     assert np.allclose(R2, R, atol=0.02) and np.allclose(t2, t, atol=2.0)
+
+
+def test_a_pose_that_is_not_a_rotation_is_neither_returned_nor_believed() -> None:
+    """One degenerate solve used to end the eye: NaN came back as the pose,
+    the caller kept it as the next frame's prior, and the disambiguating
+    solve raised on it from then on. A prior that is not a rotation is
+    ignored, and a solve that is not one is no pose at all."""
+    from orbiter_native import cvcore
+    from orbiter_native.cvcore import charuco_detect, estimate_pose
+
+    spec = BoardSpec(squares_x=8, squares_y=8, square_length_mm=36.0,
+                     marker_length_mm=26.64, aruco_dict_id=5)
+    board = build_board(spec)
+    corners, ids = charuco_detect(board.generateImage((1600, 1600), marginSize=80), board)
+    k = Intrinsics(fx=1500.0, fy=1500.0, cx=800.0, cy=800.0, dist=(0.0,) * 5)
+    good = estimate_pose(corners, ids, board, k)
+    assert good is not None
+
+    for prior in (np.full((3, 3), np.nan), np.zeros((3, 3)), np.eye(3) * 2.0):
+        poisoned = estimate_pose(corners, ids, board, k, R_predicted=prior)
+        assert poisoned is not None
+        assert np.allclose(poisoned[0], good[0], atol=0.02)      # solved without it
+
+    nan_pose = (np.full((3, 3), np.nan), np.zeros(3), 0.0)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(cvcore, "estimate_board_pose", lambda *a, **kw: nan_pose)
+        assert estimate_pose(corners, ids, board, k) is None

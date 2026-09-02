@@ -121,6 +121,8 @@ def estimate_pose(corners, ids, board, intrinsics: Intrinsics,
     # logged as a detector error and blanked the eye's view as "offline".
     if corners is None or len(corners) < 6:
         return None
+    if R_predicted is not None and not _is_rotation(R_predicted):
+        R_predicted = None                  # a poisoned prior is not a prior
     if R_predicted is None:
         out = estimate_board_pose(corners, ids, board, intrinsics)
         if out is None:
@@ -134,7 +136,25 @@ def estimate_pose(corners, ids, board, intrinsics: Intrinsics,
             return None
         R, t, ambiguity = out
     R, t = _facing(board, R, t)
+    if not _is_rotation(R) or not np.isfinite(t).all():
+        return None                         # not a pose; do not hand it out
     return R, t, ambiguity
+
+
+def _is_rotation(R) -> bool:
+    """Is this a rotation matrix, and not a hole where one should be?
+
+    A degenerate corner set can come back from solvePnP as NaN. Handed out,
+    it puts a NaN pose into the calibration sets; kept by the caller as the
+    next frame's prior, it raises inside the disambiguating solve — and then
+    every frame after it, because the caller keeps the prior it was given and
+    never sees a pose again. Both ends are checked here: nothing that is not
+    a rotation is returned, and nothing that is not a rotation is believed.
+    """
+    R = np.asarray(R, dtype=float)
+    if R.shape != (3, 3) or not np.isfinite(R).all():
+        return False
+    return abs(float(np.linalg.det(R)) - 1.0) < 1e-3
 
 
 def board_spec_from_config(cfg: dict[str, Any]) -> BoardSpec | None:
