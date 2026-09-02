@@ -85,11 +85,13 @@ class EyePanel(QFrame):
     def set_scanning(self, on: bool) -> None:
         self._scanning = on
 
-    def on_result(self, res: EyeResult) -> None:
-        self.view.set_scene(self._scene(res))
+    def on_result(self, res: EyeResult, pose=None) -> None:
+        """`pose` is a (R, t) to draw the cloud through when the result has
+        none of its own — the right eye's, composed from the left's."""
+        self.view.set_scene(self._scene(res, pose))
         self.view.set_overlay(self._overlay_lines(res))
 
-    def _scene(self, res: EyeResult) -> Scene:
+    def _scene(self, res: EyeResult, pose=None) -> Scene:
         """The worker's result as the view draws it — every coordinate still
         original; the view orients. The cloud is projected through THIS
         eye's own board pose, so the two overlays disagreeing is itself a
@@ -103,15 +105,17 @@ class EyePanel(QFrame):
                  if self._scanning and self._cloud is not None else None)
         k = res.intrinsics
         return Scene(
-            bgr=res.bgr, orientation=res.orientation, stripe=stripe,
+            bgr=res.bgr, orientation=res.orientation, size=res.wh, stripe=stripe,
             corners=None if board is None or board.corners is None
             else board.corners.reshape(-1, 2),
             ids=None if board is None or board.ids is None else board.ids.reshape(-1),
             laser=laser,
             hull=None if res.hull is None else res.hull.reshape(-1, 2),
             cloud=cloud,
-            R=None if board is None else board.R,
-            t=None if board is None else board.t,
+            R=(pose[0] if pose is not None and (board is None or board.R is None)
+               else None if board is None else board.R),
+            t=(pose[1] if pose is not None and (board is None or board.t is None)
+               else None if board is None else board.t),
             K=None if k is None else k.K,
             D=None if k is None else k.D,
         )

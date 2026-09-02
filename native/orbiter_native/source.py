@@ -14,8 +14,9 @@ against 1.36 ms for a grayscale-only decode. About 1 ms per frame per camera
 buys the only channel in which the stripe exists.
 
 With `gpu=True` the JPEG is decoded by nvJPEG instead (`gpu.decode`), the
-frame stays on the GPU for the stripe score, and `bgr`/`gray` are downloaded
-copies of it. Same `Frame` either way.
+frame stays on the GPU for the stripe score, `gray` and a half-size `display`
+are downloaded from it, and the full `bgr` only while `full_bgr` asks for it.
+Same `Frame` either way.
 """
 
 from __future__ import annotations
@@ -50,10 +51,18 @@ _READ_TIMEOUT_S = 10.0
 class Frame:
     """One decoded frame plus what is needed to time it."""
 
-    #: Colour, as decoded. The laser needs it; the board does not.
-    bgr: np.ndarray
-    #: Luminance view, derived from `bgr` — what ChArUco detection consumes.
+    #: Colour, as decoded, full size — what the calibration-mode line fit
+    #: and the CPU stripe detector read. None on the GPU path when neither
+    #: wants it: the stripe is scored on `rgb_gpu` and the view is served
+    #: by `display`.
+    bgr: np.ndarray | None
+    #: Luminance view, full size — what ChArUco detection consumes.
     gray: np.ndarray
+    #: BGR for the view: the full frame, or on the GPU path a half-size
+    #: average of it. Geometry is never measured on this.
+    display: np.ndarray
+    #: The frame's true size (width, height), whatever `display` is.
+    wh: tuple[int, int]
     #: camserver's capture instant on ITS monotonic clock. Not comparable to
     #: our clock directly — see `MjpegReader.age_ms` for why this app reports
     #: arrival intervals rather than pretending to know the clock offset.
@@ -88,6 +97,9 @@ class MjpegReader:
     def __init__(self, url: str, gpu: bool = False) -> None:
         self.url = url
         self._gpu = gpu
+        #: On the GPU path, download the full BGR too. The worker sets it
+        #: while the calibration-mode line fit needs the pixels on the CPU.
+        self.full_bgr = True
         self._stop = False
 
     def stop(self) -> None:
@@ -148,7 +160,7 @@ class MjpegReader:
             rgb_gpu = gpu.decode(payload)
             if rgb_gpu is None:
                 return None
-            bgr, gray = gpu.to_cpu(rgb_gpu)
+            bgr, gray, display = gpu.to_cpu(rgb_gpu, full=self.full_bgr)
         else:
             bgr = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_COLOR)
             if bgr is None:
@@ -157,6 +169,7 @@ class MjpegReader:
                 # the detectors.
                 return None
             gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            display = bgr
 
         def num(key: str) -> float | None:
             try:
@@ -167,6 +180,8 @@ class MjpegReader:
         return Frame(
             bgr=bgr,
             gray=gray,
+            display=display,
+            wh=(gray.shape[1], gray.shape[0]),
             capture_mono=num("x-capture-monotonic"),
             seq=hdr.get("x-frame-seq"),
             server_age_ms=num("x-age-ms"),

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 
@@ -30,16 +31,21 @@ from .config import RigConfig
 from .laser import StripePixels
 from .laserplane import LaserPlane, from_config as plane_from_config
 from .rolling import Motion, Readout
-from .scan import CloudOverlay, PointCloud, ScanFrame, ScanParams, scan_frame
+from .scan import CloudOverlay, PointCloud, ScanFrame, ScanParams, scan_frame, stripe_rows
 from .stereo import StereoRig, result_from_config
 from .worker import EyeResult, Latest
 
 log = logging.getLogger("orbiter_native.scanworker")
 
 #: Two frames count as simultaneous within this much of camserver's capture
-#: clock. Wider than calibration's 4 ms: the subject turns slowly by hand, and
-#: 10 ms found partners for 26 of 58 left frames on this rig against 11 at 4 ms.
-PAIR_WINDOW_S = 0.010
+#: clock. Wider than calibration's 4 ms: the subject turns slowly by hand.
+#: 10 ms found partners for 26 of 58 left frames on this rig against 11 at
+#: 4 ms — and the reason it was not 58 is that the left camera ran at 20 fps
+#: under auto-exposure while the right ran at 30, so every other left frame
+#: had its nearest right frame 16.7 ms away. 20 ms takes those too. What it
+#: costs is the subject's motion over that gap: 0.5 mm at 30 mm/s, about a
+#: pixel in the right eye against a 3 px confirmation slack.
+PAIR_WINDOW_S = 0.020
 
 #: Results kept per eye while waiting for a partner. At 30 fps this is half a
 #: second — far more than the two streams ever drift apart.
@@ -52,6 +58,62 @@ OVERLAY_MAX = 40000
 #: Two left poses further apart than this say nothing about the motion
 #: inside one readout: a hand changes its mind in less. No correction then.
 MAX_TWIST_GAP_S = 0.2
+
+#: While the board holds still — its pose within this of the batch's first
+#: — consecutive pairs see the same surface, and their points are averaged
+#: per scanline before they join the cloud: noise falls by the square root
+#: of the batch. A hand-held board jitters far less than this; the pose
+#: itself is repeatable to a tenth of a millimetre.
+STILL_MM = 0.5
+STILL_DEG = 0.1
+STILL_BATCH = 5
+
+#: The right eye keeps scoring the stripe for this long after the left eye
+#: last had a board pose — a moment's loss of the board is not a reason to
+#: miss the stripe the scan will want on the next frame.
+LEFT_POSE_RECENT_S = 0.5
+
+
+def _still(a: tuple[np.ndarray, np.ndarray], b: tuple[np.ndarray, np.ndarray]) -> bool:
+    """Two board poses within STILL_MM and STILL_DEG of each other."""
+    (R0, t0), (R1, t1) = a, b
+    if float(np.linalg.norm(np.asarray(t1, float).ravel() - np.asarray(t0, float).ravel())) > STILL_MM:
+        return False
+    cos = (np.trace(np.asarray(R0, float).T @ np.asarray(R1, float)) - 1.0) / 2.0
+    return float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0)))) <= STILL_DEG
+
+
+def average_still(frames: list[ScanFrame]) -> np.ndarray:
+    """One point per scanline from a batch of still frames: the per-axis
+    TRIMMED mean of the frames' points on that scanline — the lowest and the
+    highest dropped once there are four or more — kept when at least half
+    the frames had one. Trimmed, not plain: a glint that passed every gate in
+    one frame of five is 40 mm off, and a plain mean would move the point
+    8 mm toward it; as the extreme it is dropped instead, and the remaining
+    three average with most of the mean's noise reduction (a median of five
+    keeps only 70% of it). A scanline seen once in five is a flicker, not a
+    surface."""
+    if len(frames) == 1:
+        return frames[0].points_board
+    keys = np.concatenate([f.scanlines for f in frames])
+    pts = np.concatenate([f.points_board for f in frames])
+    if not len(keys):
+        return np.empty((0, 3))
+    order = np.argsort(keys, kind="stable")
+    keys, pts = keys[order], pts[order]
+    uniq, start, counts = np.unique(keys, return_index=True, return_counts=True)
+    rank = np.arange(len(keys)) - np.repeat(start, counts)
+    width = int(counts.max())
+    table = np.full((len(uniq), width, 3), np.nan)
+    table[np.repeat(np.arange(len(uniq)), counts), rank] = pts
+    enough = counts >= -(-len(frames) // 2)
+    table, counts = table[enough], counts[enough]
+    table = np.sort(table, axis=1)                        # NaN sorts last, per axis
+    ranks = np.arange(width)[None, :]
+    trim = (counts >= 4)[:, None]
+    keep = np.where(trim, (ranks >= 1) & (ranks <= counts[:, None] - 2), ranks < counts[:, None])
+    weights = keep.astype(np.float64)[:, :, None]
+    return np.nansum(table * weights, axis=1) / weights.sum(axis=1)
 
 
 @dataclass
@@ -75,6 +137,10 @@ class ScanStatus:
     n_points: int
     bounds: tuple[np.ndarray, np.ndarray] | None
     pairs: int
+    #: Left results offered while scanning — with `pairs`, the pairing rate.
+    offered_left: int = 0
+    #: Pairs held in the current still batch, waiting to be averaged.
+    batched: int = 0
     frame: ScanFrame | None = None
     #: A blocking condition — no calibration, no board, laser off.
     note: str | None = None
@@ -95,15 +161,24 @@ class ScanWorker:
         self._cfg: RigConfig | None = None
         self._params = ScanParams()
         self._pairs = 0
+        self._offered_left = 0
         # Projection geometry, rebuilt only when the calibration or the frame
         # size changes. Touched by the scan thread alone.
         self._geom_key = None
         self._geom: tuple[StereoRig | None, LaserPlane | None, Readout | None] = (
             None, None, None)
+        #: Per eye, the rows the sheet can appear in for the current reach, or
+        #: None for the whole frame; the window pushes them to the workers.
+        self.stripe_rows: dict[str, tuple[int, int] | None] = {"left": None, "right": None}
         # The previous left result that carried a pose: with the current one
         # it gives the board's twist, which is what slides the pose to each
         # stripe row's instant.
         self._prev_left: ScanInput | None = None
+        self._left_pose_at = -1e9
+        # Consecutive frames of a still board, averaged before they join the
+        # cloud; the pose they are still against is the first one's.
+        self._batch: list[ScanFrame] = []
+        self._batch_pose: tuple[np.ndarray, np.ndarray] | None = None
 
         self.cloud = PointCloud()
         self.overlay = CloudOverlay()
@@ -121,17 +196,28 @@ class ScanWorker:
             self._params = params
 
     def set_active(self, on: bool) -> None:
+        snap = None
         with self._lock:
             self._active = on
             if not on:
                 for q in self._hist.values():
                     q.clear()
                 self._prev_left = None
+                if self._flush_batch():
+                    snap = self.cloud.decimated(OVERLAY_MAX)
+        if snap is not None:
+            # The batch's points joined the cloud; the eyes and the panel
+            # must see them even though no pair follows.
+            self.overlay.publish(snap)
+            self._publish(None, None)
 
     def clear(self) -> None:
         with self._lock:
+            self._batch.clear()
+            self._batch_pose = None
             self.cloud.clear()
             self._pairs = 0
+            self._offered_left = 0
             snap = self.cloud.decimated(OVERLAY_MAX)
         self.overlay.publish(snap)
         self._publish(None, None)
@@ -157,7 +243,16 @@ class ScanWorker:
             if not self._active:
                 return
             self._hist[res.side].append(item)
+            if res.side == "left":
+                self._offered_left += 1
+                if item.board_R is not None:
+                    self._left_pose_at = time.monotonic()
         self._wake.set()
+
+    def left_pose_recent(self) -> bool:
+        """For the right eye's worker: has the left eye had a board pose
+        within `LEFT_POSE_RECENT_S`? Lock-free on purpose — a float read."""
+        return time.monotonic() - self._left_pose_at <= LEFT_POSE_RECENT_S
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
@@ -222,7 +317,7 @@ class ScanWorker:
 
     def _process(self, a: ScanInput, b: ScanInput, cfg: RigConfig | None,
                  params: ScanParams) -> None:
-        rig, plane, readout = self._geometry(cfg, a.wh)
+        rig, plane, readout = self._geometry(cfg, a.wh, b.wh)
         if rig is None:
             self._publish(None, "no pair calibration for this frame size — "
                                 "solve intrinsics and the stereo pair first")
@@ -241,12 +336,40 @@ class ScanWorker:
         snap = None
         with self._lock:
             self._pairs += 1
-            if frame.n_kept:
-                self.cloud.add(frame.points_board)
+            added = self._bank(frame, a.board_R, a.board_t)
+            if added:
                 snap = self.cloud.decimated(OVERLAY_MAX)
         if snap is not None:
             self.overlay.publish(snap)
         self._publish(frame, None)
+
+    # ── still batches (under the lock) ────────────────────────────────────
+
+    def _bank(self, frame: ScanFrame, R, t) -> bool:
+        """Add a frame's points to the cloud — through a still batch when
+        the board has not moved since the batch began. Returns True when
+        the cloud changed."""
+        still = self._batch_pose is not None and _still(self._batch_pose, (R, t))
+        changed = False
+        if not still:
+            changed = self._flush_batch()
+            self._batch_pose = (np.asarray(R, float), np.asarray(t, float).ravel())
+        if frame.n_kept:
+            self._batch.append(frame)
+        if len(self._batch) >= STILL_BATCH:
+            changed = self._flush_batch() or changed
+            self._batch_pose = (np.asarray(R, float), np.asarray(t, float).ravel())
+        return changed
+
+    def _flush_batch(self) -> bool:
+        """Average the batch per scanline and add it. One frame adds as is."""
+        frames, self._batch = self._batch, []
+        if not frames:
+            return False
+        pts = average_still(frames)
+        if len(pts):
+            self.cloud.add(pts)
+        return bool(len(pts))
 
     def _motion(self, a: ScanInput, readout: Readout | None):
         """The board's twist into this frame from the previous left pose, or
@@ -265,7 +388,8 @@ class ScanWorker:
                                 a.board_R, a.board_t, a.capture_mono, a.pose_row, readout)
         return motion, None if motion is not None else "poses out of order"
 
-    def _geometry(self, cfg: RigConfig | None, wh: tuple[int, int]):
+    def _geometry(self, cfg: RigConfig | None, wh: tuple[int, int],
+                  right_wh: tuple[int, int] | None = None):
         """Projection geometry for this calibration and frame size, cached.
 
         Keyed by the calibration's content rather than the config object: the
@@ -274,26 +398,34 @@ class ScanWorker:
         """
         if cfg is None:
             return None, None, None
-        key = (wh,
+        right_wh = wh if right_wh is None else right_wh
+        with self._lock:
+            reach = tuple(self._params.range_mm)
+        key = (wh, right_wh,
                cfg.left.intrinsics_raw if cfg.left else None,
                cfg.right.intrinsics_raw if cfg.right else None,
                cfg.extrinsics_raw, cfg.laser_plane_raw,
-               cfg.left.readout_raw if cfg.left else None)
+               cfg.left.readout_raw if cfg.left else None, reach)
         if key != self._geom_key:
             rig = None
             if cfg.left is not None and cfg.right is not None:
                 kl = cfg.left.intrinsics_for(wh)
-                kr = cfg.right.intrinsics_for(wh)
+                kr = cfg.right.intrinsics_for(right_wh)
                 geom = result_from_config(cfg.extrinsics_raw, wh)
                 if kl is not None and kr is not None and geom is not None:
                     rig = StereoRig(kl, kr, geom)
             self._geom_key = key
-            self._geom = (rig, plane_from_config(cfg.laser_plane_raw, wh),
+            plane = plane_from_config(cfg.laser_plane_raw, wh)
+            self._geom = (rig, plane,
                           Readout.from_config(cfg.left.readout_raw if cfg.left else None, wh))
+            self.stripe_rows = {
+                side: (stripe_rows(plane, rig, reach, size, side)
+                       if rig is not None and plane is not None else None)
+                for side, size in (("left", wh), ("right", right_wh))}
         return self._geom
 
     def _publish(self, frame: ScanFrame | None, note: str | None) -> None:
         with self._lock:
             st = ScanStatus(len(self.cloud), self.cloud.bounds(), self._pairs,
-                            frame, note)
+                            self._offered_left, len(self._batch), frame, note)
         self.status.put(st)

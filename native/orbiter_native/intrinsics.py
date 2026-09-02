@@ -399,6 +399,11 @@ class SolveResult:
     per_view_rms: list[float] = field(default_factory=list)
     #: Views the robust pass discarded before the final fit.
     dropped: int = 0
+    #: One-sigma uncertainty of the focal length, px, from the solve's own
+    #: covariance. This is the term that sets the SCALE of every scan: a
+    #: focal length wrong by a part in a thousand measures a 150 mm subject
+    #: 0.15 mm wrong, and no residual reveals it.
+    sigma_f_px: float = float("nan")
 
     def as_config(self) -> dict:
         """The payload `set_stereo_rig` stores on an eye.
@@ -413,6 +418,7 @@ class SolveResult:
             "width": self.wh[0], "height": self.wh[1],
             "rms_px": self.rms_px,
             "views": self.n_views,
+            "sigma_f": self.sigma_f_px,
         }
 
 
@@ -459,7 +465,10 @@ def solve(
 
     flags = cv2.CALIB_FIX_K3
     try:
-        rms, k, dist, rvecs, tvecs = cv2.calibrateCamera(
+        # The Extended form also returns the parameters' standard deviations
+        # from the solve's covariance — the focal length's is the scale
+        # uncertainty of every measurement made through this camera.
+        rms, k, dist, rvecs, tvecs, std_k, _std_ext, _pv = cv2.calibrateCameraExtended(
             obj_pts, img_pts, wh, None, None, flags=flags,
         )
         per_view = _per_view_rms(obj_pts, img_pts, rvecs, tvecs, k, dist)
@@ -477,7 +486,7 @@ def solve(
             dropped = len(per_view) - len(keep)
             obj_pts = [obj_pts[j] for j in keep]
             img_pts = [img_pts[j] for j in keep]
-            rms, k, dist, rvecs, tvecs = cv2.calibrateCamera(
+            rms, k, dist, rvecs, tvecs, std_k, _std_ext, _pv = cv2.calibrateCameraExtended(
                 obj_pts, img_pts, wh, None, None, flags=flags,
             )
             per_view = _per_view_rms(obj_pts, img_pts, rvecs, tvecs, k, dist)
@@ -501,6 +510,7 @@ def solve(
         tilt_spread=float("nan") if tilt_spread is None else float(tilt_spread),
         per_view_rms=per_view,
         dropped=dropped,
+        sigma_f_px=float(np.mean(np.asarray(std_k, float).ravel()[:2])),
     ), None
 
 

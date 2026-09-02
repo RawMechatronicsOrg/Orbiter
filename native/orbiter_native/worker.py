@@ -124,9 +124,10 @@ class EyeResult:
     """One detection pass, ready for the GUI thread."""
 
     side: str
-    #: The frame as decoded — unoriented, nothing drawn on it, and shared
-    #: with the detector rather than copied. The view orients it and draws
-    #: the geometry below over it; nothing may write into it.
+    #: The frame for the view — unoriented, nothing drawn on it, shared with
+    #: the reader rather than copied, and possibly half size on the GPU path
+    #: (`wh` is the true size). The view orients it and draws the geometry
+    #: below over it; nothing may write into it.
     bgr: np.ndarray
     stats: EyeStats
     orientation: Orientation = Orientation()
@@ -182,6 +183,14 @@ class EyeWorker(QObject):
         self._laser_on = False
         self._scan_mode = False
         self._laser_params = LaserParams()
+        #: Rows the sheet can appear in while scanning (`scan.stripe_rows`),
+        #: or None for the whole frame. Pushed by the window from the scan
+        #: worker, which owns the geometry it follows from.
+        self._stripe_rows: tuple[int, int] | None = None
+        #: Whether the scan can use a stripe from this eye right now: the
+        #: scan worker answers for the right eye (it knows whether the left
+        #: has had a pose lately). None means always.
+        self._scan_gate: Callable[[], bool] | None = None
         self._sinks: list[Callable[[EyeResult], None]] = []
 
         self._recv_times: deque[float] = deque(maxlen=_WINDOW)
@@ -210,6 +219,7 @@ class EyeWorker(QObject):
             self._laser_on = enabled
             if params is not None:
                 self._laser_params = params
+        self._push_full_bgr()
 
     def set_scan_mode(self, on: bool) -> None:
         """Switch the stripe detector between its two genuinely different jobs.
@@ -224,6 +234,26 @@ class EyeWorker(QObject):
         """
         with self._cfg_lock:
             self._scan_mode = on
+        self._push_full_bgr()
+
+    def _needs_full_bgr(self) -> bool:
+        """Only the calibration-mode line fit reads the full colour frame on
+        the CPU; scanning scores the stripe on the GPU frame."""
+        with self._cfg_lock:
+            return self._laser_on and not self._scan_mode
+
+    def _push_full_bgr(self) -> None:
+        reader = self._reader
+        if reader is not None:
+            reader.full_bgr = self._needs_full_bgr()
+
+    def set_stripe_rows(self, rows: tuple[int, int] | None) -> None:
+        with self._cfg_lock:
+            self._stripe_rows = rows
+
+    def set_scan_gate(self, gate: Callable[[], bool] | None) -> None:
+        with self._cfg_lock:
+            self._scan_gate = gate
 
     def add_sink(self, sink: Callable[[EyeResult], None]) -> None:
         """Called from the detector thread with every result. Must be quick and
@@ -234,7 +264,7 @@ class EyeWorker(QObject):
         with self._cfg_lock:
             return (self._url, self._orientation, self._board_spec,
                     self._eye, self._laser_on, self._laser_params,
-                    self._scan_mode)
+                    self._scan_mode, self._stripe_rows, self._scan_gate)
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
@@ -272,6 +302,7 @@ class EyeWorker(QObject):
                 time.sleep(0.5)
                 continue
             self._reader = MjpegReader(url, gpu=self._gpu)
+            self._reader.full_bgr = self._needs_full_bgr()
             try:
                 for frame in self._reader.frames():
                     if self._stop.is_set():
@@ -317,14 +348,18 @@ class EyeWorker(QObject):
 
     def _detect_one(self, detector: BoardDetector, frame: Frame) -> None:
         (_, orientation, spec, eye, laser_on, laser_params,
-         scan_mode) = self._snapshot()
+         scan_mode, stripe_rows, scan_gate) = self._snapshot()
         detector.set_spec(spec)
 
         h, w = frame.gray.shape
         # Resolved against THIS frame's size: intrinsics solved at another
         # resolution are refused rather than silently misapplied.
         intrinsics = eye.intrinsics_for((w, h)) if eye else None
-        board = detector.detect(frame.gray, intrinsics) if detector.ready else BoardHit()
+        # While scanning, the right eye's board pose is only ever drawn — and
+        # the window draws it from the left's through the extrinsics — so
+        # the right eye skips ChArUco and spends its frame on the stripe.
+        board = (detector.detect(frame.gray, intrinsics)
+                 if detector.ready and board_wanted(self.side, scan_mode) else BoardHit())
         descriptor = (describe(board.corners, board.ids, detector.board, (w, h))
                       if board.corners is not None else None)
 
@@ -343,15 +378,22 @@ class EyeWorker(QObject):
         pixels = StripePixels()
         hull = None
         if laser_on and scan_mode:
-            # The whole-frame score is the expensive one; on a GPU frame it
-            # runs where the pixels already are.
-            pixels = (gpu.stripe_pixels(frame.rgb_gpu, laser_params)
-                      if frame.rgb_gpu is not None
-                      else find_stripe_pixels(frame.bgr, laser_params))
+            if not stripe_wanted(self.side, board.R is not None,
+                                 True if scan_gate is None else scan_gate()):
+                pixels = StripePixels(wh=(w, h), reason="no board pose — nothing to place")
+            else:
+                # The whole-frame score is the expensive one; on a GPU frame
+                # it runs where the pixels already are.
+                pixels = (gpu.stripe_pixels(frame.rgb_gpu, laser_params, stripe_rows)
+                          if frame.rgb_gpu is not None
+                          else find_stripe_pixels(frame.bgr, laser_params, stripe_rows))
         elif laser_on:
             mask = board_mask(board.corners, frame.gray.shape)
             if mask is None:
                 laser = LaserLine(reason="board not detected")
+            elif frame.bgr is None:
+                # The reader is switching to full frames; the next one has it.
+                laser = LaserLine(reason="waiting for a full-size frame")
             else:
                 laser = find_laser_line(frame.bgr, mask, laser_params)
                 hull = cv2.convexHull(board.corners.reshape(-1, 2).astype(np.int32))
@@ -388,7 +430,7 @@ class EyeWorker(QObject):
         s.server_age_ms = frame.server_age_ms
         h, w = frame.gray.shape
         res = EyeResult(
-            self.side, frame.bgr, _copy_stats(s), orientation=orientation,
+            self.side, frame.display, _copy_stats(s), orientation=orientation,
             intrinsics=intrinsics, hull=hull, board=board, laser=laser,
             stripe=pixels, wh=(w, h), descriptor=descriptor,
             capture_mono=frame.capture_mono,
@@ -398,6 +440,24 @@ class EyeWorker(QObject):
 
 
 # ── helpers ───────────────────────────────────────────────────────────────
+
+
+def board_wanted(side: str, scan_mode: bool) -> bool:
+    """Whether this eye runs ChArUco on the frame. While scanning, the right
+    eye's board pose is only drawn, and the window draws it from the left's
+    through the extrinsics — so the right eye spends its frame on the stripe."""
+    return not (scan_mode and side == "right")
+
+
+def stripe_wanted(side: str, has_pose: bool, left_recent: bool) -> bool:
+    """Whether the stripe is worth scoring on this frame while scanning.
+
+    The scan places points through the LEFT eye's board pose, so a left
+    frame without one has nothing to place and the right eye's stripe is
+    only wanted while the left has had a pose lately — the right eye does
+    not detect the board while scanning, so it asks the scan worker.
+    """
+    return has_pose if side == "left" else left_recent
 
 
 def _rate(times: "deque[float]") -> float:

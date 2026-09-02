@@ -9,10 +9,11 @@ GPU time, both eyes decoded and scored in 5 ms of wall time, and the CPU
 mostly waits.
 
 What stays on the CPU, and why. ChArUco has no GPU implementation, so the
-luminance view is downloaded (2 MB); the display and the overlays still draw
-into a CPU copy of the frame (6 MB) — a GL overlay is the next step, not this
-one. The calibration-mode line fit (`laser.find_laser_line`) runs inside the
-board's bounding box on the CPU: a few milliseconds, only while calibrating.
+luminance view is downloaded (2 MB); the view draws a half-size copy of the
+frame (1.5 MB) as a texture, with the geometry as GL points. The
+calibration-mode line fit (`laser.find_laser_line`) runs inside the board's
+bounding box on the CPU — a few milliseconds, only while calibrating — and
+is the one consumer of the full colour frame, downloaded only then.
 
 Why MJPEG through nvJPEG rather than the cameras' H.264 through NVDEC. Each
 JPEG stands alone: camserver's per-frame `X-Capture-Monotonic` header still
@@ -144,16 +145,28 @@ def decode(payload: bytearray):
         return None
 
 
-def to_cpu(rgb) -> tuple[np.ndarray, np.ndarray]:
-    """The CPU views the rest of the app works on: BGR (H, W, 3) and gray
-    (H, W), both uint8. Gray uses OpenCV's own fixed-point BGR2GRAY weights;
-    its SIMD path rounds a level apart on a few pixels, which is below
-    anything ChArUco can tell from sensor noise."""
+def to_cpu(rgb, full: bool = True) -> tuple[np.ndarray | None, np.ndarray, np.ndarray]:
+    """The CPU views the rest of the app works on: `(bgr, gray, display)`.
+
+    `gray` (H, W) is full size always — ChArUco wants every pixel. With
+    `full`, `bgr` (H, W, 3) is downloaded whole and doubles as `display`;
+    without, `bgr` is None and `display` is the frame averaged 2×2 — the
+    eyes are shown at about a third of their size, so a half-size copy is
+    all the view can use, at a quarter of the 6 MB download and upload.
+    The full copy is only for the calibration-mode line fit, which runs
+    on the CPU. Gray uses OpenCV's own fixed-point BGR2GRAY weights; its
+    SIMD path rounds a level apart on a few pixels, below anything ChArUco
+    can tell from sensor noise."""
     torch = _torch
-    bgr = rgb.flip(0).permute(1, 2, 0).contiguous()
     r, g, b = (c.to(torch.int32) for c in rgb)
     gray = ((r * 4899 + g * 9617 + b * 1868 + (1 << 13)) >> 14).to(torch.uint8)
-    return bgr.cpu().numpy(), gray.cpu().numpy()
+    if full:
+        bgr = rgb.flip(0).permute(1, 2, 0).contiguous().cpu().numpy()
+        return bgr, gray.cpu().numpy(), bgr
+    small = _F.avg_pool2d(rgb.to(torch.float32)[None], 2)[0]
+    display = (small.round_().clamp_(0, 255).to(torch.uint8)
+               .flip(0).permute(1, 2, 0).contiguous().cpu().numpy())
+    return None, gray.cpu().numpy(), display
 
 
 # ── the stripe ────────────────────────────────────────────────────────────
@@ -189,13 +202,19 @@ def stripe_score(rgb, background_px: int = 15):
     return _torch.maximum(red, ex)
 
 
-def stripe_pixels(rgb, p: LaserParams = LaserParams()) -> StripePixels:
+def stripe_pixels(rgb, p: LaserParams = LaserParams(),
+                  rows: tuple[int, int] | None = None) -> StripePixels:
     """`laser.find_stripe_pixels` on a GPU frame: every pixel scoring at least
     `redness_min`, with its score, in the same row-major order OpenCV's
-    `findNonZero` yields. Only the pixel list comes back to the CPU."""
+    `findNonZero` yields. Only the pixel list comes back to the CPU. `rows`
+    limits the search to the band the sheet can appear in."""
     t0 = time.perf_counter()
     _, h, w = rgb.shape
-    score = stripe_score(rgb, p.background_px)
+    y0, y1 = (0, h) if rows is None else (max(0, int(rows[0])), min(h, int(rows[1])))
+    if y1 <= y0:
+        return StripePixels(wh=(w, h), reason="the sheet cannot appear in this frame",
+                            ms=(time.perf_counter() - t0) * 1000.0)
+    score = stripe_score(rgb[:, y0:y1], p.background_px)
     lit = score >= p.redness_min
     yx = lit.nonzero()
     if yx.shape[0] == 0:
@@ -204,7 +223,7 @@ def stripe_pixels(rgb, p: LaserParams = LaserParams()) -> StripePixels:
     weight = score[lit].round_().clamp_(0, 255).to(_torch.uint8)
     yx_cpu = yx.cpu().numpy()
     x = yx_cpu[:, 1].astype(np.int32)
-    y = yx_cpu[:, 0].astype(np.int32)
+    y = (yx_cpu[:, 0] + y0).astype(np.int32)
     along_x = bool((x.max() - x.min()) >= (y.max() - y.min()))
     return StripePixels(x=x, y=y, w=weight.cpu().numpy(), wh=(w, h),
                         along_x=along_x, reason=None,

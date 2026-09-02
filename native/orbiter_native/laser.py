@@ -267,12 +267,16 @@ def _lit(score: np.ndarray, redness_min: int,
     return cv2.bitwise_and(score, keep), bool(along_x)
 
 
-def find_stripe_pixels(bgr: np.ndarray, p: LaserParams = LaserParams()) -> StripePixels:
-    """Every stripe pixel in the whole frame, with its score. For scanning.
+def find_stripe_pixels(bgr: np.ndarray, p: LaserParams = LaserParams(),
+                       rows: tuple[int, int] | None = None) -> StripePixels:
+    """Every stripe pixel in the frame, with its score. For scanning.
 
     No mask: the subject stands above the board, so most of the stripe that
     matters falls outside the board's outline. Rejecting what is not wanted is
     the other eye's job, then the scan volume's, and both work in millimetres.
+    `rows`, when given, is the band the sheet can appear in at all
+    (`scan.stripe_rows`): only those rows are searched, and the pixels come
+    back in whole-frame coordinates.
     """
     t0 = time.perf_counter()
 
@@ -283,40 +287,146 @@ def find_stripe_pixels(bgr: np.ndarray, p: LaserParams = LaserParams()) -> Strip
     if bgr.ndim != 3 or bgr.shape[2] != 3:
         raise ValueError("the laser is red; this needs a colour frame")
     h, w = bgr.shape[:2]
-    lit = _lit(stripe_score(bgr, p.background_px), p.redness_min, None)
+    y0, y1 = (0, h) if rows is None else (max(0, int(rows[0])), min(h, int(rows[1])))
+    if y1 <= y0:
+        return done(StripePixels(wh=(w, h), reason="the sheet cannot appear in this frame"))
+    lit = _lit(stripe_score(bgr[y0:y1], p.background_px), p.redness_min, None)
     if lit is None:
         return done(StripePixels(wh=(w, h), reason="no stripe above the redness threshold"))
     lit, along_x = lit
     xy = cv2.findNonZero(lit).reshape(-1, 2)
-    return done(StripePixels(x=xy[:, 0].astype(np.int32), y=xy[:, 1].astype(np.int32),
+    return done(StripePixels(x=xy[:, 0].astype(np.int32),
+                             y=(xy[:, 1] + y0).astype(np.int32),
                              w=lit[xy[:, 1], xy[:, 0]], wh=(w, h),
                              along_x=along_x, reason=None))
 
 
-def _centroids(lit: np.ndarray, along_x: bool) -> np.ndarray:
-    """One intensity-weighted centroid per scanline, vectorised over all of them.
+#: Lit pixels this far apart across a scanline are still one run: a stripe
+#: thresholded on colour has the odd one-pixel hole.
+BLOB_GAP_PX = 2
 
-    `lit` is the stripe's redness with everything else zero, from `_lit`.
-    `along_x` scans columns (a roughly horizontal stripe); otherwise rows.
 
-    Only the band of scanlines that hold any stripe is touched, and the sums
-    run through `cv2.reduce`. Measured at 1080p: 4.2 ms per frame against
-    8.5 ms for a full-frame float32 version, centroids identical.
+def stripe_centroids(key: np.ndarray, across: np.ndarray, w: np.ndarray,
+                     width_px: tuple[int, int] = (1, 10 ** 6), fit: bool = True):
+    """Per scanline, where the stripe crosses it, to a fraction of a pixel.
+
+    `key` is each lit pixel's scanline, `across` its position along that
+    scanline, `w` its score. Returns `(scan, pos, n_lines, n_split,
+    n_rejected)`: the scanline index and the sub-pixel position of every
+    scanline that has a run of lit pixels `width_px` wide — the strongest
+    such run, when there are several: a scanline can carry the stripe AND
+    a glint, and the average of both is neither, while a wide dim smear
+    that outscores the stripe fails the width gate and must not take the
+    scanline with it — how many scanlines held any lit pixel, how many
+    held more than one run, and how many had no run of a valid width.
+
+    **The position.** The stripe's profile across the scanline is close to a
+    Gaussian, so with `fit` the run's scores are fitted as one — a weighted
+    quadratic in log(score) — and the position is the vertex. Where the fit
+    has too little to go on (fewer than three samples, a flat top from
+    saturation, a vertex outside the run) the position is the centroid of
+    the scores ABOVE the threshold that lit them, not of the raw scores: the
+    threshold cuts the tails, and weighting by the excess over it is what
+    keeps the cut from pulling the centroid toward the brighter flank.
+    Measured on synthetic profiles with 4 levels of noise (sigma 0.8-1.8
+    px, peaks 120-255): the Gaussian fit 0.026-0.037 px RMS; the excess
+    centroid 0.035-0.081, which beats the raw centroid 1.7x on the wide,
+    saturated profiles the fit hands off and loses to it on the narrow
+    ones the fit almost never hands off.
+
+    Vectorised: pixels sorted by scanline then across, a run breaks where
+    the scanline changes or the gap exceeds `BLOB_GAP_PX`, and every per-run
+    sum — including the fit's normal equations — is a bincount.
     """
-    m = lit if along_x else cv2.transpose(lit)
-    rows = np.flatnonzero(cv2.reduce(m, 1, cv2.REDUCE_MAX).ravel())
-    if not len(rows):
+    empty = np.empty(0, np.float64)
+    if not len(key):
+        return empty, empty, 0, 0, 0
+    order = np.lexsort((across, key))
+    k = np.asarray(key)[order].astype(np.int64)
+    a = np.asarray(across)[order].astype(np.float64)
+    wt = np.asarray(w)[order].astype(np.float64)
+    new = np.ones(len(k), bool)
+    new[1:] = (k[1:] != k[:-1]) | (a[1:] - a[:-1] > BLOB_GAP_PX)
+    blob = np.cumsum(new) - 1
+    nb = int(blob[-1]) + 1
+    b_key = k[new]
+    b_w = np.bincount(blob, weights=wt, minlength=nb)
+    starts = np.flatnonzero(new)
+    ends = np.append(starts[1:], len(k)) - 1
+    b_lo, b_hi = a[starts], a[ends]
+    lines, line_of = np.unique(b_key, return_inverse=True)
+    n_split = int((np.bincount(line_of) > 1).sum())
+    # The width gate first, then the strongest run among those that pass
+    # it: a wide dim smear the right eye happened to confirm can outscore
+    # the stripe on its scanline, and must not take the scanline with it.
+    lo, hi = width_px
+    width = b_hi - b_lo + 1.0
+    valid = (width >= lo) & (width <= hi)
+    lines_with_valid = np.zeros(len(lines), bool)
+    lines_with_valid[line_of[valid]] = True
+    n_rejected = int((~lines_with_valid).sum())
+    cand = np.flatnonzero(valid)
+    by_strength = cand[np.lexsort((-b_w[cand], line_of[cand]))]
+    first = np.ones(len(by_strength), bool)
+    first[1:] = line_of[by_strength][1:] != line_of[by_strength][:-1]
+    chosen = by_strength[first]
+
+    # The excess centroid, always available. Below three samples there is no
+    # truncated profile to correct for, and the plain centroid is exact on a
+    # two-pixel split; from three on, the excess over the run's floor is
+    # what keeps the threshold's cut from pulling toward the brighter flank.
+    n_samples = np.bincount(blob, minlength=nb)
+    floor = np.full(nb, np.inf)            # a minimum starts from above
+    np.minimum.at(floor, blob, wt)
+    excess = np.where(n_samples[blob] >= 3, wt - floor[blob] + 1.0, wt)
+    e_sum = np.bincount(blob, weights=excess, minlength=nb)
+    e_mom = np.bincount(blob, weights=excess * a, minlength=nb)
+    centre_of = e_mom / e_sum                # every run has weight: excess >= 1
+    pos = centre_of[chosen]
+
+    if fit and len(chosen):
+        # Weighted least squares of log(score) = c2 x² + c1 x + c0 per run,
+        # about the run's own centroid for conditioning; the vertex is
+        # -c1 / 2c2 when the parabola opens down and lands inside the run.
+        x = a - centre_of[blob]
+        y = np.log(np.maximum(wt, 1.0))
+        s = [np.bincount(blob, weights=wt * x ** p, minlength=nb) for p in range(5)]
+        sy = [np.bincount(blob, weights=wt * y * x ** p, minlength=nb) for p in range(3)]
+        A = np.stack([np.stack([s[4], s[3], s[2]], -1), np.stack([s[3], s[2], s[1]], -1),
+                      np.stack([s[2], s[1], s[0]], -1)], -2)[chosen]
+        rhs = np.stack([sy[2], sy[1], sy[0]], -1)[chosen]
+        # Only runs with three samples and a well-posed system are solved,
+        # so one degenerate run cannot fail the batch and drop every
+        # scanline of the frame to the centroid at once.
+        ok = (n_samples[chosen] >= 3) & (np.abs(np.linalg.det(A)) > 1e-9 * np.maximum(s[0][chosen], 1.0) ** 3)
+        coef = np.full((len(chosen), 3), np.nan)
+        if ok.any():
+            try:
+                coef[ok] = np.linalg.solve(A[ok], rhs[ok][..., None])[..., 0]
+            except np.linalg.LinAlgError:
+                pass
+        c2, c1 = coef[:, 0], coef[:, 1]
+        vertex = np.where(c2 < 0, -c1 / (2.0 * np.where(c2 < 0, c2, -1.0)), np.nan)
+        fitted = centre_of[chosen] + vertex
+        inside = np.isfinite(fitted) & (fitted >= b_lo[chosen] - 0.5) & (fitted <= b_hi[chosen] + 0.5)
+        pos = np.where(inside, fitted, pos)
+
+    scan = b_key[chosen].astype(np.float64)
+    return scan, pos, int(len(lines)), n_split, n_rejected
+
+
+def _centroids(lit: np.ndarray, along_x: bool) -> np.ndarray:
+    """One sub-pixel stripe position per scanline — `stripe_centroids` over
+    the lit pixels, columns as scanlines for a roughly horizontal stripe."""
+    xy = cv2.findNonZero(lit)
+    if xy is None:
         return np.empty((0, 2), np.float32)
-    y0, y1 = int(rows[0]), int(rows[-1]) + 1
-    band = m[y0:y1].astype(np.float32)
-    total = cv2.reduce(band, 0, cv2.REDUCE_SUM).ravel()
-    band *= np.arange(y0, y1, dtype=np.float32)[:, None]
-    moment = cv2.reduce(band, 0, cv2.REDUCE_SUM).ravel()
-    live = total > 0
-    scan = np.flatnonzero(live).astype(np.float32)
-    across = moment[live] / total[live]
-    return (np.stack([scan, across], 1) if along_x
-            else np.stack([across, scan], 1)).astype(np.float32)
+    xy = xy.reshape(-1, 2)
+    x, y = xy[:, 0], xy[:, 1]
+    w = lit[y, x]
+    scan, pos, _, _, _ = stripe_centroids(x if along_x else y, y if along_x else x, w)
+    return (np.stack([scan, pos], 1) if along_x
+            else np.stack([pos, scan], 1)).astype(np.float32)
 
 
 def _fit_tls(pts: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:

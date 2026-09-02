@@ -242,7 +242,8 @@ def _coerce_intrinsics(v: Any) -> dict[str, Any] | None:
         raise CommandError("intrinsics fx/fy must be positive")
     # Provenance — how good the solve was and how many views it used. Carried
     # so a later reader can judge the numbers instead of trusting them blindly.
-    for key, cast in (("rms_px", float), ("views", int), ("solved_at", str)):
+    for key, cast in (("rms_px", float), ("views", int), ("solved_at", str),
+                      ("sigma_f", float)):
         if key in v and v[key] is not None:
             try:
                 out[key] = cast(v[key])

@@ -1,32 +1,33 @@
-"""Calibration capture: collect ChArUco views, solve per-eye intrinsics, store.
+"""Calibration panel: one switch, and the board does the rest.
 
-The operator moves the board; this panel decides which of those views are worth
-keeping, says out loud when the set is still degenerate, and refuses to solve
-from one that is.
+The operator moves the board; `calibflow.CalibrationFlow` decides what each
+frame is good for — a still view, a pair, a stripe across the board, a brisk
+twist for the readout — and solves in the background as the sets grow. This
+panel shows the sets, the solves and the one line that matters: what to do
+with the board next. Improvements go to the server on their own.
 
 The guidance is the point. `calibrateCamera` returns a confident answer from a
 set of head-on views and that answer can be 12% wrong in focal length with a
 reprojection RMS indistinguishable from a good solve — measured, see
 `intrinsics.MIN_TILT_SPREAD`. Nothing in the result reveals it. So the tilt
 spread and the frame coverage are shown live, while the operator can still act
-on them, rather than reported afterwards when the only remedy is to start over.
+on them, and the advice line names the weakest link.
 
-Views are captured in PAIRS, matched on camserver's capture clock. Both cameras
-are timed by that same clock on that machine, so it is what says two frames are
-simultaneous — our own arrival times came through two different sockets and are
-not comparable. Intrinsics do not need the pairing; `stereoCalibrate` does, and
-it would be a waste of the operator's time to sweep the board twice.
+Solves run on a thread of their own and hand their outcome back through a
+one-slot mailbox the panel's timer drains, the way frames reach the GUI:
+nothing per frame goes through a queued signal, and the window never waits on
+`calibrateCamera`.
 """
 
 from __future__ import annotations
 
 import logging
-from collections import deque
-from dataclasses import dataclass
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -39,66 +40,28 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .calibflow import CalibrationFlow, Job, Outcome
+from .config import RigConfig
 from .cvcore import build_board
-from .intrinsics import (
-    MIN_TILT_SPREAD,
-    MIN_VIEWS,
-    EyeView,
-    PairSample,
-    SampleSet,
-    SolveResult,
-)
-from .intrinsics import solve as solve_intrinsics
-from .laserplane import LaserPlane, PlaneCollector
-from .rolling import MotionView, Readout, solve_readout
-from .stereo import StereoResult
-from .stereo import calibrate as solve_stereo
-from .worker import EyeResult
+from .intrinsics import MIN_TILT_SPREAD
+from .laserplane import from_config as plane_from_config
+from .worker import EyeResult, Latest
 
 log = logging.getLogger("orbiter_native.calibpanel")
-
-#: Two frames count as simultaneous within this much of camserver's capture
-#: clock — the one clock that times both cameras, which holds the pair to about
-#: 0.05 ms. Well under the ~33 ms frame interval, so it still names one frame.
-#:
-#: Tightened from 10 ms after the pair measured a median gap of 3.75 ms in
-#: practice: camserver reports the pair as free-running rather than held, and a
-#: hand-held board keeps moving during that gap, so the two eyes see it in
-#: slightly different places. That is a floor on the stereo residual no
-#: calibration can lift. Views still carry their capture instants, so
-#: `SampleSet.pair_gaps_ms` can show whether this is what is limiting a set.
-_PAIR_WINDOW_S = 0.004
-
-#: How many recent results to keep per eye while looking for a partner frame.
-#:
-#: Requiring the two NEWEST results to be simultaneous does not work, and the
-#: reason is worth stating: camserver's synchrony is a property of the CAMERAS,
-#: while what arrives here is whatever each detector thread last finished.
-#: Detection takes 13-20 ms and the two threads drift independently. Measured
-#: on this rig over 269 attempts, the newest left and newest right results were
-#: a median 144 ms apart and 496 ms at the 90th percentile — four or more
-#: frames — so 238 attempts were rejected and nothing was ever captured. The
-#: frames were perfectly paired; only our view of them was skewed. At ~30 fps
-#: this buffer spans about half a second, covering that p90.
-_PAIR_HISTORY = 16
-
-#: The board must be this still before a view is captured, measured as median
-#: corner movement between consecutive detections. Motion blur rounds corners
-#: off and quietly biases the solve.
-_STILL_PX = 1.0
-
-#: Frames per eye the readout solve collects before solving on its own.
-#: Five seconds of twisting the board; the solve wants motion, not variety.
-_READOUT_FRAMES = 150
-#: A frame is worth feeding the readout solve from this many corners: the
-#: pose has to be sound before its slide across the rows can be measured.
-_READOUT_MIN_CORNERS = 12
 
 #: Captured views live here between runs. A board sweep costs the operator
 #: minutes, and losing it to a restart also loses the SIMULTANEOUS views that
 #: stereoCalibrate needs — a session that solved intrinsics and then restarted
 #: could not solve the pair at all without sweeping again.
 SAMPLES_PATH = Path.home() / ".orbiter-native" / "calib-views.npz"
+
+#: How often the panel drains the solve mailbox and asks whether a cycle is due.
+_TICK_MS = 400
+
+
+def _ema(prev: float | None, value: float, alpha: float = 0.2) -> float:
+    """A slow average of a live figure, so the big number does not jitter."""
+    return value if prev is None else prev + alpha * (value - prev)
 
 
 class CoverageMap(QWidget):
@@ -132,40 +95,29 @@ class CoverageMap(QWidget):
 
 
 class CalibrationPanel(QFrame):
-    """Capture controls, live diversity guidance, and the solve."""
+    """The switch, the sets, the scoreboard, the advice."""
 
-    #: Emitted when the operator saves: `{side: {"intrinsics": ..., "readout":
-    #: ...}}` with only the solved keys, plus `_extrinsics` / `_laser_plane`.
+    #: Emitted with what to store: `{side: {"intrinsics": ..., "readout": ...}}`
+    #: with only the solved keys, plus `_extrinsics` / `_laser_plane`.
     save_requested = Signal(dict)
+    #: Calibrating wants the stripe detected; the window owns that switch.
+    laser_requested = Signal(bool)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("panel")   # see the stylesheet in __main__
         self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.samples = SampleSet()
-        self._board = None
-        self._board_spec = None
-        self._recent: dict[str, deque] = {"left": deque(maxlen=_PAIR_HISTORY),
-                                          "right": deque(maxlen=_PAIR_HISTORY)}
-        self._last_corners: dict[str, np.ndarray] = {}
-        self._results: dict[str, SolveResult] = {}
-        self._stereo: StereoResult | None = None
-        self._plane: LaserPlane | None = None
-        # Corners under motion for the rolling-shutter solve, and its result.
-        self._motion: dict[str, list[MotionView]] = {"left": [], "right": []}
-        self._readout: dict[str, Readout] = {}
-        # Stripe-on-board samples, gathered live whenever the laser is on
-        # and the board's pose is known. Nothing else needs to be aimed or
-        # measured: the board already tells us where those points are in 3D.
-        self._plane_pts = PlaneCollector()
-        #: Whether the stripe detector is running. Collection is silent
-        #: without it, so the panel has to be able to say which of the two
-        #: 'no laser' cases it is looking at.
-        self._laser_active = False
-        #: Intrinsics currently known for each eye — from a fresh solve here,
-        #: or from the server when a previous run already stored them.
-        self._known_k: dict[str, object] = {}
+        self.flow = CalibrationFlow()
         self._samples_path = SAMPLES_PATH
+        self._outcome = Latest()
+        self._thread: threading.Thread | None = None
+        self._activity = ""
+        self._solving_since: float | None = None
+        # Live inputs to the error budget, smoothed: how far the board is
+        # from the left eye, and how noisy the stripe's centroid is across
+        # the stripe, from the calibration-mode line fits.
+        self._z_mm: float | None = None
+        self._stripe_px: float | None = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 8, 10, 10)
@@ -176,30 +128,66 @@ class CalibrationPanel(QFrame):
             "color:#7cc4ff; font-weight:600; letter-spacing:2px; font-size:12px;")
         root.addWidget(title)
 
-        self.auto = QCheckBox("auto-capture new views")
+        # The one number: what a scanned point is expected to be off by,
+        # with this calibration, at the distance the board is now.
+        self.error_big = QLabel("—")
+        self.error_big.setStyleSheet(
+            "color:#8b9aac; font-family:Consolas; font-size:30px; font-weight:600;")
+        self.error_big.setToolTip(
+            "Expected one-sigma error of a scanned point, in mm, from this "
+            "calibration: the stripe centroid's noise through the laser sheet, "
+            "the sheet's own residual, the focal length's uncertainty over the "
+            "scan volume, and the rolling shutter while it is unmeasured. Added "
+            "in quadrature. Keep calibrating and watch it fall."
+        )
+        root.addWidget(self.error_big)
+        self.error_terms = QLabel("expected point error — needs the left camera "
+                                  "matrix and the laser sheet")
+        self.error_terms.setWordWrap(True)
+        self.error_terms.setStyleSheet(
+            "color:#8b9aac; font-family:Consolas; font-size:11px;")
+        root.addWidget(self.error_terms)
+
+        self.auto = QCheckBox("calibrate continuously")
         self.auto.setToolTip(
-            "Capture whenever the board is still and shows the solve something "
-            "it has not seen — a new place in the frame, a new distance or a "
-            "new tilt. Near-duplicates are skipped: twenty of the same view are "
-            "worth less than six different ones."
+            "Move the board about. A still board showing something new becomes a "
+            "view (both eyes at once: a pair); the stripe straight across a still "
+            "board feeds the laser plane; a brisk twist feeds the readout time. "
+            "Everything is solved again in the background as the sets grow, from "
+            "the raw corners through the best intrinsics so far."
         )
         self.auto.setChecked(True)
+        self.auto.toggled.connect(self._on_auto)
         root.addWidget(self.auto)
+
+        self.autosave = QCheckBox("save improvements to the server")
+        self.autosave.setToolTip(
+            "A solve replaces what the server holds only when it has more data "
+            "at a residual no worse than a little, or a lower residual."
+        )
+        self.autosave.setChecked(True)
+        root.addWidget(self.autosave)
 
         row = QHBoxLayout()
         self.btn_capture = QPushButton("Capture")
-        self.btn_capture.clicked.connect(lambda: self._capture(force=True))
+        self.btn_capture.setToolTip("Take whatever both eyes see now, still or not.")
+        self.btn_capture.clicked.connect(self._capture)
+        self.btn_solve = QPushButton("Solve now")
+        self.btn_solve.clicked.connect(self._solve_now)
+        self.btn_save = QPushButton("Save now")
+        self.btn_save.setToolTip("Send every current solve to the server, better or not.")
+        self.btn_save.clicked.connect(self._save_all)
         self.btn_clear = QPushButton("Clear")
         self.btn_clear.clicked.connect(self._clear)
-        row.addWidget(self.btn_capture)
-        row.addWidget(self.btn_clear)
+        for b in (self.btn_capture, self.btn_solve, self.btn_save, self.btn_clear):
+            row.addWidget(b)
         root.addLayout(row)
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(10)
         self._stat_labels: dict[str, QLabel] = {}
         for r, key in enumerate(("views", "paired", "tilt", "novelty",
-                                 "laser pts")):
+                                 "laser pts", "motion")):
             name = QLabel(key)
             name.setStyleSheet("color:#8b9aac; font-size:11px;")
             val = QLabel("—")
@@ -221,481 +209,226 @@ class CalibrationPanel(QFrame):
             cov.addLayout(box)
         root.addLayout(cov)
 
-        self.btn_solve = QPushButton("Solve intrinsics")
-        self.btn_solve.clicked.connect(self._solve)
-        root.addWidget(self.btn_solve)
+        self.scoreboard = QLabel("—")
+        self.scoreboard.setStyleSheet(
+            "color:#dde5ee; font-family:Consolas; font-size:11px;")
+        root.addWidget(self.scoreboard)
 
-        self.btn_stereo = QPushButton("Solve stereo pair")
-        self.btn_stereo.setToolTip(
-            "Needs intrinsics for both eyes and views where BOTH saw the board "
-            "at the same instant. Gives the real baseline and the geometry "
-            "triangulation runs on."
-        )
-        self.btn_stereo.clicked.connect(self._solve_stereo)
-        root.addWidget(self.btn_stereo)
+        self.advice = QLabel("waiting for the board")
+        self.advice.setWordWrap(True)
+        self.advice.setStyleSheet(
+            "color:#ffd166; font-family:Consolas; font-size:11px;")
+        root.addWidget(self.advice)
 
-        self.btn_plane = QPushButton("Solve laser plane")
-        self.btn_plane.setToolTip(
-            "Fit the sheet the laser projects, from where it crosses the board. "
-            "Needs the laser detector on and per-eye intrinsics. Gives the only "
-            "independent check on a scanned point, and lets one camera alone "
-            "produce points where the other cannot see the stripe."
-        )
-        self.btn_plane.clicked.connect(self._solve_plane)
-        root.addWidget(self.btn_plane)
-
-        self.btn_readout = QPushButton("Measure readout")
-        self.btn_readout.setCheckable(True)
-        self.btn_readout.setToolTip(
-            "The sensor's rolling-shutter readout time, from the board in "
-            "motion. While this is down, twist and tilt the board briskly in "
-            "front of both eyes; it solves on its own after "
-            f"{_READOUT_FRAMES} frames per eye. Needs per-eye intrinsics. "
-            "With it, scanning takes every point into the board's frame at "
-            "its own row's instant instead of the corners'."
-        )
-        self.btn_readout.toggled.connect(self._toggle_readout)
-        root.addWidget(self.btn_readout)
-
-        self.btn_save = QPushButton("Save to server")
-        self.btn_save.setEnabled(False)
-        self.btn_save.clicked.connect(self._save)
-        root.addWidget(self.btn_save)
-
-        self.report = QLabel("move the board around, tilting it between shots")
+        self.report = QLabel("")
         self.report.setWordWrap(True)
         self.report.setStyleSheet(
             "color:#8b9aac; font-family:Consolas; font-size:11px;")
         root.addWidget(self.report)
         root.addStretch(1)
 
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(_TICK_MS)
+
     # ── config ────────────────────────────────────────────────────────────
 
-    @property
-    def _left_k(self):
-        return self._known_k.get("left")
-
     def set_laser_active(self, on: bool) -> None:
-        self._laser_active = on
+        self.flow.laser_active = on
 
-    def set_intrinsics(self, side: str, k) -> None:
-        """Adopt intrinsics the server already holds, so the stereo solve does
-        not require re-running the per-eye one in this session."""
-        if k is not None:
-            self._known_k.setdefault(side, k)
-
-    def set_board_spec(self, spec) -> None:
-        """Adopt the board spec from the server. Captured views are dropped on
-        a change: they were measured against a different board and mixing the
-        two would solve for a geometry that never existed."""
-        if spec == self._board_spec:
-            return
-        had = len(self.samples)
-        self._board_spec = spec
-        self._board = build_board(spec) if spec is not None else None
-        if had:
-            self._clear()
-            self.report.setText("board spec changed — captured views discarded")
-        elif self._board is not None:
+    def set_config(self, cfg: RigConfig) -> None:
+        """Adopt the server's board and whatever it already holds: intrinsics
+        to solve the rest through, and the strength of each stored figure, so
+        a challenger has to beat it."""
+        flow = self.flow
+        board = build_board(cfg.board) if cfg.board is not None else None
+        if flow.set_board(cfg.board, board):
+            self.report.setText("board spec changed — captured sets discarded")
+            self._persist()
+        elif board is not None and not len(flow.samples) and not flow.results:
             # First board spec of the session: pick up whatever the last run
             # captured, so a restart does not cost another sweep.
-            n = self.samples.load(self._samples_path, self._board)
+            n = flow.samples.load(self._samples_path, board)
             if n:
                 self.report.setText(f"loaded {n} views from the previous run "
-                                    f"({len(self.samples.paired())} paired)")
-                self._refresh_counters()
+                                    f"({len(flow.samples.paired())} paired)")
+        for side in ("left", "right"):
+            eye = getattr(cfg, side)
+            if eye is None:
+                continue
+            flow.set_known_intrinsics(side, eye.intrinsics_for(None), eye.intrinsics_raw)
+            r = eye.readout_raw or {}
+            if isinstance(r, dict) and "seconds" in r:
+                flow.set_stored(f"readout:{side}", int(r.get("views", 0) or 0),
+                                float(r.get("sigma_s", float("nan")) or float("nan")))
+        x = cfg.extrinsics_raw or {}
+        if "R" in x:
+            flow.set_stored("stereo", int(x.get("views", 0) or 0),
+                            float(x.get("rms_px", float("nan")) or float("nan")))
+        p = cfg.laser_plane_raw or {}
+        if "n" in p:
+            flow.set_stored("plane", int(p.get("frames", 0) or 0),
+                            float(p.get("rms_mm", float("nan")) or float("nan")))
+            if flow.stored_plane is None:
+                flow.stored_plane = plane_from_config(p, None)
+        self._refresh()
 
     # ── live feed ─────────────────────────────────────────────────────────
 
     def on_result(self, res: EyeResult) -> None:
-        """Take one eye's result and, when a partner frame exists, capture.
-
-        The plane collector is fed first but must never gate what follows:
-        it has its own preconditions (left eye, intrinsics, laser on, a board
-        pose), and view capture has none of them. An earlier edit left the
-        history append, the live refresh and auto-capture inside the
-        collector's early returns, so with no intrinsics yet — exactly the
-        state at the start of every calibration — nothing ever captured.
-        """
-        self._collect_plane(res)
-        if self.btn_readout.isChecked():
-            self._collect_motion(res)
-        self._still(res)                 # keep the stillness history current
-        if res.board is not None and res.board.corners is not None:
-            self._recent[res.side].append(res)
+        if res.side == "left":
+            board = res.board
+            if board is not None and board.t is not None and float(board.t[2]) > 0:
+                self._z_mm = _ema(self._z_mm, float(board.t[2]))
+            if res.laser is not None and res.laser.ok and np.isfinite(res.laser.rms_px):
+                self._stripe_px = _ema(self._stripe_px, float(res.laser.rms_px))
+        note = self.flow.offer(res, auto=self.auto.isChecked())
+        if note:
+            self._activity = note
+            if "view" in note:
+                self._persist()
         self._refresh_live(res)
-        if self.auto.isChecked():
-            self._capture(force=False)
-
-    def _collect_plane(self, res: EyeResult) -> None:
-        """Bank stripe-on-board points from the LEFT eye.
-
-        Left only: the plane is expressed in that camera's frame, which is the
-        frame the scan works in, and mixing the right eye's points would need
-        the pair extrinsics to be already solved and correct.
-        """
-        if res.side != "left" or self._left_k is None:
-            return
-        line = res.laser
-        board = res.board
-        if (line is None or not line.ok or board is None
-                or board.R is None or board.t is None):
-            return
-        self._plane_pts.add_frame(line.inlier_points, self._left_k,
-                                  board.R, board.t, line.rms_px)
-
-    def _collect_motion(self, res: EyeResult) -> None:
-        """Bank this frame's corners for the readout solve. Every frame with
-        a sound board, moving or not — the solve measures motion itself."""
-        board = res.board
-        if (board is None or board.corners is None or board.ids is None
-                or board.count < _READOUT_MIN_CORNERS or res.capture_mono is None):
-            return
-        views = self._motion[res.side]
-        if len(views) >= _READOUT_FRAMES:
-            return
-        views.append(MotionView(np.array(board.corners, np.float32),
-                                np.array(board.ids, np.int32), res.capture_mono, res.wh))
-        nl, nr = len(self._motion["left"]), len(self._motion["right"])
-        self.report.setText(f"readout: L {nl}/{_READOUT_FRAMES}  R {nr}/{_READOUT_FRAMES} "
-                            "— twist and tilt the board briskly")
-        if nl >= _READOUT_FRAMES and nr >= _READOUT_FRAMES:
-            self.btn_readout.setChecked(False)       # solves, see _toggle_readout
-
-    def _toggle_readout(self, on: bool) -> None:
-        if on:
-            missing = [s for s in ("left", "right") if s not in self._known_k]
-            if missing:
-                self.btn_readout.setChecked(False)
-                self.report.setText(
-                    f"readout needs intrinsics for {', '.join(missing)} — solve those "
-                    "first, or load a calibration the server already has")
-                return
-            for v in self._motion.values():
-                v.clear()
-            self.report.setText("readout: twist and tilt the board briskly in front "
-                                "of both eyes — it solves on its own")
-            return
-        self._solve_readout()
-
-    def _solve_readout(self) -> None:
-        if self._board is None:
-            self.report.setText("no board spec from the server")
-            return
-        lines: list[str] = []
-        for side in ("left", "right"):
-            views, k = self._motion[side], self._known_k.get(side)
-            if not views or k is None:
-                lines.append(f"{side}: nothing collected")
-                continue
-            r, why = solve_readout(views, self._board, k)
-            if r is None:
-                self._readout.pop(side, None)
-                lines.append(f"{side}: {why}")
-                continue
-            self._readout[side] = r
-            lines.append(
-                f"{side}: readout {r.seconds * 1000:+.2f} ± {r.sigma_s * 1000:.2f} ms "
-                f"@ {r.width}x{r.height}\n"
-                f"  over {r.views} frames, {why}, skew {r.skew_px:.1f} px")
-        both = [self._readout.get(s) for s in ("left", "right")]
-        if all(r is not None for r in both):
-            # Same sensor model on both eyes: the two figures cross-check each
-            # other, sign included.
-            a, b = both
-            lines.append("  the two eyes agree" if abs(a.seconds - b.seconds) <= 0.1 * abs(a.seconds)
-                         else "  the two eyes DISAGREE by more than 10% — measure again")
-        self.report.setText("\n".join(lines))
-        self.btn_save.setEnabled(bool(self._readout) or bool(self._results)
-                                 or self._stereo is not None or self._plane is not None)
-
-    def _find_pair(self):
-        """The closest-in-capture-time result from each eye, if they pair up.
-
-        Searches the recent history rather than comparing only the newest of
-        each — see `_PAIR_HISTORY` for why the newest two are usually from
-        different frames.
-        """
-        left, right = self._recent["left"], self._recent["right"]
-        if not left or not right:
-            # No partner to pair with. Deliberately NOT falling back to "take
-            # whichever eye has something": the history is cleared after every
-            # capture, so the next result to arrive would always find the other
-            # side empty and be stored as a one-eyed view. Every sample came out
-            # unpaired that way, and stereoCalibrate needs the paired ones.
-            return None, None
-        best = None
-        for a in left:
-            if a.capture_mono is None:
-                continue
-            for b in right:
-                if b.capture_mono is None:
-                    continue
-                gap = abs(a.capture_mono - b.capture_mono)
-                if best is None or gap < best[0]:
-                    best = (gap, a, b)
-        if best is None or best[0] > _PAIR_WINDOW_S:
-            return None, None
-        return best[1], best[2]
-
-    def _still(self, res: EyeResult) -> bool:
-        """True when the board has barely moved since the previous detection.
-
-        Compared by corner ID, not by position in the list. The corner COUNT
-        flickers frame to frame as marginal corners drop in and out — measured
-        here across a live run — and treating a changed count as motion would
-        block capture for no reason.
-        """
-        if res.board is None or res.board.corners is None or res.board.ids is None:
-            return False
-        cur = res.board.corners.reshape(-1, 2)
-        cur_ids = res.board.ids.ravel()
-        prev = self._last_corners.get(res.side)
-        self._last_corners[res.side] = (cur_ids, cur)
-        if prev is None:
-            return False
-        prev_ids, prev_pts = prev
-        common = np.intersect1d(prev_ids, cur_ids)
-        if len(common) < 4:
-            return False
-        a = prev_pts[np.isin(prev_ids, common)]
-        b = cur[np.isin(cur_ids, common)]
-        # np.isin preserves each array's own order, and both id arrays are
-        # sorted ascending by the detector, so the two selections correspond.
-        return float(np.median(np.linalg.norm(b - a, axis=1))) <= _STILL_PX
 
     def _refresh_live(self, res: EyeResult) -> None:
-        left = self._recent["left"][-1] if self._recent["left"] else None
-        right = self._recent["right"][-1] if self._recent["right"] else None
-        nov = max(
-            self.samples.novelty("left", left.descriptor if left else None),
-            self.samples.novelty("right", right.descriptor if right else None),
-        )
+        flow = self.flow
+        nov = flow.samples.novelty(res.side, res.descriptor)
         self._stat_labels["novelty"].setText(
             "—" if not np.isfinite(nov) else f"{nov:.3f}")
-        if not self._laser_active:
+        if not flow.laser_active:
             self._stat_labels["laser pts"].setText("detector off")
         else:
-            sk = self._plane_pts.skipped
+            sk = flow.plane.skipped
             self._stat_labels["laser pts"].setText(
-                f"{len(self._plane_pts)} / {self._plane_pts.frames}f"
+                f"{len(flow.plane)} / {flow.plane.frames}f"
                 + (f"  (moving {sk['moving']})" if sk["moving"] else ""))
-        self._stat_labels["views"].setText(str(len(self.samples)))
-        self._stat_labels["paired"].setText(str(len(self.samples.paired())))
+        self._stat_labels["motion"].setText(
+            f"L {flow.motion.count('left')}  R {flow.motion.count('right')} frames")
+        self._refresh()
+
+    def _refresh(self) -> None:
+        flow = self.flow
+        self._stat_labels["views"].setText(str(len(flow.samples)))
+        self._stat_labels["paired"].setText(str(len(flow.samples.paired())))
         # Per eye, named. The two cameras see the board from different angles,
-        # so a tilt that is rich for one can be near flat for the other — an
-        # operator shown only the worst figure kept tilting for the eye that
-        # was already fine while the other stayed 0.3 short of the gate.
-        tl, tr = (self.samples.tilt_spread(s) for s in ("left", "right"))
+        # so a tilt that is rich for one can be near flat for the other.
+        tl, tr = (flow.samples.tilt_spread(s) for s in ("left", "right"))
         short = [n for n, v in (("L", tl), ("R", tr)) if v < MIN_TILT_SPREAD]
         self._stat_labels["tilt"].setText(
             f"L {tl:.1f}  R {tr:.1f}  / {MIN_TILT_SPREAD:.0f}"
             + ("  ✓" if not short else f"  tilt more for {'+'.join(short)}"))
         for side in ("left", "right"):
-            self.coverage[side].set_cells(self.samples.coverage(side))
+            self.coverage[side].set_cells(flow.samples.coverage(side))
+        self._refresh_error()
+        self.scoreboard.setText("\n".join(flow.scoreboard()))
+        self.advice.setText(flow.advice() if flow.board is not None
+                            else "no board spec from the server")
+        status = self._activity
+        if self._solving_since is not None:
+            status = f"solving… {time.monotonic() - self._solving_since:.0f} s" \
+                     + (f"   ({self._activity})" if self._activity else "")
+        self.report.setText(status)
 
-    # ── capture ───────────────────────────────────────────────────────────
-
-    def _capture(self, force: bool) -> None:
-        if self._board is None:
+    def _refresh_error(self) -> None:
+        b = self.flow.expected_error(self._z_mm, self._stripe_px)
+        if b is None:
+            self.error_big.setText("—")
+            self.error_big.setStyleSheet(
+                "color:#8b9aac; font-family:Consolas; font-size:30px; font-weight:600;")
+            self.error_terms.setText("expected point error — needs the left camera "
+                                     "matrix and the laser sheet")
             return
-        left, right = self._find_pair()
-        if left is None or right is None:
-            if not force:
-                return
-            # Manual capture takes whatever is there — the operator asked.
-            left = left or (self._recent["left"][-1] if self._recent["left"] else None)
-            right = right or (self._recent["right"][-1] if self._recent["right"] else None)
-            if left is None and right is None:
-                return
+        total = b.total_mm
+        colour = "#5fd38d" if total <= 0.5 else "#ffd166" if total <= 1.5 else "#ff6b6b"
+        self.error_big.setText(f"≈ {total:.2f} mm")
+        self.error_big.setStyleSheet(
+            f"color:{colour}; font-family:Consolas; font-size:30px; font-weight:600;")
+        lines = [f"expected point error @ {b.z_mm:.0f} mm, stripe {b.stripe_px:.2f} px",
+                 f"stripe {b.stripe_mm:.2f} · sheet {b.sheet_mm:.2f} · "
+                 f"scale {b.scale_mm:.2f} · shutter {b.shutter_mm:.2f} mm"]
+        if b.assumed:
+            lines.append("assumed: " + ", ".join(b.assumed))
+        self.error_terms.setText("\n".join(lines))
 
-        views = {"left": None, "right": None}
-        for side, r in (("left", left), ("right", right)):
-            if (r is None or r.board is None or r.board.corners is None
-                    or r.descriptor is None):
-                continue
-            if not force and not self._still(r):
-                return
-            views[side] = EyeView(r.board.corners, r.board.ids, r.wh,
-                                  r.descriptor, capture_mono=r.capture_mono)
+    # ── the cycle ─────────────────────────────────────────────────────────
 
-        if views["left"] is None and views["right"] is None:
-            return
-        if not force and not self.samples.is_new(
-            views["left"].descriptor if views["left"] else None,
-            views["right"].descriptor if views["right"] else None,
-        ):
-            return
+    def _tick(self) -> None:
+        now = time.monotonic()
+        out = self._outcome.take(0.0)
+        if out is not None:
+            self._finish(out, now)
+        if self.auto.isChecked() and self.flow.due(now):
+            self._start_cycle(now)
 
-        self.samples.add(PairSample(left=views["left"], right=views["right"]))
-        # Consumed: drop the history so the same frames cannot be captured
-        # again while the operator holds the board still.
-        for q in self._recent.values():
-            q.clear()
-        self._persist()
-        self.report.setText(f"captured view {len(self.samples)}")
+    def _start_cycle(self, now: float) -> None:
+        job = self.flow.snapshot(now)
+        self._solving_since = now
 
-    def _persist(self) -> None:
-        """Keep the captured set on disk. A failure here must not stop capture."""
-        try:
-            self.samples.save(self._samples_path)
-        except OSError as exc:
-            log.warning("could not persist captured views: %s", exc)
+        def work(job: Job = job) -> None:
+            try:
+                self._outcome.put(self.flow.run(job))
+            except Exception as exc:                          # noqa: BLE001
+                log.exception("calibration cycle raised")
+                self._outcome.put(Outcome(reasons={"cycle": f"{exc.__class__.__name__}: {exc}"}))
 
-    def _refresh_counters(self) -> None:
-        self._stat_labels["views"].setText(str(len(self.samples)))
-        self._stat_labels["paired"].setText(str(len(self.samples.paired())))
-        for s in ("left", "right"):
-            self.coverage[s].set_cells(self.samples.coverage(s))
+        self._thread = threading.Thread(target=work, name="calib-solve", daemon=True)
+        self._thread.start()
+        self._refresh()
+
+    def _finish(self, out: Outcome, now: float) -> None:
+        self._solving_since = None
+        payload = self.flow.finish(out, now)
+        if "cycle" in out.reasons:
+            self._activity = f"solve failed: {out.reasons['cycle']}"
+        else:
+            solved = ", ".join(k for k in out.results)
+            self._activity = (f"cycle {out.seconds:.1f} s: {solved or 'nothing solved'}"
+                              + (" — saving" if payload and self.autosave.isChecked() else ""))
+        if payload and self.autosave.isChecked():
+            self.save_requested.emit(payload)
+        self._refresh()
+
+    # ── actions ───────────────────────────────────────────────────────────
+
+    def _on_auto(self, on: bool) -> None:
+        if on:
+            self.laser_requested.emit(True)
+        self._refresh()
+
+    def _capture(self) -> None:
+        n = self.flow.capture()
+        self._activity = f"captured view {n}" if n else "nothing to capture — no board in view"
+        if n:
+            self._persist()
+        self._refresh()
+
+    def _solve_now(self) -> None:
+        if self.flow.running:
+            self._activity = "a cycle is already running"
+        elif self.flow.board is None:
+            self._activity = "no board spec from the server"
+        else:
+            self.flow.request()
+            self._start_cycle(time.monotonic())
+        self._refresh()
+
+    def _save_all(self) -> None:
+        payload = self.flow.payload_current()
+        if not payload:
+            self._activity = "nothing solved yet"
+        else:
+            self.save_requested.emit(payload)
+            self._activity = "sent every current solve to the server"
+        self._refresh()
 
     def _clear(self) -> None:
-        self.samples.clear()
-        self._results.clear()
-        self._stereo = None
-        self._plane = None
-        self._readout.clear()
-        for v in self._motion.values():
-            v.clear()
-        self._plane_pts.clear()
-        self.btn_save.setEnabled(False)
+        self.flow.clear()
         self._persist()
-        self.report.setText("cleared")
+        self._activity = "cleared"
+        self._refresh()
 
-    # ── solve ─────────────────────────────────────────────────────────────
-
-    def _solve(self) -> None:
-        if self._board is None:
-            self.report.setText("no board spec from the server")
-            return
-        self._results.clear()
-        self._extra: list[str] = []
-        lines: list[str] = []
-        for side in ("left", "right"):
-            views = self.samples.views(side)
-            if len(views) < MIN_VIEWS:
-                lines.append(f"{side}: {len(views)} views, need {MIN_VIEWS}")
-                continue
-            res, why = solve_intrinsics(views, self._board,
-                                        tilt_spread=self.samples.tilt_spread(side))
-            if res is None:
-                lines.append(f"{side}: {why}")
-                continue
-            self._results[side] = res
-            self._known_k[side] = res.intrinsics
-            # Per-view residuals and coverage, because the overall rms cannot
-            # tell a uniformly mediocre set from a good one with two bad views
-            # in it — and those call for opposite responses: better coverage
-            # versus finding and dropping the offenders.
-            pv = sorted(res.per_view_rms)
-            cov = int(self.samples.coverage(side, 6).sum())
-            if pv:
-                spread = (f"  per-view rms {pv[0]:.2f} / {pv[len(pv) // 2]:.2f}"
-                          f" / {pv[-1]:.2f}  (best/median/worst)")
-                outliers = sum(1 for v in pv if v > 2 * pv[len(pv) // 2])
-                verdict = (f"{outliers} view(s) far above median — drop those"
-                           if outliers else
-                           f"no outliers; coverage {cov}/36 is the lever")
-                self._extra.append(spread + "\n  " + verdict)
-            i = res.intrinsics
-            lines.append(
-                f"{side}: fx {i.fx:.1f} fy {i.fy:.1f} cx {i.cx:.1f} cy {i.cy:.1f}\n"
-                f"  rms {res.rms_px:.3f} px over {res.n_views} views "
-                f"@ {res.wh[0]}x{res.wh[1]}\n"
-                f"  k1 {i.dist[0]:+.4f} k2 {i.dist[1]:+.4f}"
-            )
-        self.report.setText("\n".join(lines + self._extra) or "nothing to solve")
-        self.btn_save.setEnabled(bool(self._results))
-
-    def _solve_stereo(self) -> None:
-        """Solve the pair geometry from the simultaneous views."""
-        if self._board is None:
-            self.report.setText("no board spec from the server")
-            return
-        missing = [s for s in ("left", "right") if s not in self._known_k]
-        if missing:
-            self.report.setText(
-                f"stereo needs intrinsics for {', '.join(missing)} — solve those "
-                "first, or load a calibration the server already has")
-            return
-        pairs = self.samples.paired()
-        if not pairs:
-            self.report.setText(
-                "no views where both eyes saw the board at the same instant")
-            return
-        wh = pairs[0].left.wh
-        res, why = solve_stereo(pairs, self._board,
-                                self._known_k["left"], self._known_k["right"], wh)
-        if res is None:
-            self._stereo = None
-            self.report.setText(f"stereo: {why}")
-            return
-        self._stereo = res
-        fx = self._known_k["left"].fx
-        note = ""
-        if res.dropped:
-            d = sorted(res.dropped)
-            # A contiguous run at the very start is the fingerprint of a rig
-            # that was adjusted after those views were taken.
-            if d == list(range(d[0], d[0] + len(d))) and d[0] == 0:
-                note = (f"\n  dropped the first {len(d)} pairs — they disagree "
-                        f"with the rest: the rig moved after they were taken")
-            else:
-                note = f"\n  dropped {len(d)} pairs that disagree with the rest"
-        self.report.setText(
-            f"stereo: baseline {res.baseline_mm:.1f} mm  rms {res.rms_px:.3f} px\n"
-            f"  over {res.n_views} simultaneous views @ {res.wh[0]}x{res.wh[1]}{note}\n"
-            f"  depth error ~{res.depth_error_mm(300, fx):.1f} mm at 300 mm, "
-            f"~{res.depth_error_mm(500, fx):.1f} mm at 500 mm\n"
-            f"  (halving it needs twice the baseline, not a better fit)"
-        )
-        self.btn_save.setEnabled(True)
-
-    def _solve_plane(self) -> None:
-        """Fit the laser sheet from the banked stripe-on-board points."""
-        if self._left_k is None:
-            self.report.setText("laser plane needs left-eye intrinsics first")
-            return
-        if len(self._plane_pts) == 0:
-            # Distinguish the two cases, because they need opposite actions and
-            # look identical from here: the detector being off, versus the beam
-            # simply not crossing the board.
-            self.report.setText(
-                "the stripe detector is off — tick 'laser line' in the toolbar"
-                if not self._laser_active else
-                "no stripe on the board yet — the beam has to fall ACROSS the "
-                "board. Move the board into it, from a few different tilts.")
-            return
-        wh = (self.samples.views("left")[0].wh if self.samples.views("left")
-              else (0, 0))
-        plane, why = self._plane_pts.fit(wh)
-        if plane is None:
-            self._plane = None
-            self.report.setText(f"laser plane: {why}")
-            return
-        self._plane = plane
-        n = plane.normal
-        self.report.setText(
-            f"laser plane: rms {plane.rms_mm:.2f} mm\n"
-            f"  {plane.n_points} points over {plane.n_frames} frames\n"
-            f"  n=({n[0]:+.3f},{n[1]:+.3f},{n[2]:+.3f}) d={plane.d:.1f} mm"
-        )
-        self.btn_save.setEnabled(True)
-
-    def _save(self) -> None:
-        if (not self._results and self._stereo is None and self._plane is None
-                and not self._readout):
-            return
-        payload: dict = {}
-        for side, res in self._results.items():
-            payload.setdefault(side, {})["intrinsics"] = res.as_config()
-        for side, r in self._readout.items():
-            payload.setdefault(side, {})["readout"] = r.as_config()
-        if self._stereo is not None:
-            payload["_extrinsics"] = self._stereo.as_config()
-        if self._plane is not None:
-            payload["_laser_plane"] = self._plane.as_config()
-        self.save_requested.emit(payload)
-        # Replace, never append: a stale "sent to server" line left under a
-        # later failure reads as if the failed solve had been saved.
-        self.report.setText("sent to server — the panels will show board pose "
-                            "once it comes back")
+    def _persist(self) -> None:
+        """Keep the captured views on disk. A failure here must not stop capture."""
+        try:
+            self.flow.samples.save(self._samples_path)
+        except OSError as exc:
+            log.warning("could not persist captured views: %s", exc)

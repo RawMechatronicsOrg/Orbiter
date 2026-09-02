@@ -147,6 +147,9 @@ class Scene:
 
     bgr: np.ndarray
     orientation: Orientation = Orientation()
+    #: The frame's true size (width, height) when `bgr` is a smaller copy
+    #: of it — geometry is mapped in these coordinates, not the texture's.
+    size: tuple[int, int] | None = None
     #: Stripe pixels, (N, 2) as (x, y).
     stripe: np.ndarray | None = None
     #: ChArUco corners (N, 2) and their IDs (N,).
@@ -166,7 +169,7 @@ class Scene:
 
     @property
     def wh(self) -> tuple[int, int]:
-        return self.bgr.shape[1], self.bgr.shape[0]
+        return self.size if self.size is not None else (self.bgr.shape[1], self.bgr.shape[0])
 
 
 def orientation_matrix(w: int, h: int, o: Orientation) -> np.ndarray:
@@ -324,13 +327,14 @@ class FrameView(QOpenGLWidget):
             self._draw_points(scene.stripe, clip, _STRIPE, 1.0)
 
     def _draw_image(self, scene: Scene) -> None:
-        w, h = scene.wh
+        w, h = scene.wh                       # the frame, for the geometry
+        th, tw = scene.bgr.shape[:2]          # the texture, possibly smaller
         tex = self._texture
-        if tex is None or tex.width() != w or tex.height() != h:
+        if tex is None or tex.width() != tw or tex.height() != th:
             if tex is not None:
                 tex.destroy()
             tex = QOpenGLTexture(QOpenGLTexture.Target.Target2D)
-            tex.setSize(w, h)
+            tex.setSize(tw, th)
             tex.setFormat(QOpenGLTexture.TextureFormat.RGB8_UNorm)
             tex.setMinMagFilters(QOpenGLTexture.Filter.Linear, QOpenGLTexture.Filter.Linear)
             tex.setWrapMode(QOpenGLTexture.WrapMode.ClampToEdge)

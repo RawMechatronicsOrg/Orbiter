@@ -159,11 +159,11 @@ Nothing is warped or resampled. The SCAN panel reports the largest shift it
 made and the board's speed, or why it could not (no readout figure, no
 previous pose within 200 ms).
 
-The readout time itself is measured from the board in motion — **Measure
-readout** in CALIBRATION, with intrinsics known: twist and tilt the board
-briskly in front of both eyes for 150 frames, and the solve fits a pose per
-frame together with one readout time, each frame's velocity coming from its
-neighbours over camserver's capture clock and every corner projected through
+The readout time itself is measured from the board in motion — the
+calibration flow banks every frame of brisk motion, with intrinsics known,
+and the solve fits a pose per frame together with one readout time, each
+frame's velocity coming from its neighbours in the same burst of motion over
+camserver's capture clock and every corner projected through
 the pose slid to its own row. On synthetic frames with 0.2 px corner noise it
 recovers 21.3 ms as 21.4 ± 0.04 with the sign right, and refuses a board that
 barely moved (the corners must move ≥ 3 px over one readout). The figure is
@@ -171,6 +171,8 @@ stored per eye with its frame size (`stereo_rig.<eye>.readout`), like the
 intrinsics, and refused at another size; the two eyes cross-check each other.
 
 ## Known limits
+
+What is planned, and why in that order, lives in [BACKLOG.md](BACKLOG.md).
 
 **Board pose needs a calibration first.** `model.camera_fx/fy/cx/cy` and
 `camera_distortion` were solved for the *phone* on the `camera_url` path — a
@@ -227,16 +229,58 @@ Which needs intrinsics — see the known limits above.
 
 ## Calibration
 
-Move the board around in front of the pair with **auto-capture** on. Views are
-kept only when they show the solve something new — a different place in the
-frame, a different distance, or a different tilt — and only when the board is
-still, because motion blur rounds corners off and biases the solve.
+One switch — **calibrate continuously**, on by default — and the board does
+the rest. Move it about in front of the pair: hold it still in new places, at
+new distances and tilts; bring the laser across it and hold; twist and tilt it
+briskly now and then. `calibflow.CalibrationFlow` decides what each frame is
+good for and solves in the background as the sets grow:
 
-They are captured in **pairs**, matched on camserver's capture clock (both
-cameras are timed by that same clock, so it is what makes two frames
-simultaneous; arrival times through two sockets are not comparable). Intrinsics
-do not need the pairing. `stereoCalibrate` does, and sweeping the board twice
-would be a waste of your time.
+  * a **still** board showing the solve something new — a different place in
+    the frame, a different distance or tilt — is a view (per-eye intrinsics),
+    and both eyes seeing it at the same instant makes it a pair (the stereo
+    geometry). Still, because motion blur rounds corners off and biases the
+    solve; new, because twenty near-duplicates are worth less than six
+    different views. Pairs are matched on camserver's capture clock — the one
+    clock that times both cameras; arrival times through two sockets are not
+    comparable;
+  * a still board with the stripe straight across it and a pose is a
+    laser-plane frame;
+  * a board moving **briskly** (4 px per frame and more) is a readout frame:
+    the rolling shutter's time is measured from exactly the motion that ruins
+    a view.
+
+Every set keeps what was observed — corners, IDs, stripe pixels, capture
+instants — never what was derived from it. Each cycle (no sooner than 4 s
+after the last, and only when a set grew) solves the intrinsics from all
+views, then the pair, the laser plane and the readout from *their* raw sets
+through the intrinsics just solved: the plane's points and the readout's
+poses are recomputed, not accumulated, so they improve with the camera matrix
+that places them. A result replaces what the server holds only when it is
+better — more data at a residual no more than 15% worse, or a lower residual
+— and then goes up on its own (**save improvements to the server**, on by
+default); a bad early solve is never written over a good stored one. **Save
+now** sends every current solve regardless, **Solve now** starts a cycle
+without waiting, **Capture** takes a view still or not.
+
+The panel's scoreboard shows each solve with its residual, its data and
+whether the server has it; the yellow line under it names the weakest link
+and what to do with the board about it — tilt more for one eye, reach the
+frame's corners, hold still where both eyes see it, bring the laser across,
+twist briskly. Do that, and it moves on to the next.
+
+Above everything, large, is the number the calibration is for: the
+**expected one-sigma error of a scanned point**, in mm, at the distance the
+board is now (`calibflow.ErrorBudget`). The scan places a stripe centroid on
+the laser sheet, so the terms are the centroid's pixel noise carried through
+the sheet's geometry — dZ/dpx = Z²/(f·d) for a sheet `d` from the camera
+containing the optical axis, 2.4 mm per pixel at half a metre on this rig —
+the sheet's own fit residual, the focal length's uncertainty (from the
+solve's covariance, `calibrateCameraExtended`) over the scan volume, and the
+rolling shutter while it is unmeasured; they add in quadrature. The stripe's
+noise is read live off the calibration-mode line fits and the distance off
+the board's pose; what has not been measured is assumed and the panel says
+so. Green under 0.5 mm, amber under 1.5, red above. Keep calibrating and
+watch it fall — that is the whole loop.
 
 ### Why the panel nags about tilt
 
@@ -268,9 +312,8 @@ set it absorbs error and destabilises the focal length. Tangential terms stay
 free because these are inexpensive sensors where a tilted element is real — the
 server's phone-lens solve fixes them, but that was a different lens.
 
-**Save to server** stores the result through `POST /command/set_stereo_rig`,
-the same command the web tab uses, so the server remains the one owner of this
-state.
+Results reach the server through `POST /command/set_stereo_rig`, the same
+command the web tab uses, so the server remains the one owner of this state.
 
 ## Scanning
 
@@ -318,10 +361,104 @@ board. Points below a 5 mm floor are the stripe on the board itself.
 The board must be visible for scanning to work: it is what defines where the
 volume is.
 
+**Four gates between the veto and the cloud** — learned from a live scan that
+produced points rarely and noisily at once. One blob per scanline: a
+scanline's confirmed pixels can form several runs, the stripe and a glint the
+right eye confirmed too, and averaging them gives a point that is neither, so
+the strongest run is taken and the rest ignored. That run's width, 2-24 px:
+a lone pixel is noise and a smear is a reflection. The **reach**: a point must
+lie 150-450 mm from the line through the two camera centres (SCAN panel,
+*reach from / to*) — the scanner's working range, which drops the rig's own
+hardware and the wall without recognising either and holds without a board
+pose. And no jumps: a point 5 mm off both its neighbours along the stripe
+while they agree with each other is not on their surface; a real depth step
+keeps one neighbour close and is untouched. The panel counts each.
+
+**Where the stripe crosses a scanline** is found to a fraction of a pixel by
+a Gaussian fit of the run's score profile (`laser.stripe_centroids`), not by
+the intensity-weighted centroid of the pixels above the threshold: the
+threshold cuts the profile's tails and the centroid of what is left leans to
+the brighter flank. Where the fit has too little to go on — fewer than three
+samples, a saturated flat top — the centroid of the scores *above* the run's
+floor stands in. Measured on synthetic profiles with 4 levels of noise: the
+raw centroid 0.05-0.14 px RMS, the fit 0.016-0.058. That term is the
+largest in the error budget, 2.4 mm per pixel at half a metre. The
+calibration-mode line fit shares the estimator, so the sheet is calibrated
+with the same centroids the scan runs on. `ScanParams.centroid_fit` turns it
+off for a comparison.
+
+**The stripe is searched only where the sheet can be.** The sheet and the
+reach are both fixed in the cameras' frame, so the rows a stripe can occupy
+are fixed too: `scan.stripe_rows` samples rays through a grid of pixels,
+meets the sheet, and keeps the rows whose points fall inside the reach
+(widened 15%) — on this rig cy + f·d/450 to cy + f·d/150 for 150-450 mm.
+Both detectors take the window, in either eye (the sheet and the baseline
+carried into the right camera through the extrinsics); the scan worker
+derives it from the calibration and the reach, the window pushes it to the
+workers. Glints elsewhere never reach the veto, and the score runs on a
+fraction of the frame.
+
+**While the board holds still, frames are averaged.** The scan worker keeps
+consecutive pairs whose left pose is within 0.5 mm and 0.1° of the batch's
+first, up to five, and adds their points averaged per scanline with the
+lowest and highest dropped (a glint that passed every gate in one frame
+is the extreme, not a fifth of the answer) — a scanline seen in fewer than
+half the frames is a flicker and is dropped. Noise falls by about the root
+of the batch; motion flushes it at once. The SCAN
+panel shows `still ×N` while a batch is held.
+
+**The cloud is a voxel grid.** `PointCloud` merges points on 0.5 mm voxels,
+each holding the running mean of what fell in it: a surface swept ten times
+is one point, ten times less noisy, the cloud stops growing with the number
+of passes, and the export is one point per voxel. Half a millimetre is well
+under the point noise, so nothing real is lost.
+
+**While scanning, the right eye does not run ChArUco.** Its board pose is
+only ever drawn, and the window draws it from the left's through the
+extrinsics (`stereo.compose_right_pose`) — 5 ms per frame back, and one
+source of the two overlays disagreeing gone. And no eye scores the stripe
+without a pose to place it through: the left skips a frame with no board, the
+right skips while the scan worker reports the left has had no pose for half a
+second (`worker.stripe_wanted`).
+
+**The view gets a half-size frame on the GPU path.** The eyes are shown at
+about a third of their size, so the reader downloads a 2×2-averaged copy for
+display (1.5 MB instead of 6) and keeps only the luminance at full size for
+the tracker; the full colour frame is downloaded only while the
+calibration-mode line fit needs it on the CPU. The frame's true size travels
+with it, so the geometry maps in full-frame pixels whatever the texture is.
+
+Both cameras run with `power_line_frequency` at 50 Hz: at the default of
+off, mains flicker under the room's lighting bands the rows of a rolling
+shutter. Set through camserver's control API; it persists on the cameras.
+
+Pairs are matched within 20 ms of camserver's capture clock. It was 10, and
+found partners for 26 of 58 left frames — because the left camera ran at
+20 fps under auto-exposure while the right ran at 30, so every other left
+frame had its nearest right frame 16.7 ms away. The panel now shows the
+pairing rate; a rate well under 100% with both cameras at 30 fps means the
+detector threads are dropping frames, not the cameras.
+
 While scanning, the cloud so far is drawn over both eyes in orange, each eye
 projecting it through its own board pose — so the two overlays disagreeing is
 itself a sign that the board poses do. The overlay is decimated to about 40k
 points; the export (**Export PLY**, binary little-endian) carries everything.
+
+## The cloud
+
+The third panel in the side column turns the cloud over in 3-D: the live scan
+(the same decimated snapshot the eyes draw) or, with **Open PLY**, any cloud
+from disk — a million points is a 12 MB buffer drawn in a millisecond. Drag
+to orbit, wheel to zoom, right-drag to pan, double-click to fit. Points are
+drawn the way the web viewer drew them and better: size-attenuated, so a
+point's size on screen falls with its distance from the eye — what makes a
+cloud read as a volume rather than a flat speckle — and round with a soft
+edge, shaded by height above the board; a PLY that carries colour is drawn
+in it. The board's disc and axes give the cloud a floor and an up. Two
+things a desktop GL context wants that a web one does not: `#version 120`
+for `gl_PointCoord`, and `GL_POINT_SPRITE` enabled — without either every
+fragment reads (0, 0), falls outside the circle and is discarded, with a
+clean shader log. `test_cloudview.py` renders and reads back.
 
 ## Measured on this machine
 

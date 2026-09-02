@@ -148,3 +148,29 @@ def test_to_widget_is_the_letterboxed_mapping() -> None:
         assert tuple(img[int(200 * dpr), int(250 * dpr)]) == (30, 30, 30)
     finally:
         view.close()
+
+
+def test_a_half_size_texture_still_maps_geometry_in_frame_coordinates() -> None:
+    """The GPU path hands the view a 2x2-averaged copy of the frame; the
+    corners, stripe and cloud are in full-frame pixels and must still land
+    where map_points puts them."""
+    o = Orientation(1)
+    scene = _scene(o)
+    small = scene.bgr.reshape(H // 2, 2, W // 2, 2, 3).mean(axis=(1, 3)).astype(np.uint8)
+    scene = Scene(bgr=small, orientation=o, size=(W, H), stripe=scene.stripe,
+                  cloud=scene.cloud, R=scene.R, t=scene.t, K=scene.K, D=scene.D)
+    assert scene.wh == (W, H)
+    got = _render(scene, (H, W))
+    if got is None:
+        pytest.skip("no OpenGL context here")
+    img, view, dpr = got
+    try:
+        inside = map_points(np.array([[50.0, 110.0]]), W, H, o)[0]
+        x, y = ((inside + 0.5) * dpr).astype(int)
+        assert tuple(img[y, x]) == (255, 0, 0), img[y, x]
+        assert _near(img, map_points(np.array([[201.0, 20.0]]), W, H, o)[0], dpr, (80, 235, 80))
+        px, _ = cv2.projectPoints(scene.cloud, np.zeros(3), np.zeros(3), K, D)
+        for pt in px.reshape(-1, 2):
+            assert _near(img, map_points(pt.reshape(1, 2), W, H, o)[0], dpr, (255, 150, 0), reach=2)
+    finally:
+        view.close()

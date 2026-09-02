@@ -75,7 +75,7 @@ def test_gray_matches_opencv_to_a_level() -> None:
     a few pixels, which no corner detector can tell from sensor noise."""
     rng = np.random.default_rng(5)
     bgr = rng.integers(0, 256, (48, 64, 3), dtype=np.uint8)
-    got_bgr, got_gray = gpu.to_cpu(_upload(bgr))
+    got_bgr, got_gray, _ = gpu.to_cpu(_upload(bgr))
     assert np.array_equal(got_bgr, bgr)
     diff = np.abs(got_gray.astype(np.int16)
                   - cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.int16))
@@ -92,7 +92,7 @@ def test_decode_is_close_to_opencv() -> None:
     ref = cv2.imdecode(buf, cv2.IMREAD_COLOR)
     rgb = gpu.decode(bytearray(buf.tobytes()))
     assert rgb is not None and tuple(rgb.shape) == (3, 96, 128)
-    got, _ = gpu.to_cpu(rgb)
+    got, _, _ = gpu.to_cpu(rgb)
     diff = np.abs(got.astype(np.int16) - ref.astype(np.int16))
     assert diff.mean() < 2.0, diff.mean()
     assert diff.max() <= 24, diff.max()
@@ -110,3 +110,36 @@ def test_the_reader_hands_out_gpu_frames() -> None:
     assert frame.bgr.shape == (16, 24, 3) and frame.gray.shape == (16, 24)
     assert MjpegReader("http://unused", gpu=False)._decode(
         bytearray(buf.tobytes()), {}).rgb_gpu is None
+
+
+def test_to_cpu_without_the_full_frame_gives_a_half_size_display() -> None:
+    rng = np.random.default_rng(6)
+    bgr = rng.integers(0, 256, (48, 64, 3), dtype=np.uint8)
+    full, gray, display = gpu.to_cpu(_upload(bgr), full=True)
+    assert full is display and full.shape == (48, 64, 3)
+    none, gray2, half = gpu.to_cpu(_upload(bgr), full=False)
+    assert none is None and np.array_equal(gray, gray2)
+    assert half.shape == (24, 32, 3)
+    expect = bgr.reshape(24, 2, 32, 2, 3).mean(axis=(1, 3))
+    assert np.abs(half.astype(float) - expect).max() <= 1.0
+
+
+def test_the_reader_downloads_the_full_frame_only_when_asked() -> None:
+    ok, buf = cv2.imencode(".jpg", np.full((16, 24), 40, np.uint8))
+    reader = MjpegReader("http://unused", gpu=True)
+    reader.full_bgr = False
+    frame = reader._decode(bytearray(buf.tobytes()), {})
+    assert frame.bgr is None and frame.display.shape == (8, 12, 3) and frame.wh == (24, 16)
+    reader.full_bgr = True
+    frame = reader._decode(bytearray(buf.tobytes()), {})
+    assert frame.bgr is not None and frame.display is frame.bgr and frame.wh == (24, 16)
+
+
+def test_stripe_pixels_search_only_the_row_window() -> None:
+    bgr = _scene()                                        # the stripe runs rows 70-100
+    rgb = _upload(bgr)
+    inside = gpu.stripe_pixels(rgb, rows=(60, 120))
+    assert inside.ok and 60 <= inside.y.min() and inside.y.max() < 120
+    assert inside.count == find_stripe_pixels(bgr, rows=(60, 120)).count
+    assert not gpu.stripe_pixels(rgb, rows=(150, 240)).ok
+    assert not gpu.stripe_pixels(rgb, rows=(200, 100)).ok

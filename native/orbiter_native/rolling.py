@@ -65,6 +65,12 @@ MAX_READOUT_S = 0.06
 MIN_READOUT_S = 0.0005
 #: Fewer frames than this and the velocities have nothing to average over.
 MIN_VIEWS = 20
+#: Frames further apart than this are not neighbours: a velocity taken
+#: across such a gap is not the velocity inside either frame. The frames
+#: come in bursts of brisk motion, and each burst is solved as its own run.
+MAX_RUN_GAP_S = 0.08
+#: A run shorter than this has no velocity to speak of.
+MIN_RUN = 3
 
 
 @dataclass(frozen=True)
@@ -207,6 +213,37 @@ class MotionView:
     wh: tuple[int, int]
 
 
+class MotionCollector:
+    """Frames of the board in brisk motion, per eye, for the readout solve.
+    Bounded: past a few hundred frames the solve has all the motion it can
+    use, and the oldest go first."""
+
+    MAX_FRAMES = 300
+
+    def __init__(self) -> None:
+        self._views: dict[str, list[MotionView]] = {"left": [], "right": []}
+
+    def add(self, side: str, view: MotionView) -> None:
+        views = self._views[side]
+        views.append(view)
+        if len(views) > self.MAX_FRAMES:
+            del views[: len(views) - self.MAX_FRAMES]
+
+    def views(self, side: str) -> list[MotionView]:
+        return self._views[side]
+
+    def count(self, side: str) -> int:
+        return len(self._views[side])
+
+    @property
+    def total(self) -> int:
+        return sum(len(v) for v in self._views.values())
+
+    def clear(self) -> None:
+        for v in self._views.values():
+            v.clear()
+
+
 @dataclass
 class _Prepared:
     obj: np.ndarray                # (N, 3) board points, cvcore frame, mm
@@ -277,6 +314,10 @@ class _Problem:
         self.k = k
         self.height = float(height)
         self.n = len(frames)
+        # Neighbours only within a run: across a gap the difference of two
+        # poses says nothing about the motion inside either frame.
+        caps = np.array([f.capture for f in frames])
+        self.run = np.concatenate([[0], np.cumsum(np.diff(caps) > MAX_RUN_GAP_S)])
         self.counts = np.array([len(f.img) for f in frames])
         self.offsets = np.concatenate([[0], np.cumsum(self.counts)])
 
@@ -295,7 +336,8 @@ class _Problem:
         omega = np.zeros((self.n, 3))
         vel = np.zeros((self.n, 3))
         for i in range(self.n):
-            a, b = max(i - 1, 0), min(i + 1, self.n - 1)
+            a = i - 1 if i > 0 and self.run[i - 1] == self.run[i] else i
+            b = i + 1 if i + 1 < self.n and self.run[i + 1] == self.run[i] else i
             dt = times[b] - times[a]
             if dt <= 0:
                 continue
@@ -344,6 +386,24 @@ class _Problem:
         return worst
 
 
+def _in_runs(frames: list[_Prepared]) -> list[_Prepared]:
+    """Drop frames that have no neighbour within `MAX_RUN_GAP_S` on either
+    side to make a run of at least `MIN_RUN`. Frames are sorted by time."""
+    if not frames:
+        return frames
+    out: list[_Prepared] = []
+    run: list[_Prepared] = [frames[0]]
+    for prev, cur in zip(frames, frames[1:]):
+        if cur.capture - prev.capture > MAX_RUN_GAP_S:
+            if len(run) >= MIN_RUN:
+                out.extend(run)
+            run = []
+        run.append(cur)
+    if len(run) >= MIN_RUN:
+        out.extend(run)
+    return out
+
+
 def solve_readout(views: list[MotionView], board, k,
                   initial_s: float = 0.02) -> tuple[Readout | None, str]:
     """T for one eye from its corners under motion. `(Readout, "")`, or
@@ -352,9 +412,10 @@ def solve_readout(views: list[MotionView], board, k,
         return None, "no frames"
     wh = views[0].wh
     frames = _prepare(views, board, k)
-    if len(frames) < MIN_VIEWS:
-        return None, f"only {len(frames)} usable frames, need {MIN_VIEWS}"
     frames.sort(key=lambda f: f.capture)
+    frames = _in_runs(frames)
+    if len(frames) < MIN_VIEWS:
+        return None, f"only {len(frames)} usable frames in bursts of motion, need {MIN_VIEWS}"
     problem = _Problem(frames, k, wh[1])
     x0 = problem.x0(initial_s)
     rms_before = float(np.sqrt(np.mean(problem.residuals(problem.x0(0.0)) ** 2)))

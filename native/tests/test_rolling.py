@@ -68,14 +68,21 @@ def _trajectory(kind: str):
 
 
 def _render(board, kind: str, T: float, n: int = 60, fps: float = 30.0,
-            noise: float = 0.2, seed: int = 0) -> list[MotionView]:
-    """Frames of the moving board with a true rolling shutter of `T`."""
+            noise: float = 0.2, seed: int = 0, gap_after: int | None = None,
+            isolate: int | None = None) -> list[MotionView]:
+    """Frames of the moving board with a true rolling shutter of `T`.
+    `gap_after` puts a one-second pause after that frame — two bursts —
+    and `isolate` sets one frame half a second apart from both sides."""
     rng = np.random.default_rng(seed)
     pts, ids = _board_points(board)
     pose = _trajectory(kind)
     views = []
     for k in range(n):
         t0 = k / fps + rng.normal(0, 0.0005)
+        if gap_after is not None and k > gap_after:
+            t0 += 1.0
+        if isolate is not None:
+            t0 += 0.5 if k == isolate else (1.0 if k > isolate else 0.0)
         R, t = pose(t0)
         y = _project(pts @ R.T + t, K)[:, 1]
         for _ in range(6):            # each corner at its own row's instant
@@ -101,6 +108,20 @@ def test_readout_is_recovered_with_its_sign(board, kind, sign) -> None:
     assert r.sigma_s < 0.02 * T_TRUE
     assert r.skew_px >= MIN_SKEW_PX and r.rms_px < 0.3
     assert (r.width, r.height) == (W, H) and r.views == 60
+
+
+def test_bursts_are_solved_as_runs_and_lone_frames_dropped(board) -> None:
+    """Brisk motion comes in bursts; across a pause the neighbouring poses
+    say nothing about the motion inside a frame, so each burst is its own
+    run, and a frame with no neighbours at all is left out."""
+    r, why = solve_readout(_render(board, "twist+tilt", T_TRUE, n=70, gap_after=34),
+                           board, K)
+    assert r is not None, why
+    assert abs(r.seconds - T_TRUE) < 0.03 * T_TRUE and r.views == 70
+    r, why = solve_readout(_render(board, "twist+tilt", T_TRUE, n=61, isolate=30),
+                           board, K)
+    assert r is not None, why
+    assert r.views == 60 and abs(r.seconds - T_TRUE) < 0.03 * T_TRUE
 
 
 def test_too_little_motion_is_refused(board) -> None:
@@ -201,7 +222,8 @@ def test_scan_frame_applies_the_motion_per_row() -> None:
     xyz_cam = np.column_stack([xs, np.full_like(zs, 74.0), zs])      # on the sheet
     left = _stripe(_project(xyz_cam, K))
     right = _stripe(_rig().project_right(xyz_cam))
-    params = ScanParams(volume=ScanVolume(height_mm=2000.0, radius_mm=2000.0, floor_mm=-2000.0))
+    params = ScanParams(range_mm=(0.0, 1e9), jump_mm=0.0, blob_width_px=(1, 24),
+                        volume=ScanVolume(height_mm=2000.0, radius_mm=2000.0, floor_mm=-2000.0))
     still = scan_frame(_rig(), plane, left, right, R0, t0, params)
     assert still.n_kept > 100 and still.rs_note == "no motion estimate"
     motion = Motion(omega=np.array([0.0, 0.0, 2.0]), v=np.array([80.0, 0.0, 0.0]),

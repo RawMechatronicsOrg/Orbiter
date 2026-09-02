@@ -148,6 +148,10 @@ def _plane():
                               "width": WH[0], "height": WH[1]}, WH)
 
 
+#: These tests are about the veto, the sheet and the cylinder; the reach gate
+#: has its own tests, so it is opened wide here.
+WIDE = ScanParams(range_mm=(0.0, 1e9))
+
 #: A board 600 mm out, facing the camera, its centre under the sheet: the
 #: centred, face-out frame `cvcore.estimate_pose` hands out.
 BOARD2_R = np.diag([1.0, -1.0, -1.0])
@@ -190,7 +194,7 @@ def test_scan_recovers_a_curve_on_the_plane() -> None:
     left = _pixels(KL, np.eye(3), np.zeros(3), truth)
     right = _pixels(KR, R_TRUE, T_TRUE, truth)
 
-    out = scan_frame(rig, plane, left, right, BOARD2_R, BOARD2_T)
+    out = scan_frame(rig, plane, left, right, BOARD2_R, BOARD2_T, WIDE)
     assert out.reason is None, out.reason
     assert out.n_kept > 250
     assert out.n_confirmed > 0.95 * out.n_pixels
@@ -219,7 +223,7 @@ def test_scan_vetoes_what_the_right_eye_did_not_see() -> None:
     wire = np.stack([np.linspace(-80.0, 80.0, 600), np.full(600, 30.0),
                      np.full(600, 500.0)], axis=1)
     both = _join(left, _pixels(KL, np.eye(3), np.zeros(3), wire))
-    out = scan_frame(rig, plane, both, right, BOARD2_R, BOARD2_T)
+    out = scan_frame(rig, plane, both, right, BOARD2_R, BOARD2_T, WIDE)
     assert out.reason is None, out.reason
     assert out.n_kept > 250
     # The wire's pixels are out; the stripe's — every row of it — are in.
@@ -229,7 +233,7 @@ def test_scan_vetoes_what_the_right_eye_did_not_see() -> None:
     # The right eye misses the stretch x in [10, 40]: those scanlines go.
     keep = ~((truth[:, 0] > 10.0) & (truth[:, 0] < 40.0))
     right_gap = _pixels(KR, R_TRUE, T_TRUE, truth[keep])
-    out = scan_frame(rig, plane, left, right_gap, BOARD2_R, BOARD2_T)
+    out = scan_frame(rig, plane, left, right_gap, BOARD2_R, BOARD2_T, WIDE)
     assert out.n_rejected_unconfirmed > 30
     # Up to the confirmation slack: 3 px in the right eye is 1.7 mm here, and
     # a stripe row off-centre is another 2.6 px — about 3 mm at each edge.
@@ -242,13 +246,13 @@ def test_scan_needs_the_plane_a_board_pose_and_both_eyes() -> None:
     truth = _curve(lambda x: np.full_like(x, 500.0))
     left = _pixels(KL, np.eye(3), np.zeros(3), truth)
     right = _pixels(KR, R_TRUE, T_TRUE, truth)
-    r = scan_frame(rig, None, left, right, BOARD2_R, BOARD2_T)
+    r = scan_frame(rig, None, left, right, BOARD2_R, BOARD2_T, WIDE)
     assert r.n_kept == 0 and "laser plane" in r.reason
-    r = scan_frame(rig, plane, left, right, None, None)
+    r = scan_frame(rig, plane, left, right, None, None, WIDE)
     assert r.n_kept == 0 and "board pose" in r.reason
     empty = StripePixels(wh=WH, reason="no stripe")
-    assert scan_frame(rig, plane, empty, right, BOARD2_R, BOARD2_T).n_kept == 0
-    assert scan_frame(rig, plane, left, empty, BOARD2_R, BOARD2_T).n_kept == 0
+    assert scan_frame(rig, plane, empty, right, BOARD2_R, BOARD2_T, WIDE).n_kept == 0
+    assert scan_frame(rig, plane, left, empty, BOARD2_R, BOARD2_T, WIDE).n_kept == 0
 
 
 def test_scan_drops_points_outside_the_cylinder() -> None:
@@ -257,14 +261,14 @@ def test_scan_drops_points_outside_the_cylinder() -> None:
     truth = _curve(lambda x: np.full_like(x, 500.0))        # 100 mm above the board
     left = _pixels(KL, np.eye(3), np.zeros(3), truth)
     right = _pixels(KR, R_TRUE, T_TRUE, truth)
-    assert scan_frame(rig, plane, left, right, BOARD2_R, BOARD2_T).n_kept > 250
+    assert scan_frame(rig, plane, left, right, BOARD2_R, BOARD2_T, WIDE).n_kept > 250
 
-    low = ScanParams(volume=ScanVolume(height_mm=50.0))
+    low = ScanParams(range_mm=(0.0, 1e9), volume=ScanVolume(height_mm=50.0))
     out = scan_frame(rig, plane, left, right, BOARD2_R, BOARD2_T, low)
     assert out.n_kept == 0 and out.n_rejected_volume > 250
 
     # The curve spans +/-80 mm in x; a 10 mm radius keeps the middle only.
-    narrow = ScanParams(volume=ScanVolume(radius_mm=10.0))
+    narrow = ScanParams(range_mm=(0.0, 1e9), volume=ScanVolume(radius_mm=10.0))
     kept = scan_frame(rig, plane, left, right, BOARD2_R, BOARD2_T, narrow).n_kept
     assert 0 < kept < 60
 
@@ -272,7 +276,7 @@ def test_scan_drops_points_outside_the_cylinder() -> None:
     on_board = _curve(lambda x: np.full_like(x, 600.0))
     lb = _pixels(KL, np.eye(3), np.zeros(3), on_board)
     rb = _pixels(KR, R_TRUE, T_TRUE, on_board)
-    assert scan_frame(rig, plane, lb, rb, BOARD2_R, BOARD2_T).n_kept == 0
+    assert scan_frame(rig, plane, lb, rb, BOARD2_R, BOARD2_T, WIDE).n_kept == 0
 
 
 def test_volume_edges() -> None:
