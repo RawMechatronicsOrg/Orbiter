@@ -13,10 +13,9 @@ import pytest
 
 from orbiter_native.cvcore import BoardSpec, Intrinsics, build_board
 from orbiter_native.intrinsics import EyeView, PairSample, describe
-from orbiter_native.laser import LaserPoints
-from orbiter_native.scan import (
-    PointCloud, ScanParams, ScanVolume, _cross_polyline, scan_frame,
-)
+from orbiter_native.laser import StripePixels
+from orbiter_native.laserplane import from_config as plane_from_config
+from orbiter_native.scan import PointCloud, ScanParams, ScanVolume, scan_frame
 from orbiter_native.stereo import StereoRig, calibrate, result_from_config
 
 WH = (1280, 720)
@@ -125,179 +124,165 @@ def _rig() -> StereoRig:
     return StereoRig(KL, KR, geom)
 
 
-def test_triangulation_recovers_known_points() -> None:
-    rig = _rig()
-    truth = np.array([[0.0, 0.0, 600.0], [40.0, -25.0, 520.0], [-60.0, 30.0, 700.0]])
-    lp = _project(KL, np.zeros(3), np.zeros(3), truth)
-    rp = _project(KR, cv2.Rodrigues(R_TRUE)[0].ravel(), T_TRUE, truth)
-    got = rig.triangulate(lp, rp)
-    assert np.allclose(got, truth, atol=1e-3)
-    assert np.all(rig.reprojection_error(got, lp, rp) < 1e-3)
+def test_project_right_matches_opencv_with_distortion() -> None:
+    from orbiter_native.stereo import StereoResult
+    kr = Intrinsics(fx=898.0, fy=903.0, cx=634.0, cy=364.0,
+                    dist=(-0.28, 0.09, 0.001, -0.0005, 0.02))
+    geom = StereoResult(R=R_TRUE, T=T_TRUE, E=np.zeros((3, 3)), F=np.zeros((3, 3)),
+                        rms_px=0.1, n_views=12, wh=WH)
+    rig = StereoRig(KL, kr, geom)
+    rng = np.random.default_rng(2)
+    xyz = np.stack([rng.uniform(-150, 150, 200), rng.uniform(-100, 100, 200),
+                    rng.uniform(400, 800, 200)], axis=1)
+    want = _project(kr, R_TRUE, T_TRUE, xyz)
+    assert np.allclose(rig.project_right(xyz), want, atol=1e-6)
+    assert np.isnan(rig.project_right(np.array([[0.0, 0.0, -50.0]]))).all()
 
 
-def _stripe(rig: StereoRig, xyz_truth: np.ndarray):
-    """Project a 3D stripe into both eyes as shape-free centroid sets."""
-    lp = _project(KL, np.zeros(3), np.zeros(3), xyz_truth)
-    rp = _project(KR, cv2.Rodrigues(R_TRUE)[0].ravel(), T_TRUE, xyz_truth)
-
-    def pts(a):
-        # Sample order along the axis the detector would have scanned.
-        along_x = np.ptp(a[:, 0]) >= np.ptp(a[:, 1])
-        order = np.argsort(a[:, 0] if along_x else a[:, 1])
-        return LaserPoints(points=a[order].astype(np.float32),
-                           along_x=bool(along_x), reason=None)
-
-    return pts(lp), pts(rp)
+#: The laser sheet of the synthetic rig: normal along y, 74 mm from the left
+#: camera and containing its optical axis — the geometry measured on the real
+#: rig, where the sheet's offset is the one-eye baseline.
+def _plane():
+    return plane_from_config({"n": [0.0, 1.0, 0.0], "d": 74.0, "rms_mm": 0.3,
+                              "points": 1000, "frames": 10,
+                              "width": WH[0], "height": WH[1]}, WH)
 
 
-def _laser_on_plane(rig: StereoRig, z_mm: float, y_mm: float):
-    """A straight stripe at a fixed depth, running ACROSS the baseline.
-
-    A stripe parallel to the baseline lies along the epipolar lines and has no
-    unique match in the other image, whatever the calibration quality. This
-    synthetic rig has a horizontal baseline, so the stripe is close to
-    vertical.
-    """
-    t = np.linspace(-80.0, 80.0, 160)
-    truth = np.stack([0.15 * t, y_mm + t, np.full_like(t, z_mm)], axis=1)
-    left, right = _stripe(rig, truth)
-    return left, right, truth
+#: A board 600 mm out, facing the camera, its centre under the sheet: the
+#: centred, face-out frame `cvcore.estimate_pose` hands out.
+BOARD2_R = np.diag([1.0, -1.0, -1.0])
+BOARD2_T = np.array([0.0, 74.0, 600.0])
 
 
-def test_scan_triangulates_a_stripe_into_the_board_frame() -> None:
-    """A stripe 100 mm above the board lands 100 mm above it, in board units."""
-    rig = _rig()
-    left, right, truth = _laser_on_plane(rig, z_mm=500.0, y_mm=0.0)
+def _curve(z_of_x, n: int = 600) -> np.ndarray:
+    """A 3D curve lying on the sheet, in the left camera's frame."""
+    x = np.linspace(-80.0, 80.0, n)
+    return np.stack([x, np.full_like(x, 74.0), z_of_x(x)], axis=1)
 
-    out = scan_frame(rig, left, right, BOARD_R, BOARD_T)
+
+def _pixels(K: Intrinsics, R, t, xyz, wh=WH, sigma: float = 1.0) -> StripePixels:
+    """The stripe as one eye reports it: a soft profile of rows per column."""
+    img = _project(K, R, t, xyz)
+    xs, ys, ws = [], [], []
+    for u, v in img:
+        col = int(round(u))
+        for row in range(int(np.floor(v)) - 2, int(np.floor(v)) + 4):
+            w = 255.0 * np.exp(-0.5 * ((row - v) / sigma) ** 2)
+            if w >= 40 and 0 <= col < wh[0] and 0 <= row < wh[1]:
+                xs.append(col)
+                ys.append(row)
+                ws.append(int(w))
+    return StripePixels(x=np.array(xs, np.int32), y=np.array(ys, np.int32),
+                        w=np.array(ws, np.uint8), wh=wh, along_x=True, reason=None)
+
+
+def _join(*parts: StripePixels) -> StripePixels:
+    return StripePixels(x=np.concatenate([p.x for p in parts]),
+                        y=np.concatenate([p.y for p in parts]),
+                        w=np.concatenate([p.w for p in parts]),
+                        wh=parts[0].wh, along_x=True, reason=None)
+
+
+def test_scan_recovers_a_curve_on_the_plane() -> None:
+    """Points come from the sheet, at sub-pixel centroids, in the board frame."""
+    rig, plane = _rig(), _plane()
+    truth = _curve(lambda x: 500.0 + 30.0 * np.sin(x / 25.0))
+    left = _pixels(KL, np.eye(3), np.zeros(3), truth)
+    right = _pixels(KR, R_TRUE, T_TRUE, truth)
+
+    out = scan_frame(rig, plane, left, right, BOARD2_R, BOARD2_T)
     assert out.reason is None, out.reason
-    assert out.n_kept > 100
-    # Board frame: z is distance from the board towards the camera.
-    assert np.allclose(out.points_board[:, 2], 100.0, atol=0.5)
-    assert np.ptp(out.points_board[:, 1]) > 140      # the stripe spans the box
+    assert out.n_kept > 250
+    assert out.n_confirmed > 0.95 * out.n_pixels
+    x, y, z = out.points_camera.T
+    assert np.abs(y - 74.0).max() < 1e-9                 # on the sheet by construction
+    # The end columns of a synthetic stripe are sampled from one side only
+    # and sit a fraction of a pixel off; the algorithm is judged inside them.
+    mid = np.abs(x) < 78.0
+    assert np.abs(z - (500.0 + 30.0 * np.sin(x / 25.0)))[mid].max() < 0.5
+    # Board frame: 600 - z above a board facing the camera.
+    xb, _, zb = out.points_board.T
+    assert np.allclose(zb, 100.0 - 30.0 * np.sin(xb / 25.0), atol=0.5)
 
 
-def test_scan_drops_points_outside_the_volume() -> None:
-    """The box is what removes the bench and the far wall, with no recognition."""
-    rig = _rig()
-    board_R, board_t = BOARD_R, BOARD_T
+def test_scan_vetoes_what_the_right_eye_did_not_see() -> None:
+    """A red wire in the left eye lands on the sheet somewhere — but not where
+    the right eye saw stripe. And a flank hidden from the right eye yields
+    nothing, rather than an unverified point."""
+    rig, plane = _rig(), _plane()
+    truth = _curve(lambda x: np.full_like(x, 500.0))
+    left = _pixels(KL, np.eye(3), np.zeros(3), truth)
+    right = _pixels(KR, R_TRUE, T_TRUE, truth)
 
-    # 100 mm above the board: inside a 400 mm box.
-    inside, r_in, _ = _laser_on_plane(rig, z_mm=500.0, y_mm=0.0)
-    assert scan_frame(rig, inside, r_in, board_R, board_t).n_kept > 100
-
-    # The same stripe against a ceiling below it. Shrinking the box rather than
-    # moving the stripe far from the cameras keeps the projection geometry
-    # workable, so the VOLUME is demonstrably what rejects the points and not
-    # the stereo overlap running out at close range.
-    low = ScanParams(volume=ScanVolume(height_mm=50.0))
-    out = scan_frame(rig, inside, r_in, board_R, board_t, low)
-    assert out.n_kept == 0
-    assert out.n_rejected_volume > 100
-
-    # Same for the horizontal extent. The stripe runs +/-80 mm in y, so a
-    # 10 mm half-width keeps only the short span across the middle.
-    narrow = ScanParams(volume=ScanVolume(half_width_mm=10.0))
-    kept = scan_frame(rig, inside, r_in, board_R, board_t, narrow).n_kept
-    assert 0 < kept < 40
-
-    # On the board's own surface — the calibration target, not the subject.
-    on_board, r_on, _ = _laser_on_plane(rig, z_mm=600.0, y_mm=0.0)
-    assert scan_frame(rig, on_board, r_on, board_R, board_t).n_kept == 0
-
-
-def test_scan_follows_a_stripe_that_is_not_a_line() -> None:
-    """The case a line fit destroys, and the reason scanning stopped using one.
-
-    On a real frame from this rig — a drill on the bench — the straight-line
-    fit kept 126 of 649 stripe points; the 523 it discarded WERE the object.
-    Here the stripe steps 40 mm partway along, and both the near and the far
-    part must survive with their own depths.
-    """
-    rig = _rig()
-    t = np.linspace(-80.0, 80.0, 160)
-    z = np.where(t < 0.0, 500.0, 460.0)          # a 40 mm step in depth
-    truth = np.stack([0.15 * t, t, z], axis=1)
-    left, right = _stripe(rig, truth)
-
-    out = scan_frame(rig, left, right, BOARD_R, BOARD_T)
+    # A wire 44 mm nearer the camera than the sheet, running alongside the
+    # stripe in the image. Its rays meet the sheet far out — at about 1.2 m.
+    wire = np.stack([np.linspace(-80.0, 80.0, 600), np.full(600, 30.0),
+                     np.full(600, 500.0)], axis=1)
+    both = _join(left, _pixels(KL, np.eye(3), np.zeros(3), wire))
+    out = scan_frame(rig, plane, both, right, BOARD2_R, BOARD2_T)
     assert out.reason is None, out.reason
-    assert out.n_kept > 120
+    assert out.n_kept > 250
+    # The wire's pixels are out; the stripe's — every row of it — are in.
+    assert 0.95 * left.count <= out.n_confirmed <= 1.05 * left.count
+    assert np.abs(out.points_camera[:, 2] - 500.0).max() < 0.5   # not averaged in
 
-    z_board = out.points_board[:, 2]
-    near = z_board[z_board < 120.0]
-    far = z_board[z_board >= 120.0]
-    assert len(near) > 50 and len(far) > 50, "both sides of the step must survive"
-    assert abs(np.median(near) - 100.0) < 1.0     # 600 - 500
-    assert abs(np.median(far) - 140.0) < 1.0      # 600 - 460
-
-
-def test_scan_does_not_bridge_a_gap_in_the_stripe() -> None:
-    """Where the stripe is interrupted, no surface may be invented across it."""
-    rig = _rig()
-    t = np.concatenate([np.linspace(-80.0, -30.0, 60),
-                        np.linspace(30.0, 80.0, 60)])       # a hole in the middle
-    truth = np.stack([0.15 * t, t, np.full_like(t, 500.0)], axis=1)
-    left, right = _stripe(rig, truth)
-    out = scan_frame(rig, left, right, BOARD_R, BOARD_T)
-    assert out.reason is None, out.reason
-    ys = np.sort(out.points_board[:, 1])
-    # Nothing reconstructed inside the gap the detector never saw.
-    assert not ((ys > -25.0) & (ys < 25.0)).any()
+    # The right eye misses the stretch x in [10, 40]: those scanlines go.
+    keep = ~((truth[:, 0] > 10.0) & (truth[:, 0] < 40.0))
+    right_gap = _pixels(KR, R_TRUE, T_TRUE, truth[keep])
+    out = scan_frame(rig, plane, left, right_gap, BOARD2_R, BOARD2_T)
+    assert out.n_rejected_unconfirmed > 30
+    # Up to the confirmation slack: 3 px in the right eye is 1.7 mm here, and
+    # a stripe row off-centre is another 2.6 px — about 3 mm at each edge.
+    x = out.points_camera[:, 0]
+    assert not ((x > 14.0) & (x < 36.0)).any()
 
 
-def test_scan_requires_both_eyes_and_a_board_pose() -> None:
-    rig = _rig()
-    left, right, _ = _laser_on_plane(rig, 500.0, 0.0)
-    empty = LaserPoints(reason="no stripe")
-    assert scan_frame(rig, empty, right, BOARD_R, BOARD_T).n_kept == 0
-    assert scan_frame(rig, left, empty, BOARD_R, BOARD_T).n_kept == 0
-    r = scan_frame(rig, left, right, None, None)
+def test_scan_needs_the_plane_a_board_pose_and_both_eyes() -> None:
+    rig, plane = _rig(), _plane()
+    truth = _curve(lambda x: np.full_like(x, 500.0))
+    left = _pixels(KL, np.eye(3), np.zeros(3), truth)
+    right = _pixels(KR, R_TRUE, T_TRUE, truth)
+    r = scan_frame(rig, None, left, right, BOARD2_R, BOARD2_T)
+    assert r.n_kept == 0 and "laser plane" in r.reason
+    r = scan_frame(rig, plane, left, right, None, None)
     assert r.n_kept == 0 and "board pose" in r.reason
+    empty = StripePixels(wh=WH, reason="no stripe")
+    assert scan_frame(rig, plane, empty, right, BOARD2_R, BOARD2_T).n_kept == 0
+    assert scan_frame(rig, plane, left, empty, BOARD2_R, BOARD2_T).n_kept == 0
 
 
-def test_a_shifted_right_stripe_moves_the_depth_and_is_not_otherwise_caught() -> None:
-    """Documents a real limit of two-camera stripe matching, not a bug.
+def test_scan_drops_points_outside_the_cylinder() -> None:
+    """The cylinder is what removes the bench and the wall, with no recognition."""
+    rig, plane = _rig(), _plane()
+    truth = _curve(lambda x: np.full_like(x, 500.0))        # 100 mm above the board
+    left = _pixels(KL, np.eye(3), np.zeros(3), truth)
+    right = _pixels(KR, R_TRUE, T_TRUE, truth)
+    assert scan_frame(rig, plane, left, right, BOARD2_R, BOARD2_T).n_kept > 250
 
-    Nothing purely geometric distinguishes "both eyes saw the same physical
-    point" from "both eyes saw laser, at points that do not correspond". The
-    match is built as a crossing of the left point's epipolar line with an
-    observed right segment, so the rays meet exactly by construction and
-    reprojection error is ~1e-13 px however wrong the pairing is. A uniformly
-    shifted stripe is self-consistent in both directions too, so a mutual
-    left-right check would not catch it either.
+    low = ScanParams(volume=ScanVolume(height_mm=50.0))
+    out = scan_frame(rig, plane, left, right, BOARD2_R, BOARD2_T, low)
+    assert out.n_kept == 0 and out.n_rejected_volume > 250
 
-    What it does do is change the reconstructed DEPTH. Here a 40 px shift moves
-    the surface from 100 mm above the board to about 38 mm — plausible, and
-    wrong. Only a gross error leaves the scan volume.
+    # The curve spans +/-80 mm in x; a 10 mm radius keeps the middle only.
+    narrow = ScanParams(volume=ScanVolume(radius_mm=10.0))
+    kept = scan_frame(rig, plane, left, right, BOARD2_R, BOARD2_T, narrow).n_kept
+    assert 0 < kept < 60
 
-    The independent check that would catch this is the laser plane: a
-    triangulated point must lie on the plane the laser sweeps. That is not
-    calibrated yet. In practice both eyes look at one physical stripe, so the
-    stripes cannot drift apart the way this test makes them.
-    """
-    rig = _rig()
-    left, right, _ = _laser_on_plane(rig, z_mm=500.0, y_mm=0.0)
-    truthful = scan_frame(rig, left, right, BOARD_R, BOARD_T)
-    assert truthful.n_kept > 100
-    assert abs(np.median(truthful.points_board[:, 2]) - 100.0) < 1.0
-
-    shifted = LaserPoints(points=(right.points + np.array([40.0, 0.0], np.float32)),
-                          along_x=right.along_x, reason=None)
-    out = scan_frame(rig, shifted and left, shifted, BOARD_R, BOARD_T)
-    assert out.n_kept > 0                       # still "agrees" — that is the point
-    moved = float(np.median(out.points_board[:, 2]))
-    assert abs(moved - 100.0) > 30.0, f"depth should have moved, got {moved:.1f}"
+    # On the board's own surface: the calibration target, not the subject.
+    on_board = _curve(lambda x: np.full_like(x, 600.0))
+    lb = _pixels(KL, np.eye(3), np.zeros(3), on_board)
+    rb = _pixels(KR, R_TRUE, T_TRUE, on_board)
+    assert scan_frame(rig, plane, lb, rb, BOARD2_R, BOARD2_T).n_kept == 0
 
 
 def test_volume_edges() -> None:
-    v = ScanVolume(height_mm=400.0, half_width_mm=200.0, floor_mm=3.0)
+    v = ScanVolume(height_mm=400.0, radius_mm=200.0, floor_mm=3.0)
     pts = np.array([
         [0.0, 0.0, 200.0],      # inside
         [0.0, 0.0, 1.0],        # below the floor: the board's own surface
         [0.0, 0.0, 401.0],      # above the ceiling
-        [201.0, 0.0, 200.0],    # outside in x
-        [0.0, -201.0, 200.0],   # outside in y
+        [201.0, 0.0, 200.0],    # outside the radius
+        [150.0, 150.0, 200.0],  # inside a 200 mm box, outside the disc
     ])
     assert v.contains(pts).tolist() == [True, False, False, False, False]
 
@@ -378,75 +363,6 @@ def test_point_cloud_decimated_samples_every_chunk() -> None:
     small = PointCloud()
     small.add(np.arange(9.0).reshape(3, 3))
     assert np.array_equal(small.decimated(1000), small.points())
-
-
-def _cross_polyline_reference(lines, pts, along_x, p):
-    """The original all-float64 formulation, kept as the definition."""
-    n_lines = len(lines)
-    if len(pts) < 2:
-        return (np.full((n_lines, 2), np.nan), np.zeros(n_lines, int),
-                np.zeros(n_lines))
-    a, b = pts[:-1], pts[1:]
-    scan_axis = 0 if along_x else 1
-    contiguous = np.abs(b[:, scan_axis] - a[:, scan_axis]) <= p.max_segment_gap_px
-    ha = np.hstack([a, np.ones((len(a), 1))])
-    hb = np.hstack([b, np.ones((len(b), 1))])
-    da = lines @ ha.T
-    db = lines @ hb.T
-    straddles = ((da <= 0) & (db >= 0)) | ((da >= 0) & (db <= 0))
-    straddles &= contiguous[None, :]
-    denom = da - db
-    straddles &= np.abs(denom) > 1e-12
-    n_cross = straddles.sum(axis=1)
-    match = np.full((n_lines, 2), np.nan)
-    angle = np.zeros(n_lines)
-    hit = n_cross > 0
-    if hit.any():
-        first = np.argmax(straddles, axis=1)
-        rows = np.flatnonzero(hit)
-        seg = first[rows]
-        t = da[rows, seg] / denom[rows, seg]
-        match[rows] = a[seg] + t[:, None] * (b[seg] - a[seg])
-        d = b[seg] - a[seg]
-        d_norm = np.linalg.norm(d, axis=1)
-        ln = lines[rows, :2]
-        l_norm = np.linalg.norm(ln, axis=1)
-        good = (d_norm > 1e-9) & (l_norm > 1e-9)
-        cosang = np.zeros(len(rows))
-        cosang[good] = np.abs(np.einsum("ij,ij->i", ln[good], d[good])) / (
-            l_norm[good] * d_norm[good])
-        angle[rows] = np.degrees(np.arccos(np.clip(cosang, 0.0, 1.0)))
-    return match, n_cross, angle
-
-
-def test_cross_polyline_matches_the_float64_definition() -> None:
-    """The chunked float32 sweep must agree with the reference on none, one
-    and many crossings, across chunk boundaries, with breaks in the stripe."""
-    rng = np.random.default_rng(11)
-    xs = np.arange(0, 1500, dtype=float)
-    ys = 500 + 120 * np.sin(xs / 90) + rng.normal(0, 0.3, len(xs))
-    ys[600:640] += 80                                   # a step in the subject
-    pts = np.stack([xs, ys], 1)
-    pts = np.delete(pts, np.s_[900:960], axis=0)        # a gap: no segment there
-    n = 700
-    # Lines of every slope: near-vertical ones cross once or not at all,
-    # near-horizontal ones cross the wave many times.
-    ang = rng.uniform(-np.pi / 2, np.pi / 2, n)
-    nx, ny = np.cos(ang), np.sin(ang)
-    px = rng.uniform(-100, 1600, n)
-    py = rng.uniform(300, 700, n)
-    lines = np.stack([nx, ny, -(nx * px + ny * py)], 1)
-    lines[::7] *= rng.uniform(0.01, 50, (len(lines[::7]), 1))   # unnormalised too
-    p = ScanParams()
-
-    m_ref, c_ref, a_ref = _cross_polyline_reference(lines, pts, True, p)
-    m_new, c_new, a_new = _cross_polyline(lines, pts, True, p)
-
-    assert (c_ref == 0).any() and (c_ref == 1).any() and (c_ref > 1).any()
-    assert np.array_equal(c_ref, c_new)
-    assert np.array_equal(np.isnan(m_ref), np.isnan(m_new))
-    assert np.allclose(np.nan_to_num(m_ref), np.nan_to_num(m_new), atol=1e-6)
-    assert np.allclose(a_ref, a_new, atol=1e-6)
 
 
 def _eye_result(side: str, t: float):

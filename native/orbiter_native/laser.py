@@ -55,6 +55,9 @@ class LaserParams:
     #: A fit worse than this is not a straight stripe; report it as not usable
     #: rather than handing the solve a line through a smear.
     max_rms_px: float = 2.0
+    #: Side of the opening, at half resolution, that estimates each channel's
+    #: background for `excess_redness`. Wider than the stripe ever is.
+    background_px: int = 15
 
 
 @dataclass
@@ -163,7 +166,87 @@ def redness(bgr: np.ndarray) -> np.ndarray:
     return cv2.subtract(r, g, dst=r)
 
 
-def _lit(red: np.ndarray, redness_min: int,
+def excess_redness(bgr: np.ndarray, background_px: int = 15) -> np.ndarray:
+    """Redness in excess of the local background, 0..255.
+
+    `redness` alone loses the stripe on blue surfaces: the surface's own blue
+    exceeds the laser's red and r - max(g, b) goes negative. But the laser
+    adds ONLY red, and only along a thin line. So estimate each channel's
+    background as what survives a morphological opening wider than the stripe
+    — the stripe cannot fit the element and is removed, the surface is not —
+    and take the redness of what is left above that background. Measured on
+    the drill's blue battery: 66 against a background of 46, where plain
+    redness gave 47 against 40. Dark rubber reflects almost no red (14) and
+    no measure recovers it.
+
+    The opening runs at half resolution: the background is smooth, and the
+    full-frame version cost 3.6 ms per channel against 0.15.
+    """
+    r = cv2.extractChannel(bgr, 2)
+    g = cv2.extractChannel(bgr, 1)
+    b = cv2.extractChannel(bgr, 0)
+    m = cv2.max(g, b, dst=g)
+    h, w = r.shape
+    element = cv2.getStructuringElement(cv2.MORPH_RECT, (background_px, background_px))
+
+    def excess(channel: np.ndarray) -> np.ndarray:
+        small = cv2.resize(channel, (max(1, w // 2), max(1, h // 2)),
+                           interpolation=cv2.INTER_AREA)
+        background = cv2.resize(cv2.morphologyEx(small, cv2.MORPH_OPEN, element),
+                                (w, h), interpolation=cv2.INTER_LINEAR)
+        return cv2.subtract(channel, background)
+
+    return cv2.subtract(excess(r), excess(m))
+
+
+def stripe_score(bgr: np.ndarray, background_px: int = 15) -> np.ndarray:
+    """How much each pixel looks like laser stripe: the larger of `redness`
+    and `excess_redness`. Plain redness carries bright neutral surfaces,
+    where the red channel sits near saturation and has no room for excess;
+    the excess carries coloured and dark ones."""
+    return cv2.max(redness(bgr), excess_redness(bgr, background_px))
+
+
+@dataclass
+class StripePixels:
+    """Every pixel one eye considers stripe, with its score — no centroid taken.
+
+    Scanning wants the pixels rather than per-scanline centroids because a
+    scanline can hold the stripe AND something else red — a wire, a
+    reflection — and a centroid over both is neither. The scan checks each
+    pixel against the other eye first and averages only what survives.
+    """
+
+    x: np.ndarray = field(default_factory=lambda: np.empty(0, np.int32))
+    y: np.ndarray = field(default_factory=lambda: np.empty(0, np.int32))
+    w: np.ndarray = field(default_factory=lambda: np.empty(0, np.uint8))
+    wh: tuple[int, int] = (0, 0)
+    #: True when the stripe runs mostly along x (scanlines are columns).
+    along_x: bool = True
+    ms: float = 0.0
+    reason: str | None = "no data"
+
+    @property
+    def ok(self) -> bool:
+        return self.reason is None and len(self.x) > 0
+
+    @property
+    def count(self) -> int:
+        return int(len(self.x))
+
+    def mask(self, grow_px: int = 0) -> np.ndarray:
+        """The pixels as an (h, w) uint8 image, grown `grow_px` each way."""
+        w, h = self.wh
+        img = np.zeros((h, w), np.uint8)
+        if len(self.x):
+            img[self.y, self.x] = 255
+            if grow_px > 0:
+                n = 2 * grow_px + 1
+                img = cv2.dilate(img, cv2.getStructuringElement(cv2.MORPH_RECT, (n, n)))
+        return img
+
+
+def _lit(score: np.ndarray, redness_min: int,
          within: np.ndarray | None) -> tuple[np.ndarray, bool] | None:
     """The stripe's intensity with everything else zeroed, and which way it runs.
 
@@ -173,7 +256,7 @@ def _lit(red: np.ndarray, redness_min: int,
     rows sharing one column, and scanning columns there would average the
     whole stripe into one useless point per column.
     """
-    keep = cv2.threshold(red, redness_min - 1, 255, cv2.THRESH_BINARY)[1]
+    keep = cv2.threshold(score, redness_min - 1, 255, cv2.THRESH_BINARY)[1]
     if within is not None:
         keep[~within] = 0
     cols = np.flatnonzero(cv2.reduce(keep, 0, cv2.REDUCE_MAX).ravel())
@@ -181,7 +264,33 @@ def _lit(red: np.ndarray, redness_min: int,
         return None
     rows = np.flatnonzero(cv2.reduce(keep, 1, cv2.REDUCE_MAX).ravel())
     along_x = (cols[-1] - cols[0]) >= (rows[-1] - rows[0])
-    return cv2.bitwise_and(red, keep), bool(along_x)
+    return cv2.bitwise_and(score, keep), bool(along_x)
+
+
+def find_stripe_pixels(bgr: np.ndarray, p: LaserParams = LaserParams()) -> StripePixels:
+    """Every stripe pixel in the whole frame, with its score. For scanning.
+
+    No mask: the subject stands above the board, so most of the stripe that
+    matters falls outside the board's outline. Rejecting what is not wanted is
+    the other eye's job, then the scan volume's, and both work in millimetres.
+    """
+    t0 = time.perf_counter()
+
+    def done(out: StripePixels) -> StripePixels:
+        out.ms = (time.perf_counter() - t0) * 1000.0
+        return out
+
+    if bgr.ndim != 3 or bgr.shape[2] != 3:
+        raise ValueError("the laser is red; this needs a colour frame")
+    h, w = bgr.shape[:2]
+    lit = _lit(stripe_score(bgr, p.background_px), p.redness_min, None)
+    if lit is None:
+        return done(StripePixels(wh=(w, h), reason="no stripe above the redness threshold"))
+    lit, along_x = lit
+    xy = cv2.findNonZero(lit).reshape(-1, 2)
+    return done(StripePixels(x=xy[:, 0].astype(np.int32), y=xy[:, 1].astype(np.int32),
+                             w=lit[xy[:, 1], xy[:, 0]], wh=(w, h),
+                             along_x=along_x, reason=None))
 
 
 def _centroids(lit: np.ndarray, along_x: bool) -> np.ndarray:
@@ -278,7 +387,7 @@ def find_laser_points(
         sub_bgr = bgr[y0:y1, x0:x1]
         sub_keep = mask[y0:y1, x0:x1]
 
-    lit = _lit(redness(sub_bgr), p.redness_min, sub_keep)
+    lit = _lit(stripe_score(sub_bgr, p.background_px), p.redness_min, sub_keep)
     if lit is None:
         return done(LaserPoints(reason="no stripe above the redness threshold"))
     lit, along_x = lit
@@ -330,7 +439,7 @@ def find_laser_line(
         sub_bgr = bgr[y0:y1, x0:x1]
         sub_keep = mask[y0:y1, x0:x1]
 
-    lit = _lit(redness(sub_bgr), p.redness_min, sub_keep)
+    lit = _lit(stripe_score(sub_bgr, p.background_px), p.redness_min, sub_keep)
     if lit is None:
         return done(LaserLine(reason="no stripe above the redness threshold"))
     lit, along_x = lit

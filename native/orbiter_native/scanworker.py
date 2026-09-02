@@ -27,7 +27,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .config import RigConfig
-from .laser import LaserPoints
+from .laser import StripePixels
 from .laserplane import LaserPlane, from_config as plane_from_config
 from .scan import CloudOverlay, PointCloud, ScanFrame, ScanParams, scan_frame
 from .stereo import StereoRig, result_from_config
@@ -54,7 +54,7 @@ class ScanInput:
     """What scanning needs from one eye's result — without its 6 MB frame."""
 
     capture_mono: float
-    stripe: LaserPoints | None
+    stripe: StripePixels | None
     board_R: np.ndarray | None
     board_t: np.ndarray | None
     wh: tuple[int, int]
@@ -216,7 +216,7 @@ class ScanWorker:
         if a.board_R is None or a.board_t is None:
             self._publish(None, "board not visible — it is what defines the scan volume")
             return
-        frame = scan_frame(rig, a.stripe, b.stripe, a.board_R, a.board_t, params, plane)
+        frame = scan_frame(rig, plane, a.stripe, b.stripe, a.board_R, a.board_t, params)
         snap = None
         with self._lock:
             self._pairs += 1

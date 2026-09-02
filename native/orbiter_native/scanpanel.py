@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import logging
 
-import numpy as np
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -75,19 +74,31 @@ class ScanPanel(QFrame):
         self.height_mm.setValue(ScanVolume().height_mm)
         self.height_mm.setSuffix(" mm")
         box.addWidget(self.height_mm, 0, 1)
-        box.addWidget(QLabel("half width"), 1, 0)
-        self.half_mm = QDoubleSpinBox()
-        self.half_mm.setRange(10.0, 2000.0)
-        self.half_mm.setValue(ScanVolume().half_width_mm)
-        self.half_mm.setSuffix(" mm")
-        box.addWidget(self.half_mm, 1, 1)
-        for w in (self.height_mm, self.half_mm):
+        box.addWidget(QLabel("radius"), 1, 0)
+        self.radius_mm = QDoubleSpinBox()
+        self.radius_mm.setRange(10.0, 2000.0)
+        self.radius_mm.setValue(ScanVolume().radius_mm)
+        self.radius_mm.setSuffix(" mm")
+        box.addWidget(self.radius_mm, 1, 1)
+        box.addWidget(QLabel("floor"), 2, 0)
+        self.floor_mm = QDoubleSpinBox()
+        self.floor_mm.setRange(0.0, 100.0)
+        self.floor_mm.setValue(ScanVolume().floor_mm)
+        self.floor_mm.setSuffix(" mm")
+        self.floor_mm.setToolTip(
+            "Points closer to the board than this are the board's own surface. "
+            "Plane-based points carry about 1 mm of noise at half a metre."
+        )
+        box.addWidget(self.floor_mm, 2, 1)
+        for w in (self.height_mm, self.radius_mm):
             w.setToolTip(
-                "The volume above the board that scanning keeps, in the BOARD's "
-                "own frame — so it stays put as the board moves, and the bench, "
-                "your hands and the far wall fall outside it without needing to "
-                "be recognised."
+                "A cylinder standing on the board — the volume scanning keeps, "
+                "in the BOARD's own frame, so it stays put as the board moves. "
+                "The bench, your hands and the wall behind fall outside it "
+                "without needing to be recognised. The board is a disc, so the "
+                "radius is naturally its own: 144 mm on this rig."
             )
+        for w in (self.height_mm, self.radius_mm, self.floor_mm):
             w.valueChanged.connect(self._push_params)
         root.addLayout(box)
 
@@ -112,7 +123,8 @@ class ScanPanel(QFrame):
 
     def params(self) -> ScanParams:
         return ScanParams(volume=ScanVolume(height_mm=self.height_mm.value(),
-                                            half_width_mm=self.half_mm.value()))
+                                            radius_mm=self.radius_mm.value(),
+                                            floor_mm=self.floor_mm.value()))
 
     def _push_params(self, _value=None) -> None:
         self._scanner.set_params(self.params())
@@ -148,16 +160,10 @@ class ScanPanel(QFrame):
         elif f is not None and f.reason:
             lines.append(f"frame   — {f.reason}")
         elif f is not None:
-            lines.append(f"frame   {f.n_kept}/{f.n_candidates} kept")
-            lines.append(f"no match {f.n_rejected_nomatch} · "
-                         f"ambiguous {f.n_rejected_ambiguous}")
-            lines.append(f"shallow  {f.n_rejected_geometry} · "
-                         f"outside box {f.n_rejected_volume}")
-            if f.n_rejected_plane or f.n_single_eye:
-                lines.append(f"off-plane {f.n_rejected_plane} · "
-                             f"one-eye {f.n_single_eye}")
-            if f.n_kept:
-                lines.append(f"reproj  med {np.nanmedian(f.reproj_px):.2f} px")
+            lines.append(f"frame   {f.n_kept}/{f.n_scanlines} scanlines kept")
+            lines.append(f"pixels  {f.n_confirmed}/{f.n_pixels} confirmed by the right eye")
+            lines.append(f"unconfirmed {f.n_rejected_unconfirmed} · "
+                         f"outside {f.n_rejected_volume}")
         self.stats.setText("\n".join(lines))
 
     # ── actions ───────────────────────────────────────────────────────────

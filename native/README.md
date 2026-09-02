@@ -180,32 +180,46 @@ state.
 
 ## Scanning
 
-With the pair calibrated and the laser detector on, **scanning** triangulates
-the stripe and accumulates a cloud.
+With the pair and the laser plane calibrated and the laser detector on,
+**scanning** turns the stripe into points and accumulates a cloud.
 
-Correspondence is epipolar: a point in the left image lies on a known line in
-the right one, the laser gives a second line, and two lines meet in one point.
-No descriptor, no search window, no similarity threshold.
+Each stripe pixel in the left eye is a ray, and the ray meets the calibrated
+laser plane in one point. That point is projected into the right eye, and it
+counts only if the right eye saw stripe there too — within 3 px, the
+calibration's own slack. The survivors are averaged per scanline into a
+sub-pixel centroid, and the centroid's ray meets the plane for the point that
+is kept. No epipolar search, no matching threshold: the right eye vetoes, it
+does not measure.
 
-**What "confirmed by both cameras" actually means here.** Not reprojection
-error — that check is vacuous, and it is worth knowing why because it looks
-like it should work. The match is *constructed* as a point on the left
-observation's epipolar line, so the two rays meet exactly by construction and
-every point reprojects to ~1e-13 px however wrong the match is. Sliding the
-right eye's stripe sideways by 25 px was measured to change nothing: every
-point still "agreed". The real test is whether the intersection lands where the
-right eye **actually detected laser**, not merely on the infinite line fitted
-through its detections.
+**Why not stereo triangulation.** The first version matched left stripe
+centroids to the right eye's stripe along epipolar lines and triangulated. On
+this bench 16-24% of image columns hold the stripe AND something else red — a
+wire, a reflection — and the centroid of such a column is neither; where it
+found no match, a one-eye fallback put it on the plane unverified. Checking
+each *pixel* against the right eye before any centroid is taken removes the
+wire from the average instead of averaging it in. The plane is also the more
+precise instrument on this rig: the sheet passes 74 mm from the left camera,
+so a 0.5 px centroid gives about 1.2 mm at half a metre, against 2.4 mm from
+the 144 mm stereo baseline at its 1.95 px fit.
 
-The volume filter is expressed in the **board's** frame, so it stays put as the
-board moves and "above" keeps meaning above the board. That frame is centred on
-the board with z out of the printed face (`cvcore.estimate_pose`), not OpenCV's
-raw one — whose origin is a corner and whose z points *into* the board, as
-measured on a straight-on view; in that frame the box selected the space behind
-the board and kept nothing but the board's own surface noise. The bench, your hands
-and the far wall fall outside it without any of them needing to be recognised.
-Points below a 3 mm floor are the stripe lying on the board itself — the
-calibration target, not the subject.
+**Stripe on coloured surfaces.** `r - max(g, b)` loses the stripe on blue: the
+surface's own blue exceeds the laser's red. The laser adds only red, and only
+along a thin line, so the detector also measures redness *in excess of the
+local background* — each channel minus its morphological opening — and takes
+the larger of the two. Measured on the drill's blue battery: 66 against a
+background of 46, where plain redness gave 47 against 40. Dark rubber reflects
+almost no red at all, and no measure recovers it.
+
+The volume is a **cylinder standing on the board**, in the board's frame, so
+it stays put as the board moves and "above" keeps meaning above the board.
+That frame is centred on the board with z out of the printed face
+(`cvcore.estimate_pose`), not OpenCV's raw one — whose origin is a corner and
+whose z points *into* the board, as measured on a straight-on view; in that
+frame the box selected the space behind the board and kept nothing but the
+board's own surface noise. A cylinder rather than a box because the board is a
+disc and the subject stands on it: the wall behind the bench sits inside a
+box's corners once the board is tilted, and outside a disc the size of the
+board. Points below a 5 mm floor are the stripe on the board itself.
 
 The board must be visible for scanning to work: it is what defines where the
 volume is.
@@ -214,16 +228,6 @@ While scanning, the cloud so far is drawn over both eyes in orange, each eye
 projecting it through its own board pose — so the two overlays disagreeing is
 itself a sign that the board poses do. The overlay is decimated to about 40k
 points; the export (**Export PLY**, binary little-endian) carries everything.
-
-### The one geometric trap
-
-**A laser line parallel to the stereo baseline cannot be triangulated this way.**
-It runs along the epipolar lines, so a point in one image has no unique match
-in the other, and no amount of calibration quality fixes it. The scan reports
-`stripe runs along the epipolar lines` rather than producing garbage.
-
-If that appears, rotate the laser roughly 90 degrees. The stripe wants to cross
-the baseline, not follow it.
 
 ## Measured on this machine
 

@@ -279,70 +279,41 @@ def result_from_config(cfg: dict[str, Any] | None,
 
 
 class StereoRig:
-    """Projection matrices and the epipolar relation, derived once.
+    """The two eyes' intrinsics and mutual pose, ready to project.
 
-    Built when the calibration changes rather than per frame: these are pure
-    functions of the calibration and rebuilding them at 30 Hz would be waste.
+    What scanning needs from the pair is one thing: where a point in the left
+    camera's frame lands in the right image, so the right eye can confirm or
+    veto it. Correspondence and depth come from the laser plane — see
+    `scan.py` for why that beat triangulation on this rig.
     """
 
     def __init__(self, left_k: Intrinsics, right_k: Intrinsics, geom: StereoResult):
         self.left_k = left_k
         self.right_k = right_k
         self.geom = geom
-        # Left camera is the reference frame: P_left = K [I|0], P_right = K [R|T].
-        self.P_left = left_k.K @ np.hstack([np.eye(3), np.zeros((3, 1))])
-        self.P_right = right_k.K @ np.hstack([geom.R, geom.T.reshape(3, 1)])
-        # Fundamental matrix from the geometry, so a stored solve (which does
-        # not carry F) still yields epipolar lines.
-        tx = np.array([[0, -geom.T[2], geom.T[1]],
-                       [geom.T[2], 0, -geom.T[0]],
-                       [-geom.T[1], geom.T[0], 0]], float)
-        E = tx @ geom.R
-        self.F = np.linalg.inv(right_k.K).T @ E @ np.linalg.inv(left_k.K)
 
-    def undistort(self, pts: np.ndarray, side: str) -> np.ndarray:
-        """Remove lens distortion from (N, 2) points, keeping pixel units.
+    def project_right(self, xyz_left: np.ndarray) -> np.ndarray:
+        """Right-eye pixels of (N, 3) points in the LEFT camera's frame.
 
-        Triangulation assumes a pinhole camera; feeding it raw pixels from a
-        lens with k1 = -0.28 would bend every ray.
+        NaN for points behind the right camera. The distortion model is the
+        five-coefficient one the intrinsics were solved with (k1 k2 p1 p2 k3).
+        Written out rather than `cv2.projectPoints`, which cost 5.7 ms per
+        35k points against about 1 ms here.
         """
-        k = self.left_k if side == "left" else self.right_k
-        out = cv2.undistortPoints(pts.reshape(-1, 1, 2).astype(np.float64),
-                                  k.K, k.D, P=k.K)
-        return out.reshape(-1, 2)
-
-    def epipolar_lines(self, left_pts: np.ndarray) -> np.ndarray:
-        """For each undistorted left point, its line (a, b, c) in the right image."""
-        h = np.hstack([left_pts, np.ones((len(left_pts), 1))])
-        return (self.F @ h.T).T
-
-    def triangulate(self, left_pts: np.ndarray, right_pts: np.ndarray) -> np.ndarray:
-        """(N, 3) points in the LEFT camera's frame, in mm."""
-        x = cv2.triangulatePoints(self.P_left, self.P_right,
-                                  left_pts.T.astype(np.float64),
-                                  right_pts.T.astype(np.float64))
-        w = x[3]
-        safe = np.abs(w) > 1e-12
-        out = np.full((len(left_pts), 3), np.nan)
-        out[safe] = (x[:3, safe] / w[safe]).T
+        p = np.asarray(xyz_left, float) @ self.geom.R.T + self.geom.T.reshape(1, 3)
+        out = np.full((len(p), 2), np.nan)
+        z = p[:, 2]
+        ok = z > 1e-6
+        if not ok.any():
+            return out
+        x = p[ok, 0] / z[ok]
+        y = p[ok, 1] / z[ok]
+        k = self.right_k
+        k1, k2, p1, p2, k3 = (list(np.asarray(k.D, float).ravel()) + [0.0] * 5)[:5]
+        r2 = x * x + y * y
+        radial = 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2
+        xd = x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x)
+        yd = y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y
+        out[ok, 0] = k.fx * xd + k.cx
+        out[ok, 1] = k.fy * yd + k.cy
         return out
-
-    def reprojection_error(self, xyz: np.ndarray, left_pts: np.ndarray,
-                           right_pts: np.ndarray) -> np.ndarray:
-        """Per-point reprojection error in pixels, worst of the two views.
-
-        This is what "confirmed by both cameras" means numerically: a point
-        that reprojects close to BOTH observations is one thing seen twice; a
-        large error means the two images were showing different things and the
-        triangulation split the difference.
-        """
-        h = np.hstack([xyz, np.ones((len(xyz), 1))])
-        err = np.full(len(xyz), np.inf)
-        for P, obs in ((self.P_left, left_pts), (self.P_right, right_pts)):
-            proj = (P @ h.T).T
-            w = proj[:, 2]
-            ok = np.abs(w) > 1e-12
-            d = np.full(len(xyz), np.inf)
-            d[ok] = np.linalg.norm(proj[ok, :2] / w[ok, None] - obs[ok], axis=1)
-            err = np.where(np.isinf(err), d, np.maximum(err, d))
-        return err

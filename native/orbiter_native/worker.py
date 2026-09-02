@@ -38,10 +38,10 @@ from .intrinsics import ViewDescriptor, describe
 from .laser import (
     LaserLine,
     LaserParams,
-    LaserPoints,
+    StripePixels,
     board_mask,
     find_laser_line,
-    find_laser_points,
+    find_stripe_pixels,
 )
 from .laser import draw as draw_laser
 from .orient import Orientation, apply as orient_apply, map_points
@@ -125,9 +125,9 @@ class EyeResult:
     stats: EyeStats
     board: BoardHit | None = None
     laser: LaserLine | None = None
-    #: Shape-free stripe points — what scanning consumes. Empty unless the
-    #: worker is in scan mode.
-    stripe: LaserPoints | None = None
+    #: Every stripe pixel with its score — what scanning consumes. Empty
+    #: unless the worker is in scan mode.
+    stripe: StripePixels | None = None
     #: Frame size, needed to interpret corner coordinates and to check that a
     #: stored calibration was solved at this resolution.
     wh: tuple[int, int] = (0, 0)
@@ -332,10 +332,10 @@ class EyeWorker(QObject):
         # kept 126 of 649 points — the 523 it dropped were the object. So no
         # fit and no mask; the 3D volume does the rejecting, in millimetres.
         laser = LaserLine()
-        points = LaserPoints()
+        pixels = StripePixels()
         hull = None
         if laser_on and scan_mode:
-            points = find_laser_points(frame.bgr, None, laser_params)
+            pixels = find_stripe_pixels(frame.bgr, laser_params)
         elif laser_on:
             mask = board_mask(board.corners, frame.gray.shape)
             if mask is None:
@@ -354,8 +354,9 @@ class EyeWorker(QObject):
             # Single pixels, not a polyline: the stripe breaks wherever the
             # subject does, and a segment drawn across a break would show a
             # surface that was never measured.
-            _draw_points(bgr, points.points if orientation.is_identity
-                         else _map_all(points.points, orientation, w, h))
+            xy = np.stack([pixels.x, pixels.y], axis=1)
+            _draw_points(bgr, xy if orientation.is_identity
+                         else _map_all(xy, orientation, w, h))
             if overlay is not None and board.R is not None and intrinsics is not None:
                 _draw_cloud(bgr, overlay.points(), board.R, board.t, intrinsics,
                             orientation, w, h)
@@ -364,9 +365,9 @@ class EyeWorker(QObject):
                        _orient_hull(hull, orientation, w, h))
 
         self._det_times.append(time.monotonic())
-        self._publish(frame, board, laser, bgr, descriptor, points)
+        self._publish(frame, board, laser, bgr, descriptor, pixels)
 
-    def _publish(self, frame, board, laser, bgr, descriptor, points) -> None:
+    def _publish(self, frame, board, laser, bgr, descriptor, pixels) -> None:
         s = self._stats
         s.frames += 1
         s.recv_fps = _rate(self._recv_times)
@@ -379,12 +380,13 @@ class EyeWorker(QObject):
         s.laser_inliers = laser.n_inliers
         s.laser_rms_px = laser.rms_px
         s.laser_angle_deg = laser.angle_deg
-        s.laser_reason = points.reason if points.count or points.reason != "no data"             else laser.reason
-        s.stripe_points = points.count
+        s.laser_reason = (pixels.reason if pixels.count or pixels.reason != "no data"
+                          else laser.reason)
+        s.stripe_points = pixels.count
         s.server_age_ms = frame.server_age_ms
         h, w = frame.gray.shape
         res = EyeResult(
-            self.side, bgr, _copy_stats(s), board, laser, stripe=points,
+            self.side, bgr, _copy_stats(s), board, laser, stripe=pixels,
             wh=(w, h), descriptor=descriptor, capture_mono=frame.capture_mono,
         )
         for sink in self._sinks:
@@ -395,7 +397,7 @@ class EyeWorker(QObject):
 
 
 def _draw_points(bgr: np.ndarray, pts: np.ndarray) -> None:
-    """Draw the raw stripe centroids — one pixel each, no line joining them.
+    """Draw the raw stripe pixels — one each, no line joining them.
 
     Not a polyline: the stripe breaks wherever the subject does, and drawing a
     segment across a break would show a surface that was never measured.
