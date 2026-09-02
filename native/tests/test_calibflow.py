@@ -165,9 +165,16 @@ def test_views_stop_at_the_ceiling(board) -> None:
 
 # ── the cycle ────────────────────────────────────────────────────────────
 
-def _fake_solvers(intr_rms=0.3, stereo_rms=0.4, plane_rms=0.3, sigma=0.0002):
+def _fake_solvers(intr_rms=0.3, stereo_rms=0.4, plane_rms=0.3, sigma=0.0002,
+                  intr_sigma_f=None):
+    # A camera is judged by its focal length's uncertainty, not by the
+    # reprojection error it fitted, so the fake has to carry one: left unset
+    # it is NaN, and every solve would look like news over an unknown.
+    sigma_f = intr_rms * 10.0 if intr_sigma_f is None else intr_sigma_f
+
     def intrinsics(views, board, tilt_spread=None):
-        return SolveResult(K, intr_rms, len(views), WH, tilt_spread=tilt_spread), None
+        return SolveResult(K, intr_rms, len(views), WH, tilt_spread=tilt_spread,
+                           sigma_f_px=sigma_f), None
 
     def stereo(pairs, board, kl, kr, wh):
         return StereoResult(R=np.eye(3), T=np.array([-144.0, 0.0, 0.0]), E=np.zeros((3, 3)),
@@ -261,6 +268,22 @@ def test_better_judges_more_data_and_lower_residual() -> None:
     assert _better(10, 0.5, Saved.first(10, float("nan")))   # unknown on the server
 
 
+def test_a_thinner_solve_never_replaces_a_richer_one() -> None:
+    """Every residual here is measured on the data that was fitted, so it
+    falls as views are taken away. On the rig a 196-view calibration was
+    replaced by a 13-view one that reported a smaller error, and every richer
+    solve after it was refused for not beating that. Data first, then the
+    number."""
+    rich = Saved.first(196, 1.13)
+    assert not _better(13, 0.67, rich)                # fewer views, better number
+    assert _better(196, 1.10, rich)                   # as much data, and better
+    assert _better(210, 1.20, rich)                   # more data, a little worse
+    # A figure the server never recorded does not open the door either: the
+    # view count still holds the bar.
+    assert not _better(13, 0.67, Saved.first(196, float("nan")))
+    assert _better(200, 0.67, Saved.first(196, float("nan")))
+
+
 def test_the_tolerance_is_spent_once_and_not_again_every_cycle() -> None:
     """More data at a slightly worse residual is worth saving. Measured
     against the residual in hand it would be worth saving again next cycle,
@@ -275,6 +298,48 @@ def test_the_tolerance_is_spent_once_and_not_again_every_cycle() -> None:
     assert saved.adopt(40, 0.42).floor == 0.42        # a better solve lowers it
     seeded = Saved.first(10, float("nan"))            # the server said no residual
     assert seeded.adopt(20, 0.9).floor == 0.9
+
+
+def test_new_intrinsics_retire_what_was_solved_through_the_old(board) -> None:
+    """The sheet is coordinates in the left camera's frame. Replace the left
+    intrinsics and a sheet refitted through the new ones has to be able to
+    take the old one's place, even at a worse residual — otherwise what the
+    server holds is a camera from one cycle and a sheet from another, and the
+    scan's right-eye veto is the first thing that ever notices."""
+    flow = _flow(board)
+    flow.solvers = _fake_solvers(intr_rms=0.3)
+    flow.plane = _Plane(0.3)
+    _fill(flow, board)
+    flow.finish(flow.run(flow.snapshot(now=0.0)), now=1.0)
+    assert "plane" in flow.saved and "stereo" in flow.saved
+    assert flow.plane_known.rms_mm == 0.3
+
+    # Better intrinsics, and a sheet refitted through them that is worse than
+    # the one banked under the old ones. It still has to land.
+    flow.solvers = _fake_solvers(intr_rms=0.1)
+    flow.plane = _Plane(0.9)
+    _fill(flow, board, n_views=2, motion=0)
+    payload = flow.finish(flow.run(flow.snapshot(now=10.0)), now=11.0)
+    assert payload is not None and "_laser_plane" in payload
+    assert flow.plane_known.rms_mm == 0.9
+
+
+def test_a_cycle_that_re_solves_the_same_camera_keeps_its_dependants(board) -> None:
+    """Refused is not the same as different: once the intrinsics settle, every
+    cycle re-solves the camera already in force and that solve is refused as
+    no improvement. What the cycle built on it is still built on the camera
+    the rig has, and must not be thrown away with it."""
+    flow = _flow(board)
+    flow.solvers = _fake_solvers(intr_rms=0.3)
+    flow.plane = _Plane(0.5)
+    _fill(flow, board)
+    flow.finish(flow.run(flow.snapshot(now=0.0)), now=1.0)
+
+    flow.plane = _Plane(0.2)                       # a better sheet, same camera
+    _fill(flow, board, n_views=2, motion=0)
+    payload = flow.finish(flow.run(flow.snapshot(now=10.0)), now=11.0)
+    assert payload is not None and "_laser_plane" in payload
+    assert flow.plane_known.rms_mm == 0.2
 
 
 def test_cycles_are_paced_and_need_new_data(board) -> None:

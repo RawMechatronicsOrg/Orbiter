@@ -168,6 +168,10 @@ class ScanFrame:
     #: Points standing off both their neighbours along the stripe.
     n_rejected_jump: int = 0
     n_rejected_volume: int = 0
+    #: How far, in px along the scanline, the right eye's stripe sits from
+    #: where the left eye's candidates project into its frame. NaN when the
+    #: eyes share no scanline. See `_veto_offset`.
+    veto_px: float = float("nan")
     reason: str | None = None
     #: Rolling shutter: the largest shift the per-row poses made to a kept
     #: point, the board's speed the twist implied, or why none was applied.
@@ -186,6 +190,39 @@ def _on_plane(k, plane: LaserPlane, pixels: np.ndarray) -> np.ndarray:
     left camera's frame. NaN where the ray runs parallel or away."""
     d = rays(pixels, k)
     return plane.intersect_rays(np.zeros_like(d), d)
+
+
+def _veto_offset(right: StripePixels, uv: np.ndarray) -> float:
+    """Median signed distance, px, from where the left eye puts the stripe in
+    the right frame to where the right eye actually has it.
+
+    The veto asks whether those coincide within `confirm_px`; this says by
+    how much they miss, which is what tells a calibration that cannot scan
+    from a scene with nothing in it. Intrinsics, sheet and pair geometry that
+    disagree put the stripe tens of pixels from where the other eye sees it,
+    and then no amount of stripe will ever confirm — while every count on the
+    panel reads exactly as it would with the laser switched off. NaN when the
+    two eyes share no scanline.
+    """
+    if not len(uv) or not len(right.x):
+        return float("nan")
+    w, h = right.wh
+    n = w if right.along_x else h
+    key_px = (right.x if right.along_x else right.y).astype(np.int64)
+    across_px = (right.y if right.along_x else right.x).astype(np.float64)
+    weight = np.maximum(right.w.astype(np.float64), 1.0)
+    total = np.bincount(key_px, weights=weight, minlength=n)
+    moment = np.bincount(key_px, weights=weight * across_px, minlength=n)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        seen = moment / total                      # NaN on scanlines with none
+    key = np.rint(uv[:, 0] if right.along_x else uv[:, 1])
+    across = uv[:, 1] if right.along_x else uv[:, 0]
+    on = np.isfinite(key) & (key >= 0) & (key < n)
+    if not on.any():
+        return float("nan")
+    off = across[on] - seen[key[on].astype(np.int64)]
+    off = off[np.isfinite(off)]
+    return float(np.median(off)) if len(off) else float("nan")
 
 
 def _whole_blobs(px: StripePixels, confirmed: np.ndarray, reach: int) -> np.ndarray:
@@ -328,8 +365,10 @@ def scan_frame(
     # The veto. A candidate is real only if the right eye saw stripe where
     # the candidate projects.
     confirmed = np.zeros(len(px), bool)
+    veto_px = float("nan")
     if ok.any():
         uv = rig.project_right(cand[ok])
+        veto_px = _veto_offset(right, uv)
         seen = right.mask(params.confirm_px)
         w, h = right.wh
         fin = np.isfinite(uv).all(axis=1)
@@ -402,6 +441,7 @@ def scan_frame(
         n_rejected_range=n_range,
         n_rejected_jump=n_jump,
         n_rejected_volume=int((~inside).sum()),
+        veto_px=veto_px,
         rs_max_mm=rs_max,
         speed_mm_s=0.0 if motion is None else motion.speed_mm_s,
         spin_deg_s=0.0 if motion is None else motion.spin_deg_s,

@@ -206,12 +206,21 @@ class Saved:
 
 
 def _better(new_count: int, new_res: float, old: Saved | None) -> bool:
-    """Should this solve replace what is saved? A lower residual always
-    wins. More data at a slightly worse residual wins too — but against
-    `old.floor`, the best this solve has ever reached, so the tolerance
-    cannot be spent again every cycle and ratchet the calibration up."""
+    """Should this solve replace what is saved?
+
+    Never on less data. Every residual here is measured on the very data
+    that was fitted, and such a residual falls as data is taken away: a
+    calibration from thirteen views reports a smaller reprojection error
+    than the same rig from a hundred and ninety-six, and preferring it
+    walks the calibration to its most overfit point and freezes there.
+    So more data first, and only then the residual — lower wins, or a
+    little worse against `old.floor`, the best this solve has reached, so
+    the tolerance cannot be spent again every cycle and ratchet upward.
+    """
     if old is None:
         return True
+    if new_count < old.count:
+        return False
     if not np.isfinite(old.residual):
         return True
     if new_res < old.residual:
@@ -284,8 +293,9 @@ class CalibrationFlow:
         key = f"intrinsics:{side}"
         if key not in self.saved:
             n = int((raw or {}).get("views", 0) or 0)
-            rms = float((raw or {}).get("rms_px", float("nan")) or float("nan"))
-            self.saved[key] = Saved.first(n, rms)
+            # Stored before this app measured one: unknown, not zero. The
+            # view count still holds the bar until a challenger matches it.
+            self.saved[key] = Saved.first(n, self.sigma_f.get(side, float("nan")))
 
     def set_stored(self, key: str, count: int, residual: float) -> None:
         """A stereo / plane / readout figure the server holds."""
@@ -569,8 +579,11 @@ class CalibrationFlow:
         for key in out.results:
             self.reasons.pop(key, None)
         payload: dict[str, Any] = {}
+        stale = self._stale_dependants(out)
         for key, res in out.results.items():
             self.results[key] = res
+            if key in stale:
+                continue
             count, resid = _measure(key, res)
             if not _better(count, resid, self.saved.get(key)):
                 continue
@@ -582,6 +595,7 @@ class CalibrationFlow:
                 self.known_k[side] = res.intrinsics
                 self.sigma_f[side] = float(res.sigma_f_px)
                 payload.setdefault(side, {})["intrinsics"] = res.as_config()
+                self._retire_dependants(side)
             elif kind == "stereo":
                 payload["_extrinsics"] = res.as_config()
             elif kind == "plane":
@@ -590,6 +604,47 @@ class CalibrationFlow:
             elif kind == "readout":
                 payload.setdefault(side, {})["readout"] = res.as_config()
         return payload or None
+
+    def _stale_dependants(self, out: Outcome) -> set[str]:
+        """The cycle's solves that rest on intrinsics that will not be in force.
+
+        A cycle refits the sheet, the pair and the readouts through the
+        intrinsics it has just solved. Where those are refused and differ
+        from the ones in force, what was built on them describes a camera
+        the rig does not have — and saving it is how a calibration becomes a
+        mixture of generations that only the scan's veto ever notices. A
+        refused solve that repeats what is already in force changes nothing,
+        and what was built on it is as good as anything.
+        """
+        stale: set[str] = set()
+        for side in ("left", "right"):
+            key = f"intrinsics:{side}"
+            res = out.results.get(key)
+            if res is None:
+                continue
+            if (_better(*_measure(key, res), self.saved.get(key))
+                    or res.intrinsics == self.known_k.get(side)):
+                continue
+            stale.add(f"readout:{side}")
+            stale.add("stereo")
+            if side == "left":
+                stale.add("plane")
+        return stale
+
+    def _retire_dependants(self, side: str) -> None:
+        """New intrinsics for an eye retire what was solved through the old.
+
+        The sheet is coordinates in the left camera's frame, the pair
+        geometry relates the two cameras' models, and a readout is measured
+        through one of them. Replacing an eye's intrinsics changes what all
+        three mean, so their bars go with them: the next cycle's refit takes
+        their place instead of being refused for not beating a figure that
+        no longer describes the same thing.
+        """
+        self.saved.pop("stereo", None)
+        self.saved.pop(f"readout:{side}", None)
+        if side == "left":
+            self.saved.pop("plane", None)
 
     # ── the number ────────────────────────────────────────────────────────
 
@@ -711,7 +766,10 @@ def _measure(key: str, res) -> tuple[int, float]:
     """(how much data, how good) for a result, for `_better`."""
     kind = key.partition(":")[0]
     if kind == "intrinsics":
-        return int(res.n_views), float(res.rms_px)
+        # Not the reprojection error: that is what was fitted, and it says
+        # more about how few views were used than about the camera. The
+        # focal length's own standard error is what the solve is for.
+        return int(res.n_views), float(res.sigma_f_px)
     if kind == "stereo":
         return int(res.n_views), float(res.rms_px)
     if kind == "plane":

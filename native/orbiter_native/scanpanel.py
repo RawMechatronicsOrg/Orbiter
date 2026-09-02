@@ -187,6 +187,9 @@ class ScanPanel(QFrame):
         elif f is not None:
             lines.append(f"frame   {f.n_kept}/{f.n_scanlines} scanlines kept")
             lines.append(f"pixels  {f.n_confirmed}/{f.n_pixels} confirmed by the right eye")
+            if f.veto_px == f.veto_px:            # not NaN
+                lines.append(f"veto    the eyes disagree by {f.veto_px:+.1f} px "
+                             f"about where the stripe is")
             lines.append(f"dropped unconfirmed {f.n_rejected_unconfirmed} · blob "
                          f"{f.n_rejected_blob} · reach {f.n_rejected_range} · "
                          f"jump {f.n_rejected_jump} · outside {f.n_rejected_volume}"

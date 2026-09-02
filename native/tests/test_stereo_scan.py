@@ -448,6 +448,28 @@ def test_board_pose_frame_is_centred_with_z_toward_the_camera() -> None:
     assert np.allclose(R2, R, atol=0.02) and np.allclose(t2, t, atol=2.0)
 
 
+def test_the_veto_offset_measures_how_far_the_eyes_disagree() -> None:
+    """A calibration that cannot scan and a scene with no laser in it produce
+    the same confirmed count: zero. This is the number that tells them apart —
+    how far the right eye's stripe sits from where the left eye's candidates
+    land in its frame. On the rig it read -52 px against a 3 px tolerance."""
+    from orbiter_native.laser import StripePixels
+    from orbiter_native.scan import _veto_offset
+
+    cols = np.arange(200, 800, dtype=np.int32)
+    rows = np.full(len(cols), 400, np.int32)
+    right = StripePixels(x=cols, y=rows, w=np.full(len(cols), 200, np.uint8),
+                         wh=(1920, 1080), along_x=True, reason=None)
+    on_it = np.column_stack([cols.astype(float), rows.astype(float)])
+    assert abs(_veto_offset(right, on_it)) < 1e-9
+    assert abs(_veto_offset(right, on_it + [0.0, 52.0]) - 52.0) < 1e-9
+    assert abs(_veto_offset(right, on_it + [0.0, -7.5]) + 7.5) < 1e-9
+    # Columns the right eye has no stripe in say nothing, not zero.
+    away = np.column_stack([np.full(10, 1900.0), np.full(10, 100.0)])
+    assert np.isnan(_veto_offset(right, away))
+    assert np.isnan(_veto_offset(right, np.empty((0, 2))))
+
+
 def test_a_pose_that_is_not_a_rotation_is_neither_returned_nor_believed() -> None:
     """One degenerate solve used to end the eye: NaN came back as the pose,
     the caller kept it as the next frame's prior, and the disambiguating
