@@ -30,7 +30,9 @@ class BoardHit:
 
     corners: np.ndarray | None = None       # (N, 1, 2) float32
     ids: np.ndarray | None = None           # (N, 1) int32
-    #: Board→camera pose, only when per-eye intrinsics were supplied. The
+    #: Board→camera pose, only when per-eye intrinsics were supplied. Board
+    #: frame: origin at the board's centre, z out of the printed face toward
+    #: the camera — `cvcore.estimate_pose` explains why it is not OpenCV's. The
     #: model's intrinsics belong to the phone, not to this pair, so this stays
     #: None until the pair itself is calibrated — see `cvcore.intrinsics_from_eye`.
     R: np.ndarray | None = None

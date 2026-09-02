@@ -71,9 +71,38 @@ def charuco_detect(gray: np.ndarray, board):
     return detect_board(gray, board)
 
 
+#: OpenCV's ChArUco frame has its origin at a corner, y running DOWN the
+#: printed face and z pointing INTO the board. Measured, not assumed: on a
+#: straight-on synthetic view the board's z came back as (0.003, 0.04, 0.999)
+#: in camera coordinates — along the viewing direction, away from the camera.
+#: "Above the board" was therefore behind it, and the scan volume kept
+#: nothing but the board's own surface noise. This rotation (180° about x)
+#: makes z point OUT of the printed face, toward the camera, with y up.
+_FACE_OUT = np.diag([1.0, -1.0, -1.0])
+
+
+def _facing(board, R: np.ndarray, t: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Re-express an OpenCV board pose in the centred, face-out frame.
+
+    A point p' there is p = FACE_OUT·p' + centre in OpenCV's frame, so
+    R' = R·FACE_OUT and t' = t + R·centre.
+    """
+    sx, sy = board.getChessboardSize()
+    sq = float(board.getSquareLength()) * 1000.0     # the board is built in metres
+    centre = np.array([sx * sq / 2.0, sy * sq / 2.0, 0.0])
+    return R @ _FACE_OUT, np.asarray(t, float).ravel() + R @ centre
+
+
 def estimate_pose(corners, ids, board, intrinsics: Intrinsics,
                   R_predicted=None) -> tuple[np.ndarray, np.ndarray, float] | None:
     """Board→camera `(R, t_mm, ambiguity_deg)`, or None.
+
+    The board frame handed out here is NOT OpenCV's raw one: its origin is the
+    board's centre and its z axis points out of the printed face, toward the
+    camera, so "above the board" is +z and a volume centred on the board is
+    centred on the frame. See `_FACE_OUT` for why. Every consumer in this app
+    — the scan volume, the laser-plane collector, the overlay — gets the pose
+    from here and nowhere else, so the convention lives in one place.
 
     A flat board admits TWO poses that reproject almost identically, and a bare
     `solvePnP` flips between them — a ~10-30 degree rotation error with only a
@@ -87,11 +116,25 @@ def estimate_pose(corners, ids, board, intrinsics: Intrinsics,
     the two candidates were, so a pose that depended heavily on the prior is
     visible rather than implied.
     """
+    # solvePnP's DLT needs six correspondences and raises below that. A board
+    # seen by its edge gives four or five, every frame; raising there was
+    # logged as a detector error and blanked the eye's view as "offline".
+    if corners is None or len(corners) < 6:
+        return None
     if R_predicted is None:
         out = estimate_board_pose(corners, ids, board, intrinsics)
-        return None if out is None else (out[0], out[1], 0.0)
-    return estimate_board_pose_disambiguated(corners, ids, board, intrinsics,
-                                             R_predicted)
+        if out is None:
+            return None
+        R, t, ambiguity = out[0], out[1], 0.0
+    else:
+        # The prior is in this app's frame; the server's solver wants its own.
+        out = estimate_board_pose_disambiguated(corners, ids, board, intrinsics,
+                                                R_predicted @ _FACE_OUT)
+        if out is None:
+            return None
+        R, t, ambiguity = out
+    R, t = _facing(board, R, t)
+    return R, t, ambiguity
 
 
 def board_spec_from_config(cfg: dict[str, Any]) -> BoardSpec | None:

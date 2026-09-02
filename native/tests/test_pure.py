@@ -13,12 +13,13 @@ import pytest
 
 from orbiter_native import config as cfgmod
 from orbiter_native.laser import (
+    find_laser_points,
     LaserParams,
     board_mask,
     find_laser_line,
     redness,
 )
-from orbiter_native.orient import Orientation, apply, map_point
+from orbiter_native.orient import Orientation, apply, map_point, map_points
 from orbiter_native.source import MjpegReader
 
 ALL_ORIENTATIONS = [
@@ -281,3 +282,52 @@ def test_intrinsics_are_refused_at_a_different_resolution() -> None:
     got = cfg.left.intrinsics_for((1280, 720))
     assert got is not None and got.fx == 900.0
     assert cfg.left.intrinsics_for((1920, 1080)) is None
+
+
+@pytest.mark.parametrize("o", [
+    Orientation(), Orientation(flip_h=True), Orientation(flip_v=True),
+    Orientation(quarter_turns_cw=1), Orientation(quarter_turns_cw=3, flip_h=True),
+    Orientation(quarter_turns_cw=2, flip_v=True),
+])
+def test_map_points_is_map_point_over_an_array(o: Orientation) -> None:
+    rng = np.random.default_rng(5)
+    pts = rng.uniform(0, 100, (40, 2))
+    got = map_points(pts, 120, 80, o)
+    assert got.shape == (40, 2)
+    for (x, y), (mx, my) in zip(pts, got):
+        assert (mx, my) == map_point(float(x), float(y), 120, 80, o)
+    assert map_points(np.empty((0, 2)), 120, 80, o).shape == (0, 2)
+
+
+def test_find_laser_points_recovers_a_curve_to_subpixel() -> None:
+    """Scanning wants the stripe's actual shape, one centroid per column."""
+    h, w = 240, 320
+    bgr = np.zeros((h, w, 3), np.uint8)
+    xs = np.arange(w)
+    centre = 120 + 40 * np.sin(xs / 25.0)
+    # A stripe two rows wide, weighted so the centroid is not on a pixel, and
+    # never fainter than the threshold so both rows always count.
+    lo = np.floor(centre).astype(int)
+    frac = centre - lo
+    r_lo = np.rint(160 * (1 - frac) + 60)
+    r_hi = np.rint(160 * frac + 60)
+    bgr[lo, xs, 2] = r_lo.astype(np.uint8)
+    bgr[lo + 1, xs, 2] = r_hi.astype(np.uint8)
+
+    got = find_laser_points(bgr, None, LaserParams(redness_min=40))
+    assert got.ok and got.along_x and got.count == w
+    assert np.array_equal(got.points[:, 0], xs)
+    expected = (lo * r_lo + (lo + 1) * r_hi) / (r_lo + r_hi)
+    assert np.abs(got.points[:, 1] - expected).max() < 1e-3
+
+
+def test_find_laser_points_scans_rows_for_a_vertical_stripe() -> None:
+    bgr = np.full((200, 100, 3), 20, np.uint8)
+    ys = np.arange(200)
+    bgr[ys, 50 + (ys // 40), 2] = 240
+    got = find_laser_points(bgr, None, LaserParams(redness_min=40))
+    assert got.ok and not got.along_x and got.count == 200
+    assert np.array_equal(got.points[:, 1], ys)
+    assert np.array_equal(got.points[:, 0], 50 + ys // 40)
+    assert find_laser_points(np.full((8, 8, 3), 200, np.uint8), None).reason \
+        == "no stripe above the redness threshold"

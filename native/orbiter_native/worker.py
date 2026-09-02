@@ -24,6 +24,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Callable
 
 import cv2
 import httpx
@@ -43,7 +44,8 @@ from .laser import (
     find_laser_points,
 )
 from .laser import draw as draw_laser
-from .orient import Orientation, apply as orient_apply, map_point
+from .orient import Orientation, apply as orient_apply, map_points
+from .scan import CloudOverlay
 from .source import Frame, MjpegReader
 
 log = logging.getLogger("orbiter_native.worker")
@@ -81,7 +83,7 @@ class EyeStats:
     error: str | None = None
 
 
-class _Latest:
+class Latest:
     """A one-slot mailbox: writers overwrite, readers take.
 
     Deliberately not a Queue — a queue would buffer, and a buffered frame is a
@@ -140,14 +142,17 @@ class EyeResult:
 class EyeWorker(QObject):
     """Owns the reader and detector threads for one eye."""
 
-    #: Emitted from the detector thread; Qt queues it to the GUI thread.
-    result = Signal(object)
+    #: Rare, so a queued Qt signal suits it. Per-frame results do NOT go
+    #: through a signal: Qt's queue never drops, so a GUI thread that falls
+    #: behind backlogs frames without bound. They go to sinks — `add_sink` —
+    #: which is where the GUI's one-slot mailbox and the scan worker's pairing
+    #: history plug in.
     status = Signal(str, object)   # side, error-or-None
 
     def __init__(self, side: str) -> None:
         super().__init__()
         self.side = side
-        self._latest = _Latest()
+        self._latest = Latest()
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._reader: MjpegReader | None = None
@@ -163,6 +168,8 @@ class EyeWorker(QObject):
         self._laser_on = False
         self._scan_mode = False
         self._laser_params = LaserParams()
+        self._overlay: CloudOverlay | None = None
+        self._sinks: list[Callable[[EyeResult], None]] = []
 
         self._recv_times: deque[float] = deque(maxlen=_WINDOW)
         self._det_times: deque[float] = deque(maxlen=_WINDOW)
@@ -205,11 +212,21 @@ class EyeWorker(QObject):
         with self._cfg_lock:
             self._scan_mode = on
 
+    def set_overlay(self, overlay: CloudOverlay | None) -> None:
+        """The scanned cloud to draw over this eye's frames while scanning."""
+        with self._cfg_lock:
+            self._overlay = overlay
+
+    def add_sink(self, sink: Callable[[EyeResult], None]) -> None:
+        """Called from the detector thread with every result. Must be quick and
+        must not touch widgets — the GUI reads its mailbox on its own clock."""
+        self._sinks.append(sink)
+
     def _snapshot(self):
         with self._cfg_lock:
             return (self._url, self._orientation, self._board_spec,
                     self._eye, self._laser_on, self._laser_params,
-                    self._scan_mode)
+                    self._scan_mode, self._overlay)
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
@@ -292,7 +309,7 @@ class EyeWorker(QObject):
 
     def _detect_one(self, detector: BoardDetector, frame: Frame) -> None:
         (_, orientation, spec, eye, laser_on, laser_params,
-         scan_mode) = self._snapshot()
+         scan_mode, overlay) = self._snapshot()
         detector.set_spec(spec)
 
         h, w = frame.gray.shape
@@ -339,6 +356,9 @@ class EyeWorker(QObject):
             # surface that was never measured.
             _draw_points(bgr, points.points if orientation.is_identity
                          else _map_all(points.points, orientation, w, h))
+            if overlay is not None and board.R is not None and intrinsics is not None:
+                _draw_cloud(bgr, overlay.points(), board.R, board.t, intrinsics,
+                            orientation, w, h)
         elif laser_on:
             draw_laser(bgr, _orient_laser(laser, orientation, w, h),
                        _orient_hull(hull, orientation, w, h))
@@ -363,10 +383,12 @@ class EyeWorker(QObject):
         s.stripe_points = points.count
         s.server_age_ms = frame.server_age_ms
         h, w = frame.gray.shape
-        self.result.emit(EyeResult(
+        res = EyeResult(
             self.side, bgr, _copy_stats(s), board, laser, stripe=points,
             wh=(w, h), descriptor=descriptor, capture_mono=frame.capture_mono,
-        ))
+        )
+        for sink in self._sinks:
+            sink(res)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────
@@ -386,6 +408,35 @@ def _draw_points(bgr: np.ndarray, pts: np.ndarray) -> None:
     bgr[p[ok, 1], p[ok, 0]] = (80, 235, 80)
 
 
+def _draw_cloud(bgr: np.ndarray, pts_board: np.ndarray, R: np.ndarray,
+                t: np.ndarray, k, o: Orientation, w: int, h: int) -> None:
+    """Project the scanned cloud into this eye and draw it, 2×2 px per point.
+
+    Board-frame points through THIS eye's own board pose: each eye places the
+    cloud from what it sees, so the two overlays disagreeing is itself a sign
+    that the board poses do. Two pixels because the 1080p frame is shown at
+    about a third of its size and a single pixel would be lost to the scaling.
+    """
+    if not len(pts_board):
+        return
+    cam = pts_board @ np.asarray(R, float).T + np.asarray(t, float).reshape(1, 3)
+    ahead = cam[:, 2] > 1.0
+    if not ahead.any():
+        return
+    px, _ = cv2.projectPoints(cam[ahead], np.zeros(3), np.zeros(3), k.K, k.D)
+    px = px.reshape(-1, 2)
+    if not o.is_identity:
+        px = map_points(px, w, h, o)
+    p = np.rint(px).astype(np.int32)
+    hh, ww = bgr.shape[:2]
+    ok = ((p[:, 0] >= 0) & (p[:, 0] < ww - 1)
+          & (p[:, 1] >= 0) & (p[:, 1] < hh - 1))
+    p = p[ok]
+    for dx in (0, 1):
+        for dy in (0, 1):
+            bgr[p[:, 1] + dy, p[:, 0] + dx] = (0, 150, 255)
+
+
 def _rate(times: "deque[float]") -> float:
     if len(times) < 2:
         return 0.0
@@ -400,8 +451,7 @@ def _copy_stats(s: EyeStats) -> EyeStats:
 
 def _map_all(pts: np.ndarray, o: Orientation, w: int, h: int) -> np.ndarray:
     """Map an (N, 2) array of (x, y) into oriented coordinates."""
-    return np.array([map_point(float(x), float(y), w, h, o) for x, y in pts],
-                    dtype=np.float32)
+    return map_points(pts, w, h, o).astype(np.float32)
 
 
 def _orient_board(hit: BoardHit, o: Orientation, w: int, h: int) -> BoardHit:

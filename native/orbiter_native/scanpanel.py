@@ -1,10 +1,13 @@
-"""Scan controls: run the triangulation, show what it kept and what it dropped.
+"""Scan controls: switch scanning on, watch what it keeps and drops, export.
 
 The rejection counters are the useful part of this panel. A scan that produces
 nothing looks identical whether the board is out of view, the laser is off, the
 subject is outside the box or the two eyes are looking at different stripes —
 and each of those calls for a different fix. So they are counted separately and
 shown while scanning, not summarised afterwards.
+
+The panel owns no data. The cloud lives in `ScanWorker`, on its own thread;
+this widget pushes settings down and shows the status that comes back up.
 """
 
 from __future__ import annotations
@@ -25,7 +28,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from .scan import PointCloud, ScanFrame, ScanParams, ScanVolume
+from .scan import ScanParams, ScanVolume
+from .scanworker import ScanStatus, ScanWorker
 
 log = logging.getLogger("orbiter_native.scanpanel")
 
@@ -37,13 +41,12 @@ class ScanPanel(QFrame):
     #: the laser detector is running — scanning without it finds nothing.
     active_changed = Signal(bool)
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, scanner: ScanWorker, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("panel")   # see the stylesheet in __main__
         self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.cloud = PointCloud()
-        self._last: ScanFrame | None = None
-        self._frames = 0
+        self._scanner = scanner
+        self._status: ScanStatus | None = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 8, 10, 10)
@@ -58,9 +61,10 @@ class ScanPanel(QFrame):
         self.active.setToolTip(
             "Triangulate the laser stripe from both eyes and keep the points "
             "inside the box above the board. Needs the pair calibration, a "
-            "visible board and the laser detector switched on."
+            "visible board and the laser detector switched on. The cloud is "
+            "drawn over both eyes in orange."
         )
-        self.active.toggled.connect(self.active_changed.emit)
+        self.active.toggled.connect(self._toggle)
         root.addWidget(self.active)
 
         box = QGridLayout()
@@ -84,11 +88,12 @@ class ScanPanel(QFrame):
                 "your hands and the far wall fall outside it without needing to "
                 "be recognised."
             )
+            w.valueChanged.connect(self._push_params)
         root.addLayout(box)
 
         row = QHBoxLayout()
         self.btn_clear = QPushButton("Clear cloud")
-        self.btn_clear.clicked.connect(self._clear)
+        self.btn_clear.clicked.connect(self._scanner.clear)
         self.btn_export = QPushButton("Export PLY")
         self.btn_export.clicked.connect(self._export)
         row.addWidget(self.btn_clear)
@@ -109,34 +114,40 @@ class ScanPanel(QFrame):
         return ScanParams(volume=ScanVolume(height_mm=self.height_mm.value(),
                                             half_width_mm=self.half_mm.value()))
 
+    def _push_params(self, _value=None) -> None:
+        self._scanner.set_params(self.params())
+
+    def _toggle(self, on: bool) -> None:
+        self._push_params()
+        self._scanner.set_active(on)
+        self.active_changed.emit(on)
+
     @property
     def scanning(self) -> bool:
         return self.active.isChecked()
 
     # ── live ──────────────────────────────────────────────────────────────
 
-    def on_frame(self, frame: ScanFrame) -> None:
-        """Accumulate one frame pair's contribution and refresh the counters."""
-        self._last = frame
-        self._frames += 1
-        if frame.n_kept:
-            self.cloud.add(frame.points_board)
+    def on_status(self, status: ScanStatus) -> None:
+        self._status = status
         self._refresh()
 
     def _refresh(self) -> None:
-        f = self._last
-        lines = [f"cloud   {len(self.cloud)} points"]
-        b = self.cloud.bounds()
-        if b is not None:
-            lo, hi = b
+        st = self._status
+        if st is None:
+            self.stats.setText("idle")
+            return
+        lines = [f"cloud   {st.n_points} points · {st.pairs} pairs"]
+        if st.bounds is not None:
+            lo, hi = st.bounds
             lines.append(f"extent  x {lo[0]:+.0f}..{hi[0]:+.0f}  "
                          f"y {lo[1]:+.0f}..{hi[1]:+.0f}  z {lo[2]:+.0f}..{hi[2]:+.0f} mm")
-        if f is None:
-            self.stats.setText("\n".join(lines))
-            return
-        if f.reason:
+        f = st.frame
+        if st.note:
+            lines.append(f"frame   — {st.note}")
+        elif f is not None and f.reason:
             lines.append(f"frame   — {f.reason}")
-        else:
+        elif f is not None:
             lines.append(f"frame   {f.n_kept}/{f.n_candidates} kept")
             lines.append(f"no match {f.n_rejected_nomatch} · "
                          f"ambiguous {f.n_rejected_ambiguous}")
@@ -146,23 +157,13 @@ class ScanPanel(QFrame):
                 lines.append(f"off-plane {f.n_rejected_plane} · "
                              f"one-eye {f.n_single_eye}")
             if f.n_kept:
-                lines.append(f"reproj  med {np.median(f.reproj_px):.2f} px")
+                lines.append(f"reproj  med {np.nanmedian(f.reproj_px):.2f} px")
         self.stats.setText("\n".join(lines))
-
-    def note(self, message: str) -> None:
-        """Show a blocking condition — no calibration, no board, laser off."""
-        self.stats.setText(f"cloud   {len(self.cloud)} points\n{message}")
 
     # ── actions ───────────────────────────────────────────────────────────
 
-    def _clear(self) -> None:
-        self.cloud.clear()
-        self._last = None
-        self._frames = 0
-        self._refresh()
-
     def _export(self) -> None:
-        if not len(self.cloud):
+        if self._status is None or not self._status.n_points:
             self.stats.setText("nothing to export yet")
             return
         path, _ = QFileDialog.getSaveFileName(
@@ -170,7 +171,7 @@ class ScanPanel(QFrame):
         if not path:
             return
         try:
-            n = self.cloud.write_ply(path)
+            n = self._scanner.export(path)
         except OSError as exc:
             self.stats.setText(f"could not write {path}: {exc}")
             return

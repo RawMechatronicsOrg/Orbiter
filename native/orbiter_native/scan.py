@@ -50,9 +50,12 @@ log = logging.getLogger("orbiter_native.scan")
 class ScanVolume:
     """The box, in board coordinates, in millimetres.
 
-    The board's own frame has z pointing out of its printed face, so
-    `height_mm` is "above the board" and the x/y extent is centred on the
-    board's origin.
+    The board frame from `cvcore.estimate_pose` has its origin at the board's
+    centre and z pointing out of the printed face, so `height_mm` is "above
+    the board" and the x/y extent is centred on the board itself. (OpenCV's
+    raw frame has the origin at a corner and z pointing into the board: a box
+    like this one in that frame selected the space behind the board, minus
+    the far half of the board.)
     """
 
     height_mm: float = 400.0        # the 40 cm cube
@@ -130,6 +133,12 @@ class ScanFrame:
         return len(self.points_board)
 
 
+#: Epipolar lines swept per pass in `_cross_polyline`. 128 rows by ~1700
+#: stripe points of float32 stay in cache; measured at 1700×1700: 4.5 ms,
+#: against 8.0 ms at 512 rows and 37 ms for the unchunked float64 original.
+_CROSS_CHUNK = 128
+
+
 def _cross_polyline(
     lines: np.ndarray, pts: np.ndarray, along_x: bool, p: ScanParams
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -140,8 +149,14 @@ def _cross_polyline(
     `n_crossings` says so, so the caller can drop it as ambiguous rather than
     silently pick one.
 
-    Vectorised over all lines and all segments at once — the per-left-point
-    Python loop this replaces would run ~650 times per frame per eye.
+    Every line against every segment, because a broken polyline can cross any
+    line anywhere. The sweep that finds WHICH segment is float32 and chunked:
+    only the sign of each vertex's distance to each line matters there, and a
+    sign is in doubt only within ~1e-4 px of the line, where either answer puts
+    the crossing at the same place. The crossing itself is then solved in
+    float64 from the original inputs, for just the segments that matter. A
+    vertex lying exactly on a line counts once, with the segment across which
+    the sign changes.
     """
     n_lines = len(lines)
     if len(pts) < 2:
@@ -155,39 +170,39 @@ def _cross_polyline(
     scan_axis = 0 if along_x else 1
     contiguous = np.abs(b[:, scan_axis] - a[:, scan_axis]) <= p.max_segment_gap_px
 
-    # Signed distance of every segment endpoint to every epipolar line.
-    ha = np.hstack([a, np.ones((len(a), 1))])
-    hb = np.hstack([b, np.ones((len(b), 1))])
-    da = lines @ ha.T                      # (n_lines, n_segments)
-    db = lines @ hb.T
+    hom = np.hstack([pts, np.ones((len(pts), 1))]).astype(np.float32).T   # (3, n_pts)
+    lines32 = np.asarray(lines, np.float32)
+    n_cross = np.zeros(n_lines, int)
+    first = np.zeros(n_lines, int)
+    for s in range(0, n_lines, _CROSS_CHUNK):
+        dist = lines32[s:s + _CROSS_CHUNK] @ hom          # signed, per vertex
+        straddles = np.signbit(dist[:, :-1]) != np.signbit(dist[:, 1:])
+        straddles &= contiguous[None, :]
+        n_cross[s:s + _CROSS_CHUNK] = straddles.sum(axis=1)
+        first[s:s + _CROSS_CHUNK] = np.argmax(straddles, axis=1)
 
-    straddles = ((da <= 0) & (db >= 0)) | ((da >= 0) & (db <= 0))
-    straddles &= contiguous[None, :]
-    denom = da - db
-    straddles &= np.abs(denom) > 1e-12
-
-    n_cross = straddles.sum(axis=1)
     match = np.full((n_lines, 2), np.nan)
     angle = np.zeros(n_lines)
-
-    hit = n_cross > 0
-    if hit.any():
-        first = np.argmax(straddles, axis=1)          # index of the first crossing
-        rows = np.flatnonzero(hit)
+    rows = np.flatnonzero(n_cross > 0)
+    if len(rows):
         seg = first[rows]
-        t = da[rows, seg] / denom[rows, seg]
+        ln = np.asarray(lines, np.float64)[rows]
+        da = ln[:, 0] * a[seg, 0] + ln[:, 1] * a[seg, 1] + ln[:, 2]
+        db = ln[:, 0] * b[seg, 0] + ln[:, 1] * b[seg, 1] + ln[:, 2]
+        denom = da - db
+        ok = np.abs(denom) > 1e-12
+        t = np.where(ok, da / np.where(ok, denom, 1.0), 0.0)
         match[rows] = a[seg] + t[:, None] * (b[seg] - a[seg])
 
         # Angle between the epipolar line and the segment it crossed.
         d = b[seg] - a[seg]
         d_norm = np.linalg.norm(d, axis=1)
-        ln = lines[rows, :2]
-        l_norm = np.linalg.norm(ln, axis=1)
+        l_norm = np.linalg.norm(ln[:, :2], axis=1)
         good = (d_norm > 1e-9) & (l_norm > 1e-9)
         # The line's normal against the segment direction: 90 degrees apart
         # means the segment runs ALONG the line and never usefully meets it.
         cosang = np.zeros(len(rows))
-        cosang[good] = np.abs(np.einsum("ij,ij->i", ln[good], d[good])) / (
+        cosang[good] = np.abs(np.einsum("ij,ij->i", ln[good, :2], d[good])) / (
             l_norm[good] * d_norm[good])
         angle[rows] = np.degrees(np.arccos(np.clip(cosang, 0.0, 1.0)))
 
@@ -296,23 +311,34 @@ class PointCloud:
     Board-frame rather than camera-frame on purpose: it is the one coordinate
     system that stays fixed while the subject turns on the board, so sweeps
     taken at different times land in the same space.
+
+    Bounds are kept running rather than recomputed: the panel shows them after
+    every pair, and a min/max over the whole cloud cost 42 ms per pair at a
+    million points — on the GUI thread, at the time.
     """
 
     def __init__(self) -> None:
         self._chunks: list[np.ndarray] = []
         self._n = 0
+        self._lo = np.full(3, np.inf)
+        self._hi = np.full(3, -np.inf)
 
     def __len__(self) -> int:
         return self._n
 
     def add(self, pts: np.ndarray) -> None:
         if len(pts):
-            self._chunks.append(np.asarray(pts, np.float64))
+            pts = np.asarray(pts, np.float64)
+            self._chunks.append(pts)
             self._n += len(pts)
+            np.minimum(self._lo, pts.min(axis=0), out=self._lo)
+            np.maximum(self._hi, pts.max(axis=0), out=self._hi)
 
     def clear(self) -> None:
         self._chunks.clear()
         self._n = 0
+        self._lo[:] = np.inf
+        self._hi[:] = -np.inf
 
     def points(self) -> np.ndarray:
         if not self._chunks:
@@ -320,19 +346,54 @@ class PointCloud:
         return np.concatenate(self._chunks, axis=0)
 
     def bounds(self) -> tuple[np.ndarray, np.ndarray] | None:
-        p = self.points()
-        if not len(p):
+        if not self._n:
             return None
-        return p.min(axis=0), p.max(axis=0)
+        return self._lo.copy(), self._hi.copy()
+
+    def decimated(self, max_n: int) -> np.ndarray:
+        """About `max_n` points spread over the whole cloud.
+
+        Every k-th point of every chunk, so old and new sweeps are represented
+        alike. This is what the eyes draw: projecting a million points per
+        frame would cost more than the frame.
+        """
+        if not self._chunks:
+            return np.empty((0, 3), np.float64)
+        stride = max(1, -(-self._n // max_n))
+        if stride == 1:
+            return self.points()
+        return np.concatenate([c[::stride] for c in self._chunks], axis=0)
 
     def write_ply(self, path: str) -> int:
-        """Write an ASCII PLY. Returns the point count."""
-        p = self.points()
-        with open(path, "w", encoding="ascii") as f:
-            f.write("ply\nformat ascii 1.0\n")
-            f.write(f"element vertex {len(p)}\n")
-            f.write("property float x\nproperty float y\nproperty float z\n")
-            f.write("end_header\n")
-            for x, y, z in p:
-                f.write(f"{x:.4f} {y:.4f} {z:.4f}\n")
+        """Write a binary little-endian PLY. Returns the point count.
+
+        Binary because an ASCII writer loops in Python: a million points took
+        seconds, on the GUI thread, behind the Export button.
+        """
+        p = np.ascontiguousarray(self.points().astype("<f4"))
+        header = ("ply\nformat binary_little_endian 1.0\n"
+                  f"element vertex {len(p)}\n"
+                  "property float x\nproperty float y\nproperty float z\n"
+                  "end_header\n")
+        with open(path, "wb") as f:
+            f.write(header.encode("ascii"))
+            f.write(p.tobytes())
         return len(p)
+
+
+class CloudOverlay:
+    """The cloud as the eyes draw it: a decimated, board-frame snapshot.
+
+    Written by the scan thread, read by both detector threads. The array is
+    swapped whole and never mutated after publishing, so readers need no lock:
+    they see either the previous snapshot or the new one, each consistent.
+    """
+
+    def __init__(self) -> None:
+        self._pts = np.empty((0, 3), np.float64)
+
+    def publish(self, pts: np.ndarray) -> None:
+        self._pts = pts
+
+    def points(self) -> np.ndarray:
+        return self._pts

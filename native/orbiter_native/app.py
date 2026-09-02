@@ -4,6 +4,14 @@ The server owns configuration; this window polls `GET /config` and pushes what
 changed down into the workers. Change an eye's orientation in the web Stereo
 tab, press Apply there, and this window follows within a poll interval without
 a restart — one place to set the run's baseline, two places that honour it.
+
+The GUI thread only paints. Detection and scanning run in their own threads
+and leave their newest result in a one-slot mailbox; a 30 Hz timer here takes
+whatever is newest and shows it. Nothing queues: when the workers outrun the
+painter, frames are skipped, never backlogged. The previous design delivered
+every result through a queued Qt signal and did the scan maths in the slot —
+at 1080p that was more than a second of GUI-thread work per second, and the
+window fell further behind the cameras the longer it ran.
 """
 
 from __future__ import annotations
@@ -29,21 +37,19 @@ from .calibpanel import CalibrationPanel
 from .config import ConfigClient, RigConfig
 from .laser import LaserParams
 from .panel import EyePanel
-from .scan import scan_frame
 from .scanpanel import ScanPanel
-from .laserplane import from_config as plane_from_config
-from .stereo import StereoRig, result_from_config
-from .worker import EyeResult, EyeWorker
+from .scanworker import ScanWorker
+from .worker import EyeWorker, Latest
 
 log = logging.getLogger("orbiter_native.app")
-
-#: Two frames count as simultaneous within this much of camserver's capture
-#: clock — the one clock that times both cameras.
-_PAIR_WINDOW_S = 0.010
 
 #: How often to re-read the server's config. A human editing settings in the
 #: web tab is the only thing that changes it, so seconds are plenty.
 _CONFIG_POLL_MS = 2000
+
+#: How often the window looks for newer results. Faster than the cameras is
+#: pointless; slower would show frames late.
+_PAINT_MS = 33
 
 
 class MainWindow(QMainWindow):
@@ -55,24 +61,26 @@ class MainWindow(QMainWindow):
         self._client = ConfigClient(server)
         self._config: RigConfig | None = None
 
+        self.scanner = ScanWorker()
+        #: Newest result per eye, waiting for the paint timer.
+        self._inbox = {"left": Latest(), "right": Latest()}
         self.panels = {"left": EyePanel("left"), "right": EyePanel("right")}
         self.workers: dict[str, EyeWorker] = {}
         for side, panel in self.panels.items():
             w = EyeWorker(side)
-            # Qt queues these across the thread boundary, so the slots run on
-            # the GUI thread and may touch widgets safely.
-            w.result.connect(self._on_result, Qt.ConnectionType.QueuedConnection)
+            # Errors are rare, so a queued signal is fine for them; results
+            # are not, so they go to mailboxes the timer drains.
             w.status.connect(self._on_status, Qt.ConnectionType.QueuedConnection)
+            w.add_sink(self._inbox[side].put)
+            w.add_sink(self.scanner.offer)
+            w.set_overlay(self.scanner.overlay)
             self.workers[side] = w
 
         self.calib = CalibrationPanel()
         self.calib.save_requested.connect(self._save_intrinsics)
 
-        self.scan = ScanPanel()
+        self.scan = ScanPanel(self.scanner)
         self.scan.active_changed.connect(self._on_scan_toggled)
-        #: Newest result per eye, waiting for its partner from the same instant.
-        self._latest: dict[str, EyeResult] = {}
-        self._rig: StereoRig | None = None
 
         split = QSplitter(Qt.Orientation.Horizontal)
         split.addWidget(self.panels["left"])
@@ -95,8 +103,13 @@ class MainWindow(QMainWindow):
         self._server_label.setStyleSheet("color:#8b9aac; font-family:Consolas;")
         self.statusBar().addPermanentWidget(self._server_label)
 
+        self.scanner.start()
         for w in self.workers.values():
             w.start()
+
+        self._paint_timer = QTimer(self)
+        self._paint_timer.timeout.connect(self._paint)
+        self._paint_timer.start(_PAINT_MS)
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll_config)
@@ -167,6 +180,7 @@ class MainWindow(QMainWindow):
             eye = getattr(cfg, side)
             if eye is not None:
                 self.calib.set_intrinsics(side, eye.intrinsics_for(None))
+        self.scanner.set_config(cfg)
         for side, worker in self.workers.items():
             eye = getattr(cfg, side)
             self.panels[side].set_eye(eye)
@@ -210,7 +224,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("intrinsics saved to the server")
         self._poll_config()
 
-    # ── worker signals ────────────────────────────────────────────────────
+    # ── worker output ─────────────────────────────────────────────────────
 
     def _on_scan_toggled(self, on: bool) -> None:
         """Scanning without the laser detector finds nothing, so turn it on."""
@@ -219,57 +233,16 @@ class MainWindow(QMainWindow):
         for w in self.workers.values():
             w.set_scan_mode(on)
 
-    def _on_result(self, res: EyeResult) -> None:
-        self.panels[res.side].on_result(res)
-        self.calib.on_result(res)
-        self._latest[res.side] = res
-        if self.scan.scanning:
-            self._try_scan()
-
-    def _try_scan(self) -> None:
-        """Triangulate when both eyes have a frame from the same instant."""
-        left, right = self._latest.get("left"), self._latest.get("right")
-        if left is None or right is None:
-            return
-        lm, rm = left.capture_mono, right.capture_mono
-        if lm is None or rm is None or abs(lm - rm) > _PAIR_WINDOW_S:
-            return
-        self._latest.clear()
-
-        rig = self._scan_rig(left.wh)
-        if rig is None:
-            self.scan.note("no pair calibration for this frame size — "
-                           "solve intrinsics and the stereo pair first")
-            return
-        if left.stripe is None or right.stripe is None:
-            self.scan.note("laser detector is off")
-            return
-        board = left.board
-        if board is None or board.R is None or board.t is None:
-            self.scan.note("board not visible — it is what defines the scan volume")
-            return
-        plane = plane_from_config(
-            self._config.laser_plane_raw if self._config else None, left.wh)
-        self.scan.on_frame(scan_frame(rig, left.stripe, right.stripe,
-                                      board.R, board.t, self.scan.params(),
-                                      plane))
-
-    def _scan_rig(self, wh) -> StereoRig | None:
-        """Build the projection geometry, reusing it until the calibration changes."""
-        cfg = self._config
-        if cfg is None or cfg.left is None or cfg.right is None:
-            return None
-        kl = cfg.left.intrinsics_for(wh)
-        kr = cfg.right.intrinsics_for(wh)
-        geom = result_from_config(cfg.extrinsics_raw, wh)
-        if kl is None or kr is None or geom is None:
-            self._rig = None
-            return None
-        key = (id(cfg), wh)
-        if getattr(self, "_rig_key", None) != key or self._rig is None:
-            self._rig = StereoRig(kl, kr, geom)
-            self._rig_key = key
-        return self._rig
+    def _paint(self) -> None:
+        """Show whatever is newest. Anything older was skipped, not queued."""
+        for side, box in self._inbox.items():
+            res = box.take(0.0)
+            if res is not None:
+                self.panels[side].on_result(res)
+                self.calib.on_result(res)
+        status = self.scanner.status.take(0.0)
+        if status is not None:
+            self.scan.on_status(status)
 
     def _on_status(self, side: str, error: object) -> None:
         self.panels[side].on_status(error if isinstance(error, str) else None)
@@ -280,10 +253,12 @@ class MainWindow(QMainWindow):
         """Stop the threads before the window goes away.
 
         Without this the reader threads keep a socket open and Qt tears down
-        widgets underneath the queued signals still in flight.
+        widgets underneath the timer still firing.
         """
+        self._paint_timer.stop()
         self._timer.stop()
         for w in self.workers.values():
             w.stop()
+        self.scanner.stop()
         self._client.close()
         super().closeEvent(event)

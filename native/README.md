@@ -52,6 +52,16 @@ would fill with frames nobody has read — the view then silently becomes a
 recording running further and further behind, at a frame rate that still looks
 correct.
 
+**The GUI thread only paints.** Each worker leaves its newest result in a
+one-slot mailbox and a 30 Hz timer in the window takes whatever is there; the
+scan maths runs in a thread of its own (`scanworker.py`) that pairs the eyes'
+results by camserver's capture clock. Nothing is delivered through a queued
+Qt signal per frame: Qt's queue never drops, so a GUI thread that falls behind
+backlogs frames without bound. That was the first design, and at 1080p it was
+doing more than a second of work per second — triangulation, a numpy
+BGR→RGB pass and QImage copy per frame, a min/max over the whole cloud per
+pair — and fell further behind the cameras the longer it ran.
+
 **Orientation is flip-then-rotate**, and that order is a contract shared with
 `server/orbiter_server/commands.py::_cmd_set_stereo_rig` and
 `ui/src/viewer/StereoView.tsx::eyeTransform`. If the three drift, the operator
@@ -188,13 +198,22 @@ right eye **actually detected laser**, not merely on the infinite line fitted
 through its detections.
 
 The volume filter is expressed in the **board's** frame, so it stays put as the
-board moves and "above" keeps meaning above the board. The bench, your hands
+board moves and "above" keeps meaning above the board. That frame is centred on
+the board with z out of the printed face (`cvcore.estimate_pose`), not OpenCV's
+raw one — whose origin is a corner and whose z points *into* the board, as
+measured on a straight-on view; in that frame the box selected the space behind
+the board and kept nothing but the board's own surface noise. The bench, your hands
 and the far wall fall outside it without any of them needing to be recognised.
 Points below a 3 mm floor are the stripe lying on the board itself — the
 calibration target, not the subject.
 
 The board must be visible for scanning to work: it is what defines where the
 volume is.
+
+While scanning, the cloud so far is drawn over both eyes in orange, each eye
+projecting it through its own board pose — so the two overlays disagreeing is
+itself a sign that the board poses do. The overlay is decimated to about 40k
+points; the export (**Export PLY**, binary little-endian) carries everything.
 
 ### The one geometric trap
 
@@ -215,6 +234,18 @@ imdecode COLOR     2.2 ms   (1.4 ms grayscale-only, + 0.2 ms for the gray view)
 charuco detect    13.1 ms   (6.4 ms at half scale; 2.8 ms with no board in view)
 redness           0.7 ms    (board bbox; 3.1 ms over the full frame)
 laser line         ~8 ms    (redness + centroids + RANSAC + fit)
+```
+
+Scan mode at 1920×1080, live frames, ~1700 stripe points per eye, before and
+after the kernels were rewritten (`laser.py`, `scan.py`, `orient.py`):
+
+```
+stripe points (no fit)    20.7 ms  →  5.3 ms   (OpenCV redness, band-limited centroids)
+epipolar × polyline       33.6 ms  →  2.9 ms   (float32 sweep in 128-line chunks)
+scan_frame, whole         31.9 ms  →  4.0 ms
+orient mapping, 1700 pts   1.5 ms  →  0.01 ms  (vectorised)
+cloud bounds at 1M pts    42.0 ms  →  0        (kept running)
+frame to QImage, per eye   8.6 ms  →  0        (wrapped as BGR888, no copy)
 ```
 
 Colour decode costs about 1 ms per frame per camera over grayscale, and buys
