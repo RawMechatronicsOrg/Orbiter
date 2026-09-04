@@ -82,11 +82,22 @@ and the black rubber that no measure recovered today appears in the cloud.
 ## Exposure loop from the detectors
 
 Both cameras run auto-exposure metering their own scene; the left ran at 20 fps
-under a 50 ms exposure, blurring the stripe and halving the pairing rate. Drive
-`exposure_time_absolute` per camera from what the app measures — the stripe's
-peak just under saturation, the board's white squares at a mid grey — with a
-slow P-loop over camserver's control API. Same targets for both eyes. (The power line frequency is
-already at 50 Hz on both cameras.)
+under a 50 ms exposure, blurring the stripe and halving the pairing rate.
+
+**These cameras do not accept `exposure_time_absolute`.** Measured 2026-09-02:
+the write reports `honoured=false` with a readback of 0, in Shutter Priority
+the ioctl returns EACCES, and `exposure_dynamic_framerate` returns EIO. Tested
+against the ends of the range — 200 ms and 1 ms give the same frame. What does
+work is `auto_exposure=1` (Manual Mode), and it is most of the win: the frame
+rate went 20.9 → 28.5 fps and blown highlights 1.86% → 0.2%, because the
+camera stops hunting and holds a fixed, shorter exposure. `brightness` is a
+digital level shift, not exposure (mean 122 → 49, frame rate unchanged), and
+there is no gain control at all.
+
+So the loop has nowhere to push on this hardware. It waits on either a camera
+that honours the control, or the strobe above, which makes the exposure
+question mostly moot. Note also that camera controls do not always survive a
+stream being reopened — read them back (`orbiter-rigcheck`) after a restart.
 
 ## Colour normalisation from the board
 
@@ -97,9 +108,46 @@ score and the display, EMA-smoothed, held when the board leaves. Optionally a
 two-point fit from black and white squares to match contrast too. Makes the
 redness threshold mean the same thing in both eyes, which the veto assumes.
 
+## The sheet cannot be re-solved after a restart
+
+Captured views survive a restart (`~/.orbiter-native/calib-views.npz`); the
+plane collector's raw frames do not. So a session that improves the intrinsics
+cannot re-derive the sheet through them until the operator sweeps the stripe
+across the board again — and until it does, what the server holds is a camera
+from this session and a sheet from a previous one. That mixture is exactly
+what the right-eye veto refuses, and on 2026-09-02 it cost an evening: the
+eyes disagreed by 52 px against a 3 px tolerance, then by 10 px once the
+intrinsics were re-solved, and the sheet could not follow.
+
+Persist the plane collector the way the sample set is persisted: the raw
+stripe pixels, corners, ids and `R_hint` per frame, keyed to the board spec.
+Then a restart can refit the sheet through whatever intrinsics are in force,
+which is what every cycle already tries to do.
+
 ## Small ones
 
 - Pinned host buffers for the GPU downloads (0.5 → ~0.2 ms per frame).
+- `right.mask(confirm_px)` and `scan._whole_blobs` each allocate a full-frame
+  `uint8` image and dilate it (7x7 and 17x1 at defaults) on every pair, while
+  the pixels that matter live inside `stripe_rows`. Two 2 MP passes at 1080p
+  that could be band-sized.
+- `laser._lit` decides `along_x` from the extent of the lit pixels, and in
+  scan mode it only ever sees the row band — whose height is a fraction of the
+  frame's width, so the answer is pinned to True. Harmless on this rig, where
+  the sheet does lie across the rows, but it is not a measurement any more.
+  Decide it from the geometry (`stripe_rows` already has the sheet) instead.
+- `average_still` sorts and trims each axis independently, so the point it
+  produces may match no observation, and a glint offset mainly along one axis
+  is trimmed only on that axis. A trim on distance from the median point would
+  keep the observations whole.
+- `rolling.solve_readout` accepted 59 ms for the right eye — longer than the
+  33 ms frame interval, which no rolling shutter can be. Refuse a readout
+  longer than the frame interval rather than storing it.
+- The bar for the pair geometry is dropped when new intrinsics are accepted
+  (`_retire_dependants`), so the first stereo solve of the new generation
+  lands whatever its residual. Correct — consistency beats a number measured
+  through another camera — but it means one unmeasured solve each time. Seed
+  the new bar from the same cycle instead.
 - `--cv-threads 1` on the GPU path: 16 core-ms per pair against 22 at two,
   once the full ChArUco pass fits a frame at one thread.
 - Per-voxel normals from the merged cloud, for shading and for meshing.

@@ -154,6 +154,11 @@ class ScanFrame:
     scanlines: np.ndarray = field(default_factory=lambda: np.empty(0, np.int64))
     #: Scanlines (columns or rows) holding any stripe in the left eye.
     n_scanlines: int = 0
+    #: Which of the two `scanlines` counts along: columns when True, rows
+    #: when False. Decided per frame from the lit pixels' own extent, so it
+    #: can differ between frames — and a scanline id from one is not the
+    #: same place as the same id from the other.
+    along_x: bool = True
     #: Stripe pixels in the left eye, and how many the right eye confirmed.
     n_pixels: int = 0
     n_confirmed: int = 0
@@ -433,6 +438,7 @@ def scan_frame(
         points_camera=xyz_cam[inside],
         scanlines=scan[smooth][inside].astype(np.int64) if len(scan) else np.empty(0, np.int64),
         n_scanlines=n_lines,
+        along_x=bool(left.along_x),
         n_pixels=int(len(px)),
         n_confirmed=int(confirmed.sum()),
         n_rejected_unconfirmed=n_unconfirmed,

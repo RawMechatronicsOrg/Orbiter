@@ -200,7 +200,8 @@ The stripe is found in **colour, not luminance**, and only **inside the board**.
 
 Colour because the board is black and white and the laser is red. On a frame
 from this rig there are 68142 board pixels brighter than gray 170 — the white
-squares — and exactly 31 of them survive a redness threshold of 50. A
+squares — and exactly 31 of them survive a redness threshold of 50 (the
+detector's own `redness_min` is 45). A
 brightness threshold does not find the stripe on this board; it finds the white
 squares. `redness = r - max(g, b)` has an on-board median of 0 against a stripe
 peaking near 110.
@@ -401,9 +402,10 @@ fraction of the frame.
 **While the board holds still, frames are averaged.** The scan worker keeps
 consecutive pairs whose left pose is within 0.5 mm and 0.1° of the batch's
 first, up to five, and adds their points averaged per scanline with the
-lowest and highest dropped (a glint that passed every gate in one frame
-is the extreme, not a fifth of the answer) — a scanline seen in fewer than
-half the frames is a flicker and is dropped. Noise falls by about the root
+lowest and highest dropped once a scanline has four or more of them (a glint
+that passed every gate in one frame is the extreme, not a fifth of the
+answer) — a scanline seen in fewer than half the frames is a flicker and is
+dropped, and a batch ends where the stripe's axis flips. Noise falls by about the root
 of the batch; motion flushes it at once. The SCAN
 panel shows `still ×N` while a batch is held.
 
@@ -543,6 +545,29 @@ frame (texture upload)                       1.7 ms
 
 What left the detector threads with it: the oriented copy (1.5 ms), the
 drawing, and the cloud projection (7 ms per eye per frame while scanning).
+
+## Checking the rig
+
+```bash
+native/.venv/Scripts/orbiter-rigcheck
+```
+
+Measures what a scan depends on and says what is in the way, in the order the
+gates apply: exposure mode and flicker setting per eye, the frame rate each is
+really running at, how often the two eyes land close enough in the capture
+clock to pair, what calibration the server holds and how much data each piece
+rests on, where the sheet says the stripe can be against where it is, and —
+the one that decides whether a scan can confirm anything at all — how far the
+right eye's stripe sits from where the left eye's candidates project into its
+frame.
+
+That last number is the point of the tool. Every one of these failures reads
+identically from the SCAN panel: no points. A calibration whose pieces
+describe different cameras puts the stripe tens of pixels from where the other
+eye sees it, and nothing is ever confirmed, while the counts look exactly as
+they would with the laser switched off. `orbiter-rigcheck` exits non-zero when
+it finds something that stops a scan, so it is worth running after a
+calibration sweep and not only when something already looks wrong.
 
 ## Tests
 

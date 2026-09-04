@@ -101,19 +101,72 @@ def test_still_is_a_pose_within_half_a_millimetre_and_a_tenth_of_a_degree() -> N
     assert not _still((R, t), (turned, t))
 
 
+def _bank(worker, frame, R, t) -> bool:
+    """What one pair does: sort the frame into the batch under the offer
+    lock, then merge whatever the batch gave up outside it."""
+    return worker._merge(worker._bank(frame, R, t))
+
+
 def test_the_worker_batches_still_frames_and_flushes_on_motion() -> None:
     rng = np.random.default_rng(3)
     worker = ScanWorker()
     R, t = np.eye(3), np.array([0.0, 0.0, 500.0])
     for i in range(STILL_BATCH - 1):
-        assert not worker._bank(_frame(rng, 1.0), R, t)      # held
+        assert not _bank(worker, _frame(rng, 1.0), R, t)      # held
     assert len(worker._batch) == STILL_BATCH - 1
-    assert worker._bank(_frame(rng, 1.0), R, t)              # the fifth flushes
+    assert _bank(worker, _frame(rng, 1.0), R, t)              # the fifth flushes
     assert 190 <= len(worker.cloud) <= 200 and len(worker._batch) == 0   # voxel-merged
-    worker._bank(_frame(rng, 1.0), R, t)                     # a new batch begins
+    _bank(worker, _frame(rng, 1.0), R, t)                     # a new batch begins
     assert len(worker._batch) == 1
-    assert worker._bank(_frame(rng, 1.0), R, t + [5.0, 0.0, 0.0])   # motion: flush
+    assert _bank(worker, _frame(rng, 1.0), R, t + [5.0, 0.0, 0.0])   # motion: flush
     assert len(worker._batch) == 1
+
+
+def test_a_batch_ends_where_the_scanline_axis_flips() -> None:
+    """A scanline id counts along columns in one frame and along rows in
+    another, and `along_x` is decided per frame from the lit pixels' extent.
+    Averaged across a flip, the same id would put a column onto a row."""
+    rng = np.random.default_rng(11)
+    worker = ScanWorker()
+    R, t = np.eye(3), np.array([0.0, 0.0, 500.0])
+    down = _frame(rng, 1.0)
+    across = _frame(rng, 1.0)
+    across.along_x = not down.along_x
+    _bank(worker, down, R, t)
+    assert len(worker._batch) == 1
+    assert _bank(worker, across, R, t)                # the flip ends the batch
+    assert len(worker._batch) == 1 and worker._batch[0] is across
+
+
+def test_a_new_session_is_not_judged_against_the_last_one_s_pose() -> None:
+    """`set_active(False)` used to leave the batch pose behind, so the first
+    frame of the next scan was measured for stillness against wherever the
+    board stood when the last one ended."""
+    rng = np.random.default_rng(12)
+    worker = ScanWorker()
+    R, t = np.eye(3), np.array([0.0, 0.0, 500.0])
+    worker.set_active(True)
+    _bank(worker, _frame(rng, 1.0), R, t)
+    assert worker._batch_pose is not None
+    worker.set_active(False)
+    assert worker._batch_pose is None and not worker._batch
+
+
+def test_nearest_gaps_is_what_the_pairing_gets_to_choose_from() -> None:
+    """The two cameras free-run, so what matters is not the offset but its
+    distribution: for each left frame, how close the nearest right one is."""
+    from orbiter_native.rigcheck import nearest_gaps
+
+    left = np.arange(0.0, 0.33, 0.033)
+    assert np.allclose(nearest_gaps(left, left), 0.0)
+    # A steady 11 ms offset: every frame is 11 ms from its nearest partner,
+    # which a 4 ms window pairs never and a 20 ms window pairs always.
+    gaps = nearest_gaps(left, left + 0.011)
+    assert np.allclose(gaps, 0.011)
+    assert (gaps <= 0.004).mean() == 0.0 and (gaps <= 0.020).mean() == 1.0
+    # The nearest partner can be the one before, not only the one after.
+    assert np.allclose(nearest_gaps(np.array([0.100]), np.array([0.090, 0.140])), 0.010)
+    assert not len(nearest_gaps(np.empty(0), left))
 
 
 # ── the voxel merge ──────────────────────────────────────────────────────

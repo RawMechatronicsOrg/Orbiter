@@ -64,6 +64,8 @@ class MainWindow(QMainWindow):
         self._client = ConfigClient(server)
         self._config: RigConfig | None = None
         self._left_pose: tuple | None = None
+        self._extrinsics_raw: dict | None = None
+        self._extrinsics_at: tuple = (None, None)
         self._extrinsics = None
 
         self.scanner = ScanWorker()
@@ -180,7 +182,7 @@ class MainWindow(QMainWindow):
             return
 
         self._config = cfg
-        self._extrinsics = result_from_config(cfg.extrinsics_raw, None)
+        self._extrinsics_raw = cfg.extrinsics_raw
         board = "no board configured"
         if cfg.board:
             board = (f"board {cfg.board.squares_x}x{cfg.board.squares_y} · "
@@ -247,13 +249,29 @@ class MainWindow(QMainWindow):
         for panel in self.panels.values():
             panel.set_scanning(on)
 
+    def _extrinsics_for(self, wh: tuple[int, int] | None):
+        """The pair geometry at the left eye's live frame size, or None.
+
+        Resolved against the size, the way everything else here is: a
+        calibration solved at another resolution is refused rather than
+        silently misapplied. Drawn through an unchecked one, the right eye's
+        overlay would agree with the left's while the scan itself refused the
+        same numbers — and the two overlays disagreeing is the diagnostic.
+        """
+        if wh is None or self._extrinsics_raw is None:
+            return None
+        if (self._extrinsics_raw, wh) != self._extrinsics_at:
+            self._extrinsics_at = (self._extrinsics_raw, wh)
+            self._extrinsics = result_from_config(self._extrinsics_raw, wh)
+        return self._extrinsics
+
     def _paint(self) -> None:
         """Show whatever is newest. Anything older was skipped, not queued."""
         fresh = {side: box.take(0.0) for side, box in self._inbox.items()}
         left = fresh["left"]
         now = time.monotonic()
         if left is not None and left.board is not None and left.board.R is not None:
-            self._left_pose = (left.board.R, left.board.t, now)
+            self._left_pose = (left.board.R, left.board.t, now, left.wh)
         elif self._left_pose is not None and now - self._left_pose[2] > LEFT_POSE_RECENT_S:
             # A pose the left eye has not had for a while is not one to draw
             # the right eye's cloud through: the two overlays disagreeing is
@@ -263,11 +281,13 @@ class MainWindow(QMainWindow):
             if res is None:
                 continue
             pose = None
+            geom = (self._extrinsics_for(self._left_pose[3])
+                    if self._left_pose is not None else None)
             if (side == "right" and (res.board is None or res.board.R is None)
-                    and self._left_pose is not None and self._extrinsics is not None):
+                    and geom is not None):
                 # The right eye skipped ChArUco while scanning: its board
                 # pose for drawing follows from the left's.
-                pose = compose_right_pose(self._left_pose[0], self._left_pose[1], self._extrinsics)
+                pose = compose_right_pose(self._left_pose[0], self._left_pose[1], geom)
             self.panels[side].on_result(res, pose)
             self.calib.on_result(res)
         status = self.scanner.status.take(0.0)

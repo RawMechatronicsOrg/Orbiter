@@ -246,6 +246,16 @@ class BoardDetector:
 
     # ── the track ─────────────────────────────────────────────────────────
 
+    def forget(self) -> None:
+        """Drop the track and the pose prior.
+
+        A track kept while the detector is not being called would thaw
+        against a frame from whenever it last ran — minutes, in scan mode,
+        where the right eye skips the board entirely.
+        """
+        self._forget()
+        self._last_R = None
+
     def _forget(self) -> None:
         self._prev_gray = self._corners = self._ids = self._plane = None
         self._since_detect = 0

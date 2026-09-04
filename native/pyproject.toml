@@ -40,6 +40,7 @@ gpu = ["torch>=2.6", "torchvision>=0.21"]
 
 [project.scripts]
 orbiter-native = "orbiter_native.__main__:main"
+orbiter-rigcheck = "orbiter_native.rigcheck:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

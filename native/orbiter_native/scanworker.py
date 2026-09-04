@@ -150,8 +150,13 @@ class ScanWorker:
     """Owns the scan thread, the cloud, and the overlay snapshot."""
 
     def __init__(self) -> None:
-        # Guards the history, the configuration and the cloud.
+        # Guards the history, the batch and the configuration — taken by
+        # the detector threads on every result, so nothing slow runs under it.
         self._lock = threading.Lock()
+        # The cloud has its own: merging and decimating are the slow parts,
+        # and the eyes must not wait on them. Order, where both are held:
+        # `_lock` first, never the other way round.
+        self._cloud_lock = threading.Lock()
         self._hist: dict[str, deque[ScanInput]] = {
             "left": deque(maxlen=_HISTORY), "right": deque(maxlen=_HISTORY)}
         self._wake = threading.Event()
@@ -199,12 +204,19 @@ class ScanWorker:
         snap = None
         with self._lock:
             self._active = on
+            spilled = []
             if not on:
                 for q in self._hist.values():
                     q.clear()
                 self._prev_left = None
-                if self._flush_batch():
-                    snap = self.cloud.decimated(OVERLAY_MAX)
+                # The next session starts its own batch: kept, this pose
+                # would be what the first frame of that session is judged
+                # still against.
+                self._batch_pose = None
+                spilled = self._take_batch()
+        if self._merge(spilled):
+            with self._cloud_lock:
+                snap = self.cloud.decimated(OVERLAY_MAX)
         if snap is not None:
             # The batch's points joined the cloud; the eyes and the panel
             # must see them even though no pair follows.
@@ -215,15 +227,16 @@ class ScanWorker:
         with self._lock:
             self._batch.clear()
             self._batch_pose = None
-            self.cloud.clear()
             self._pairs = 0
             self._offered_left = 0
+        with self._cloud_lock:
+            self.cloud.clear()
             snap = self.cloud.decimated(OVERLAY_MAX)
         self.overlay.publish(snap)
         self._publish(None, None)
 
     def export(self, path: str) -> int:
-        with self._lock:
+        with self._cloud_lock:
             return self.cloud.write_ply(path)
 
     # ── input (detector threads) ──────────────────────────────────────────
@@ -336,8 +349,11 @@ class ScanWorker:
         snap = None
         with self._lock:
             self._pairs += 1
-            added = self._bank(frame, a.board_R, a.board_t)
-            if added:
+            spilled = self._bank(frame, a.board_R, a.board_t)
+        # Deliberately outside that lock: `offer` takes it on both detector
+        # threads, and a voxel merge under it stalls both eyes every pair.
+        if self._merge(spilled):
+            with self._cloud_lock:
                 snap = self.cloud.decimated(OVERLAY_MAX)
         if snap is not None:
             self.overlay.publish(snap)
@@ -345,31 +361,47 @@ class ScanWorker:
 
     # ── still batches (under the lock) ────────────────────────────────────
 
-    def _bank(self, frame: ScanFrame, R, t) -> bool:
-        """Add a frame's points to the cloud — through a still batch when
-        the board has not moved since the batch began. Returns True when
-        the cloud changed."""
-        still = self._batch_pose is not None and _still(self._batch_pose, (R, t))
-        changed = False
-        if not still:
-            changed = self._flush_batch()
-            self._batch_pose = (np.asarray(R, float), np.asarray(t, float).ravel())
+    def _bank(self, frame: ScanFrame, R, t) -> list[ScanFrame]:
+        """Sort a frame into the still batch. Returns whatever the batch gave
+        up, for `_merge` to average and add.
+
+        The merge is not done here on purpose: this runs under the lock the
+        detector threads take to hand their results over, and a voxel merge
+        under that lock stalls both eyes.
+        """
+        pose = (np.asarray(R, float), np.asarray(t, float).ravel())
+        # A scanline id counts along columns in one frame and along rows in
+        # another — `along_x` is decided per frame — so a batch that spans a
+        # flip would average columns into rows. It ends at the flip instead.
+        turned = bool(self._batch) and self._batch[-1].along_x != frame.along_x
+        spilled: list[ScanFrame] = []
+        if turned or self._batch_pose is None or not _still(self._batch_pose, (R, t)):
+            spilled += self._take_batch()
+            self._batch_pose = pose
         if frame.n_kept:
             self._batch.append(frame)
         if len(self._batch) >= STILL_BATCH:
-            changed = self._flush_batch() or changed
-            self._batch_pose = (np.asarray(R, float), np.asarray(t, float).ravel())
-        return changed
+            spilled += self._take_batch()
+            self._batch_pose = pose
+        return spilled
 
-    def _flush_batch(self) -> bool:
-        """Average the batch per scanline and add it. One frame adds as is."""
+    def _take_batch(self) -> list[ScanFrame]:
+        """Empty the batch, under the caller's lock."""
         frames, self._batch = self._batch, []
+        return frames
+
+    def _merge(self, frames: list[ScanFrame]) -> bool:
+        """Average what a batch gave up and add it to the cloud. Returns True
+        when the cloud changed. Takes the cloud's own lock, never the
+        offer lock."""
         if not frames:
             return False
         pts = average_still(frames)
-        if len(pts):
+        if not len(pts):
+            return False
+        with self._cloud_lock:
             self.cloud.add(pts)
-        return bool(len(pts))
+        return True
 
     def _motion(self, a: ScanInput, readout: Readout | None):
         """The board's twist into this frame from the previous left pose, or
@@ -407,6 +439,8 @@ class ScanWorker:
                cfg.extrinsics_raw, cfg.laser_plane_raw,
                cfg.left.readout_raw if cfg.left else None, reach)
         if key != self._geom_key:
+            # The key goes in last: a raise below would otherwise leave a
+            # half-built cache marked as current for this calibration.
             rig = None
             if cfg.left is not None and cfg.right is not None:
                 kl = cfg.left.intrinsics_for(wh)
@@ -414,7 +448,6 @@ class ScanWorker:
                 geom = result_from_config(cfg.extrinsics_raw, wh)
                 if kl is not None and kr is not None and geom is not None:
                     rig = StereoRig(kl, kr, geom)
-            self._geom_key = key
             plane = plane_from_config(cfg.laser_plane_raw, wh)
             self._geom = (rig, plane,
                           Readout.from_config(cfg.left.readout_raw if cfg.left else None, wh))
@@ -422,10 +455,13 @@ class ScanWorker:
                 side: (stripe_rows(plane, rig, reach, size, side)
                        if rig is not None and plane is not None else None)
                 for side, size in (("left", wh), ("right", right_wh))}
+            self._geom_key = key
         return self._geom
 
     def _publish(self, frame: ScanFrame | None, note: str | None) -> None:
+        with self._cloud_lock:
+            n, bounds = len(self.cloud), self.cloud.bounds()
         with self._lock:
-            st = ScanStatus(len(self.cloud), self.cloud.bounds(), self._pairs,
+            st = ScanStatus(n, bounds, self._pairs,
                             self._offered_left, len(self._batch), frame, note)
         self.status.put(st)

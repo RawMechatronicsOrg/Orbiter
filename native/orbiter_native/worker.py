@@ -358,8 +358,11 @@ class EyeWorker(QObject):
         # While scanning, the right eye's board pose is only ever drawn — and
         # the window draws it from the left's through the extrinsics — so
         # the right eye skips ChArUco and spends its frame on the stripe.
-        board = (detector.detect(frame.gray, intrinsics)
-                 if detector.ready and board_wanted(self.side, scan_mode) else BoardHit())
+        if detector.ready and board_wanted(self.side, scan_mode):
+            board = detector.detect(frame.gray, intrinsics)
+        else:
+            detector.forget()
+            board = BoardHit()
         descriptor = (describe(board.corners, board.ids, detector.board, (w, h))
                       if board.corners is not None else None)
 
