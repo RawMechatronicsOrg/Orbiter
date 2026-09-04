@@ -94,8 +94,17 @@ def _snapshot(host: str, cam: str) -> np.ndarray | None:
 
 
 def _controls(host: str, cam: str) -> dict[str, Any]:
-    r = httpx.get(f"{host}/api/controls/{cam}", timeout=8).json()
-    return {c["slug"]: c for c in r.get("controls", [])}
+    """The driver's controls for one camera, by slug.
+
+    camserver answers 503 "camera is not running" when nothing is holding the
+    stream open, and a control read that lands then reports every value as
+    null — which reads exactly like a camera on auto. So this is only ever
+    called while `_with_streams` has the cameras up.
+    """
+    r = httpx.get(f"{host}/api/controls/{cam}", timeout=8)
+    if r.status_code != 200:
+        raise RuntimeError(f"{r.status_code} {r.json().get('error', r.text[:80])}")
+    return {c["slug"]: c for c in r.json().get("controls", [])}
 
 
 #: A line's mark: nothing to see, worth knowing, in the way of a scan.
@@ -106,44 +115,61 @@ def say(state: str, line: str) -> None:
     print(f"{MARK[state]} {line}")
 
 
-def check_cameras(host: str, cams: dict[str, str]) -> list[str]:
+def _with_streams(host: str, cams: dict[str, str], seconds: float, work):
+    """Hold both streams open for `seconds`, running `work()` meanwhile.
+
+    Everything that asks the driver a question has to ask it while the camera
+    is running: camserver refuses a control read otherwise. Holding the
+    streams also measures the frame rate and the offset between the eyes,
+    which is the same measurement the pairing needs.
+    """
+    got: dict[str, list[float]] = {s: [] for s in cams}
+    threads = [threading.Thread(target=_stamps, args=(host, cam, seconds, got[side]),
+                               daemon=True)
+               for side, cam in cams.items()]
+    for t in threads:
+        t.start()
+    time.sleep(min(1.5, seconds / 2))                 # let the devices come up
+    out = work()
+    for t in threads:
+        t.join()
+    return {s: np.array([v for v in got[s] if np.isfinite(v)]) for s in got}, out
+
+
+def report_cameras(cams: dict[str, str], controls: dict[str, Any]) -> list[str]:
     """Exposure mode and flicker setting, read back from the driver."""
     print("cameras")
     bad = []
     for side, cam in cams.items():
-        try:
-            c = _controls(host, cam)
-        except httpx.HTTPError as exc:
-            say(BAD, f"{side:5s} {cam}: controls unreadable — {exc}")
-            bad.append(f"{cam} unreachable")
+        c = controls.get(side)
+        if isinstance(c, str):                        # the read itself failed
+            say(BAD, f"{side:5s} {cam}: controls unreadable — {c}")
+            bad.append(f"{cam} controls unreadable")
             continue
         auto = c.get("auto_exposure", {}).get("value")
         line = c.get("power_line_frequency", {}).get("value")
         # 1 is Manual Mode. Anything else is the camera choosing its own
         # exposure, which on this rig meant 50 ms and a smeared stripe.
+        # None means the driver would not say, which is not the same thing.
         say(OK if auto == 1 else WARN,
             f"{side:5s} {cam}: auto_exposure={auto} "
-            f"({'manual' if auto == 1 else 'the camera is choosing'})")
-        if auto != 1:
+            + ("(manual)" if auto == 1 else
+               "(the driver would not say)" if auto is None else
+               "(the camera is choosing)"))
+        if auto is not None and auto != 1:
             bad.append(f"{cam} auto exposure")
         say(OK if line == 1 else WARN,
             f"{side:5s} {cam}: power_line_frequency={line} "
-            f"({'50 Hz' if line == 1 else 'not 50 Hz — mains banding'})")
+            + ("(50 Hz)" if line == 1 else
+               "(the driver would not say)" if line is None else
+               "(not 50 Hz — mains banding)"))
     return bad
 
 
-def check_pairing(host: str, cams: dict[str, str], seconds: float,
-                  window_s: float) -> list[str]:
+def report_pairing(cams: dict[str, str], stamps: dict[str, np.ndarray],
+                   seconds: float, window_s: float) -> list[str]:
     """Frame rate per eye, and how often a pair falls inside the window."""
-    print(f"\npairing (watching {seconds:.0f} s)")
-    got: dict[str, list[float]] = {s: [] for s in cams}
-    threads = [threading.Thread(target=_stamps, args=(host, cam, seconds, got[side]))
-               for side, cam in cams.items()]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    stamps = {s: np.array([v for v in got[s] if np.isfinite(v)]) for s in got}
+    print(f"\npairing (watched {seconds:.0f} s)")
     bad = []
     for side, cam in cams.items():
         fps = len(stamps[side]) / seconds
@@ -240,11 +266,19 @@ def check_stripe(cfg, rig_cfg: dict, host: str, cams: dict[str, str],
     pix = {s: find_stripe_pixels(frames[s], rows=bands[s]) for s in ("left", "right")}
     for side in ("left", "right"):
         p, band = pix[side], bands[side]
-        say(OK if p.ok else BAD,
+        # A stripe is thin: a few pixels across, one run per scanline. Much
+        # more than that in the band is the room, not the laser, and every
+        # number below it is then about the room.
+        area = max((band[1] - band[0]) * frames[side].shape[1], 1)
+        share = p.count / area
+        say(OK if p.ok and share < 0.03 else (BAD if not p.ok else WARN),
             f"{side:5s}: rows {band[0]}..{band[1]} of {frames[side].shape[0]}, "
-            f"{p.count} lit px" + (f" — {p.reason}" if p.reason else ""))
+            f"{p.count} lit px ({100 * share:.1f}% of the band)"
+            + (f" — {p.reason}" if p.reason else ""))
         if not p.ok:
             bad.append(f"no stripe in the {side} eye")
+        elif share >= 0.03:
+            bad.append(f"the {side} eye's band is {100 * share:.0f}% lit — not a stripe")
     if bad:
         return bad
 
@@ -301,11 +335,23 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     print(f"camserver {host} · left {cams['left']} · right {cams['right']}\n")
 
+    from .scanworker import PAIR_WINDOW_S
     params = ScanParams()
-    trouble = check_cameras(host, cams)
+    seconds = 1.5 if a.quick else a.seconds
+
+    def read_controls():
+        out: dict[str, Any] = {}
+        for side, cam in cams.items():
+            try:
+                out[side] = _controls(host, cam)
+            except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                out[side] = str(exc)
+        return out
+
+    stamps, controls = _with_streams(host, cams, seconds, read_controls)
+    trouble = report_cameras(cams, controls)
     if not a.quick:
-        from .scanworker import PAIR_WINDOW_S
-        trouble += check_pairing(host, cams, a.seconds, PAIR_WINDOW_S)
+        trouble += report_pairing(cams, stamps, seconds, PAIR_WINDOW_S)
     trouble += check_calibration(rig_cfg)
     try:
         trouble += check_stripe(cfg, rig_cfg, host, cams, params)
