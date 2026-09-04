@@ -9,11 +9,13 @@ depending on which window you looked at last.
 
 from __future__ import annotations
 
+import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QFrame, QLabel, QVBoxLayout
 
 from .config import Eye
-from .glview import FrameView
+from .glview import FrameView, Scene
+from .scan import CloudOverlay
 from .worker import EyeResult, EyeStats
 
 
@@ -28,6 +30,8 @@ class EyePanel(QFrame):
         super().__init__(parent)
         self.side = side
         self._eye: Eye | None = None
+        self._cloud: CloudOverlay | None = None
+        self._scanning = False
 
         self.setObjectName("panel")   # see the stylesheet in __main__
         self.setFrameShape(QFrame.Shape.StyledPanel)
@@ -74,9 +78,47 @@ class EyePanel(QFrame):
 
     # ── live updates ──────────────────────────────────────────────────────
 
-    def on_result(self, res: EyeResult) -> None:
-        self.view.set_frame(res.bgr)
+    def set_overlay(self, overlay: CloudOverlay | None) -> None:
+        """The scanned cloud, drawn over the frame while scanning."""
+        self._cloud = overlay
+
+    def set_scanning(self, on: bool) -> None:
+        self._scanning = on
+
+    def on_result(self, res: EyeResult, pose=None) -> None:
+        """`pose` is a (R, t) to draw the cloud through when the result has
+        none of its own — the right eye's, composed from the left's."""
+        self.view.set_scene(self._scene(res, pose))
         self.view.set_overlay(self._overlay_lines(res))
+
+    def _scene(self, res: EyeResult, pose=None) -> Scene:
+        """The worker's result as the view draws it — every coordinate still
+        original; the view orients. The cloud is projected through THIS
+        eye's own board pose, so the two overlays disagreeing is itself a
+        sign that the board poses do."""
+        board = res.board
+        stripe = None
+        if res.stripe is not None and res.stripe.count:
+            stripe = np.stack([res.stripe.x, res.stripe.y], axis=1).astype(np.float32)
+        laser = res.laser if res.laser is not None and res.laser.points.size else None
+        cloud = (self._cloud.points()
+                 if self._scanning and self._cloud is not None else None)
+        k = res.intrinsics
+        return Scene(
+            bgr=res.bgr, orientation=res.orientation, size=res.wh, stripe=stripe,
+            corners=None if board is None or board.corners is None
+            else board.corners.reshape(-1, 2),
+            ids=None if board is None or board.ids is None else board.ids.reshape(-1),
+            laser=laser,
+            hull=None if res.hull is None else res.hull.reshape(-1, 2),
+            cloud=cloud,
+            R=(pose[0] if pose is not None and (board is None or board.R is None)
+               else None if board is None else board.R),
+            t=(pose[1] if pose is not None and (board is None or board.t is None)
+               else None if board is None else board.t),
+            K=None if k is None else k.K,
+            D=None if k is None else k.D,
+        )
 
     def on_status(self, error: str | None) -> None:
         if error:
@@ -85,7 +127,7 @@ class EyePanel(QFrame):
     def _overlay_lines(self, res: EyeResult) -> list[str]:
         s: EyeStats = res.stats
         lines = [
-            f"recv   {_fmt(s.recv_fps, 2)} fps",
+            f"recv   {_fmt(s.recv_fps, 2)} fps" + ("   gpu" if s.gpu else ""),
             f"detect {_fmt(s.detect_fps, 2)} fps   {_fmt(s.detect_ms)} ms",
         ]
         if s.server_age_ms is not None:
@@ -95,7 +137,8 @@ class EyePanel(QFrame):
             # from two unsynchronised clocks.
             lines.append(f"age    {_fmt(s.server_age_ms)} ms (server)")
         if s.corners:
-            lines.append(f"board  {s.corners} corners · cover {s.coverage * 100:.0f}%")
+            lines.append(f"board  {s.corners} corners · cover {s.coverage * 100:.0f}% · "
+                         f"{'tracked' if s.tracked else 'detected'}")
         else:
             lines.append("board  —")
         if res.board is not None and res.board.t is not None:

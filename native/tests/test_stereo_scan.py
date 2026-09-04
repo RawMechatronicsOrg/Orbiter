@@ -148,6 +148,10 @@ def _plane():
                               "width": WH[0], "height": WH[1]}, WH)
 
 
+#: These tests are about the veto, the sheet and the cylinder; the reach gate
+#: has its own tests, so it is opened wide here.
+WIDE = ScanParams(range_mm=(0.0, 1e9))
+
 #: A board 600 mm out, facing the camera, its centre under the sheet: the
 #: centred, face-out frame `cvcore.estimate_pose` hands out.
 BOARD2_R = np.diag([1.0, -1.0, -1.0])
@@ -190,7 +194,7 @@ def test_scan_recovers_a_curve_on_the_plane() -> None:
     left = _pixels(KL, np.eye(3), np.zeros(3), truth)
     right = _pixels(KR, R_TRUE, T_TRUE, truth)
 
-    out = scan_frame(rig, plane, left, right, BOARD2_R, BOARD2_T)
+    out = scan_frame(rig, plane, left, right, BOARD2_R, BOARD2_T, WIDE)
     assert out.reason is None, out.reason
     assert out.n_kept > 250
     assert out.n_confirmed > 0.95 * out.n_pixels
@@ -219,7 +223,7 @@ def test_scan_vetoes_what_the_right_eye_did_not_see() -> None:
     wire = np.stack([np.linspace(-80.0, 80.0, 600), np.full(600, 30.0),
                      np.full(600, 500.0)], axis=1)
     both = _join(left, _pixels(KL, np.eye(3), np.zeros(3), wire))
-    out = scan_frame(rig, plane, both, right, BOARD2_R, BOARD2_T)
+    out = scan_frame(rig, plane, both, right, BOARD2_R, BOARD2_T, WIDE)
     assert out.reason is None, out.reason
     assert out.n_kept > 250
     # The wire's pixels are out; the stripe's — every row of it — are in.
@@ -229,7 +233,7 @@ def test_scan_vetoes_what_the_right_eye_did_not_see() -> None:
     # The right eye misses the stretch x in [10, 40]: those scanlines go.
     keep = ~((truth[:, 0] > 10.0) & (truth[:, 0] < 40.0))
     right_gap = _pixels(KR, R_TRUE, T_TRUE, truth[keep])
-    out = scan_frame(rig, plane, left, right_gap, BOARD2_R, BOARD2_T)
+    out = scan_frame(rig, plane, left, right_gap, BOARD2_R, BOARD2_T, WIDE)
     assert out.n_rejected_unconfirmed > 30
     # Up to the confirmation slack: 3 px in the right eye is 1.7 mm here, and
     # a stripe row off-centre is another 2.6 px — about 3 mm at each edge.
@@ -242,13 +246,13 @@ def test_scan_needs_the_plane_a_board_pose_and_both_eyes() -> None:
     truth = _curve(lambda x: np.full_like(x, 500.0))
     left = _pixels(KL, np.eye(3), np.zeros(3), truth)
     right = _pixels(KR, R_TRUE, T_TRUE, truth)
-    r = scan_frame(rig, None, left, right, BOARD2_R, BOARD2_T)
+    r = scan_frame(rig, None, left, right, BOARD2_R, BOARD2_T, WIDE)
     assert r.n_kept == 0 and "laser plane" in r.reason
-    r = scan_frame(rig, plane, left, right, None, None)
+    r = scan_frame(rig, plane, left, right, None, None, WIDE)
     assert r.n_kept == 0 and "board pose" in r.reason
     empty = StripePixels(wh=WH, reason="no stripe")
-    assert scan_frame(rig, plane, empty, right, BOARD2_R, BOARD2_T).n_kept == 0
-    assert scan_frame(rig, plane, left, empty, BOARD2_R, BOARD2_T).n_kept == 0
+    assert scan_frame(rig, plane, empty, right, BOARD2_R, BOARD2_T, WIDE).n_kept == 0
+    assert scan_frame(rig, plane, left, empty, BOARD2_R, BOARD2_T, WIDE).n_kept == 0
 
 
 def test_scan_drops_points_outside_the_cylinder() -> None:
@@ -257,14 +261,14 @@ def test_scan_drops_points_outside_the_cylinder() -> None:
     truth = _curve(lambda x: np.full_like(x, 500.0))        # 100 mm above the board
     left = _pixels(KL, np.eye(3), np.zeros(3), truth)
     right = _pixels(KR, R_TRUE, T_TRUE, truth)
-    assert scan_frame(rig, plane, left, right, BOARD2_R, BOARD2_T).n_kept > 250
+    assert scan_frame(rig, plane, left, right, BOARD2_R, BOARD2_T, WIDE).n_kept > 250
 
-    low = ScanParams(volume=ScanVolume(height_mm=50.0))
+    low = ScanParams(range_mm=(0.0, 1e9), volume=ScanVolume(height_mm=50.0))
     out = scan_frame(rig, plane, left, right, BOARD2_R, BOARD2_T, low)
     assert out.n_kept == 0 and out.n_rejected_volume > 250
 
     # The curve spans +/-80 mm in x; a 10 mm radius keeps the middle only.
-    narrow = ScanParams(volume=ScanVolume(radius_mm=10.0))
+    narrow = ScanParams(range_mm=(0.0, 1e9), volume=ScanVolume(radius_mm=10.0))
     kept = scan_frame(rig, plane, left, right, BOARD2_R, BOARD2_T, narrow).n_kept
     assert 0 < kept < 60
 
@@ -272,7 +276,7 @@ def test_scan_drops_points_outside_the_cylinder() -> None:
     on_board = _curve(lambda x: np.full_like(x, 600.0))
     lb = _pixels(KL, np.eye(3), np.zeros(3), on_board)
     rb = _pixels(KR, R_TRUE, T_TRUE, on_board)
-    assert scan_frame(rig, plane, lb, rb, BOARD2_R, BOARD2_T).n_kept == 0
+    assert scan_frame(rig, plane, lb, rb, BOARD2_R, BOARD2_T, WIDE).n_kept == 0
 
 
 def test_volume_edges() -> None:
@@ -442,3 +446,52 @@ def test_board_pose_frame_is_centred_with_z_toward_the_camera() -> None:
     # 180° or 144 mm.
     R2, t2, _ = estimate_pose(corners, ids, board, k, R_predicted=R)
     assert np.allclose(R2, R, atol=0.02) and np.allclose(t2, t, atol=2.0)
+
+
+def test_the_veto_offset_measures_how_far_the_eyes_disagree() -> None:
+    """A calibration that cannot scan and a scene with no laser in it produce
+    the same confirmed count: zero. This is the number that tells them apart —
+    how far the right eye's stripe sits from where the left eye's candidates
+    land in its frame. On the rig it read -52 px against a 3 px tolerance."""
+    from orbiter_native.laser import StripePixels
+    from orbiter_native.scan import _veto_offset
+
+    cols = np.arange(200, 800, dtype=np.int32)
+    rows = np.full(len(cols), 400, np.int32)
+    right = StripePixels(x=cols, y=rows, w=np.full(len(cols), 200, np.uint8),
+                         wh=(1920, 1080), along_x=True, reason=None)
+    on_it = np.column_stack([cols.astype(float), rows.astype(float)])
+    assert abs(_veto_offset(right, on_it)) < 1e-9
+    assert abs(_veto_offset(right, on_it + [0.0, 52.0]) - 52.0) < 1e-9
+    assert abs(_veto_offset(right, on_it + [0.0, -7.5]) + 7.5) < 1e-9
+    # Columns the right eye has no stripe in say nothing, not zero.
+    away = np.column_stack([np.full(10, 1900.0), np.full(10, 100.0)])
+    assert np.isnan(_veto_offset(right, away))
+    assert np.isnan(_veto_offset(right, np.empty((0, 2))))
+
+
+def test_a_pose_that_is_not_a_rotation_is_neither_returned_nor_believed() -> None:
+    """One degenerate solve used to end the eye: NaN came back as the pose,
+    the caller kept it as the next frame's prior, and the disambiguating
+    solve raised on it from then on. A prior that is not a rotation is
+    ignored, and a solve that is not one is no pose at all."""
+    from orbiter_native import cvcore
+    from orbiter_native.cvcore import charuco_detect, estimate_pose
+
+    spec = BoardSpec(squares_x=8, squares_y=8, square_length_mm=36.0,
+                     marker_length_mm=26.64, aruco_dict_id=5)
+    board = build_board(spec)
+    corners, ids = charuco_detect(board.generateImage((1600, 1600), marginSize=80), board)
+    k = Intrinsics(fx=1500.0, fy=1500.0, cx=800.0, cy=800.0, dist=(0.0,) * 5)
+    good = estimate_pose(corners, ids, board, k)
+    assert good is not None
+
+    for prior in (np.full((3, 3), np.nan), np.zeros((3, 3)), np.eye(3) * 2.0):
+        poisoned = estimate_pose(corners, ids, board, k, R_predicted=prior)
+        assert poisoned is not None
+        assert np.allclose(poisoned[0], good[0], atol=0.02)      # solved without it
+
+    nan_pose = (np.full((3, 3), np.nan), np.zeros(3), 0.0)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(cvcore, "estimate_board_pose", lambda *a, **kw: nan_pose)
+        assert estimate_pose(corners, ids, board, k) is None

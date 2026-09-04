@@ -278,6 +278,17 @@ def result_from_config(cfg: dict[str, Any] | None,
                         n_views=int(cfg.get("views", 0)), wh=wh)
 
 
+def compose_right_pose(R_left: np.ndarray, t_left: np.ndarray,
+                       geom: StereoResult) -> tuple[np.ndarray, np.ndarray]:
+    """The board's pose in the RIGHT camera's frame from its pose in the
+    left's, through the pair's geometry: X_r = R (R_l X_b + t_l) + T, so
+    R_r = R R_l and t_r = R t_l + T. Lets the right eye skip ChArUco while
+    scanning and still place the cloud on its frame."""
+    R = np.asarray(geom.R, float)
+    T = np.asarray(geom.T, float).ravel()
+    return R @ np.asarray(R_left, float), R @ np.asarray(t_left, float).ravel() + T
+
+
 class StereoRig:
     """The two eyes' intrinsics and mutual pose, ready to project.
 

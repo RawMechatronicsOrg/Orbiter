@@ -17,6 +17,7 @@ window fell further behind the cameras the longer it ran.
 from __future__ import annotations
 
 import logging
+import time
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction
@@ -34,11 +35,13 @@ from PySide6.QtWidgets import (
 import httpx
 
 from .calibpanel import CalibrationPanel
+from .cloudview import CloudPanel
 from .config import ConfigClient, RigConfig
 from .laser import LaserParams
 from .panel import EyePanel
 from .scanpanel import ScanPanel
-from .scanworker import ScanWorker
+from .scanworker import LEFT_POSE_RECENT_S, ScanWorker
+from .stereo import compose_right_pose, result_from_config
 from .worker import EyeWorker, Latest
 
 log = logging.getLogger("orbiter_native.app")
@@ -53,34 +56,45 @@ _PAINT_MS = 33
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, server: str) -> None:
+    def __init__(self, server: str, gpu: bool = False) -> None:
         super().__init__()
         self.setWindowTitle("Orbiter — native CV workbench")
         self.resize(1500, 780)
 
         self._client = ConfigClient(server)
         self._config: RigConfig | None = None
+        self._left_pose: tuple | None = None
+        self._extrinsics_raw: dict | None = None
+        self._extrinsics_at: tuple = (None, None)
+        self._extrinsics = None
 
         self.scanner = ScanWorker()
         #: Newest result per eye, waiting for the paint timer.
         self._inbox = {"left": Latest(), "right": Latest()}
         self.panels = {"left": EyePanel("left"), "right": EyePanel("right")}
         self.workers: dict[str, EyeWorker] = {}
+        self._rows_pushed: dict[str, tuple[int, int] | None] = {}
         for side, panel in self.panels.items():
-            w = EyeWorker(side)
+            w = EyeWorker(side, gpu=gpu)
             # Errors are rare, so a queued signal is fine for them; results
             # are not, so they go to mailboxes the timer drains.
             w.status.connect(self._on_status, Qt.ConnectionType.QueuedConnection)
             w.add_sink(self._inbox[side].put)
             w.add_sink(self.scanner.offer)
-            w.set_overlay(self.scanner.overlay)
+            if side == "right":
+                w.set_scan_gate(self.scanner.left_pose_recent)
+            panel.set_overlay(self.scanner.overlay)
             self.workers[side] = w
 
         self.calib = CalibrationPanel()
         self.calib.save_requested.connect(self._save_intrinsics)
+        # Calibrating wants the stripe detected; the checkbox pushes it down.
+        self.calib.laser_requested.connect(
+            lambda on: self._laser.setChecked(True) if on else None)
 
         self.scan = ScanPanel(self.scanner)
         self.scan.active_changed.connect(self._on_scan_toggled)
+        self.cloud = CloudPanel()
 
         split = QSplitter(Qt.Orientation.Horizontal)
         split.addWidget(self.panels["left"])
@@ -88,8 +102,10 @@ class MainWindow(QMainWindow):
         side = QSplitter(Qt.Orientation.Vertical)
         side.addWidget(self.calib)
         side.addWidget(self.scan)
+        side.addWidget(self.cloud)
+        side.setStretchFactor(2, 1)
         split.addWidget(side)
-        split.setSizes([600, 600, 300])
+        split.setSizes([560, 560, 380])
 
         root = QWidget()
         outer = QHBoxLayout(root)
@@ -166,6 +182,7 @@ class MainWindow(QMainWindow):
             return
 
         self._config = cfg
+        self._extrinsics_raw = cfg.extrinsics_raw
         board = "no board configured"
         if cfg.board:
             board = (f"board {cfg.board.squares_x}x{cfg.board.squares_y} · "
@@ -175,11 +192,7 @@ class MainWindow(QMainWindow):
             f"(nominal) · {board}"
         )
 
-        self.calib.set_board_spec(cfg.board)
-        for side in ("left", "right"):
-            eye = getattr(cfg, side)
-            if eye is not None:
-                self.calib.set_intrinsics(side, eye.intrinsics_for(None))
+        self.calib.set_config(cfg)
         self.scanner.set_config(cfg)
         for side, worker in self.workers.items():
             eye = getattr(cfg, side)
@@ -199,7 +212,8 @@ class MainWindow(QMainWindow):
         # flags it with a reserved key so one save covers both solves.
         extr = per_side.pop("_extrinsics", None)
         plane = per_side.pop("_laser_plane", None)
-        args: dict = {side: {"intrinsics": k} for side, k in per_side.items()}
+        # Per-eye fields as the panel keyed them: intrinsics, readout.
+        args: dict = {side: dict(fields) for side, fields in per_side.items()}
         if plane is not None:
             args["laser_plane"] = plane
         if extr is not None:
@@ -232,17 +246,61 @@ class MainWindow(QMainWindow):
             self._laser.setChecked(True)      # this also pushes it to the workers
         for w in self.workers.values():
             w.set_scan_mode(on)
+        for panel in self.panels.values():
+            panel.set_scanning(on)
+
+    def _extrinsics_for(self, wh: tuple[int, int] | None):
+        """The pair geometry at the left eye's live frame size, or None.
+
+        Resolved against the size, the way everything else here is: a
+        calibration solved at another resolution is refused rather than
+        silently misapplied. Drawn through an unchecked one, the right eye's
+        overlay would agree with the left's while the scan itself refused the
+        same numbers — and the two overlays disagreeing is the diagnostic.
+        """
+        if wh is None or self._extrinsics_raw is None:
+            return None
+        if (self._extrinsics_raw, wh) != self._extrinsics_at:
+            self._extrinsics_at = (self._extrinsics_raw, wh)
+            self._extrinsics = result_from_config(self._extrinsics_raw, wh)
+        return self._extrinsics
 
     def _paint(self) -> None:
         """Show whatever is newest. Anything older was skipped, not queued."""
-        for side, box in self._inbox.items():
-            res = box.take(0.0)
-            if res is not None:
-                self.panels[side].on_result(res)
-                self.calib.on_result(res)
+        fresh = {side: box.take(0.0) for side, box in self._inbox.items()}
+        left = fresh["left"]
+        now = time.monotonic()
+        if left is not None and left.board is not None and left.board.R is not None:
+            self._left_pose = (left.board.R, left.board.t, now, left.wh)
+        elif self._left_pose is not None and now - self._left_pose[2] > LEFT_POSE_RECENT_S:
+            # A pose the left eye has not had for a while is not one to draw
+            # the right eye's cloud through: the two overlays disagreeing is
+            # a diagnostic, and a stale pose would fake agreement.
+            self._left_pose = None
+        for side, res in fresh.items():
+            if res is None:
+                continue
+            pose = None
+            geom = (self._extrinsics_for(self._left_pose[3])
+                    if self._left_pose is not None else None)
+            if (side == "right" and (res.board is None or res.board.R is None)
+                    and geom is not None):
+                # The right eye skipped ChArUco while scanning: its board
+                # pose for drawing follows from the left's.
+                pose = compose_right_pose(self._left_pose[0], self._left_pose[1], geom)
+            self.panels[side].on_result(res, pose)
+            self.calib.on_result(res)
         status = self.scanner.status.take(0.0)
         if status is not None:
             self.scan.on_status(status)
+        # The same decimated snapshot the eyes draw; the view uploads it
+        # only when the scan thread published a new one.
+        self.cloud.set_live_points(self.scanner.overlay.points(), len(self.scanner.cloud))
+        rows = dict(self.scanner.stripe_rows)
+        if rows != self._rows_pushed:
+            for side, worker in self.workers.items():
+                worker.set_stripe_rows(rows.get(side))
+            self._rows_pushed = rows
 
     def _on_status(self, side: str, error: object) -> None:
         self.panels[side].on_status(error if isinstance(error, str) else None)

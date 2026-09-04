@@ -29,8 +29,18 @@ dependencies = [
     "httpx>=0.27",
 ]
 
+[project.optional-dependencies]
+# nvJPEG decode and the stripe score on an NVIDIA GPU (orbiter_native/gpu.py).
+# CUDA builds of torch live on PyTorch's own index, not PyPI:
+#
+#     pip install -e "./native[gpu]" --extra-index-url https://download.pytorch.org/whl/cu128
+#
+# Without the extra, or without a CUDA device, the app runs the OpenCV path.
+gpu = ["torch>=2.6", "torchvision>=0.21"]
+
 [project.scripts]
 orbiter-native = "orbiter_native.__main__:main"
+orbiter-rigcheck = "orbiter_native.rigcheck:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

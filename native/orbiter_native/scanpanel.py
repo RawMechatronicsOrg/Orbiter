@@ -98,7 +98,27 @@ class ScanPanel(QFrame):
                 "without needing to be recognised. The board is a disc, so the "
                 "radius is naturally its own: 144 mm on this rig."
             )
-        for w in (self.height_mm, self.radius_mm, self.floor_mm):
+        box.addWidget(QLabel("reach from"), 3, 0)
+        self.reach_lo = QDoubleSpinBox()
+        self.reach_lo.setRange(0.0, 5000.0)
+        self.reach_lo.setValue(ScanParams().range_mm[0])
+        self.reach_lo.setSuffix(" mm")
+        box.addWidget(self.reach_lo, 3, 1)
+        box.addWidget(QLabel("reach to"), 4, 0)
+        self.reach_hi = QDoubleSpinBox()
+        self.reach_hi.setRange(0.0, 5000.0)
+        self.reach_hi.setValue(ScanParams().range_mm[1])
+        self.reach_hi.setSuffix(" mm")
+        box.addWidget(self.reach_hi, 4, 1)
+        for w in (self.reach_lo, self.reach_hi):
+            w.setToolTip(
+                "The scanner's working range: a point must lie this far from the "
+                "line through the two camera centres. Nearer is the rig itself or "
+                "a hand, farther is the wall; neither has to be recognised. Holds "
+                "without a board pose, unlike the cylinder."
+            )
+        for w in (self.height_mm, self.radius_mm, self.floor_mm,
+                  self.reach_lo, self.reach_hi):
             w.valueChanged.connect(self._push_params)
         root.addLayout(box)
 
@@ -122,7 +142,9 @@ class ScanPanel(QFrame):
     # ── configuration ─────────────────────────────────────────────────────
 
     def params(self) -> ScanParams:
-        return ScanParams(volume=ScanVolume(height_mm=self.height_mm.value(),
+        lo, hi = sorted((self.reach_lo.value(), self.reach_hi.value()))
+        return ScanParams(range_mm=(lo, hi),
+                          volume=ScanVolume(height_mm=self.height_mm.value(),
                                             radius_mm=self.radius_mm.value(),
                                             floor_mm=self.floor_mm.value()))
 
@@ -149,7 +171,10 @@ class ScanPanel(QFrame):
         if st is None:
             self.stats.setText("idle")
             return
-        lines = [f"cloud   {st.n_points} points · {st.pairs} pairs"]
+        rate = (f" of {st.offered_left} left frames ({100 * st.pairs / st.offered_left:.0f}%)"
+                if st.offered_left else "")
+        lines = [f"cloud   {st.n_points} points · {st.pairs} pairs{rate}"
+                 + (f" · still ×{st.batched}" if st.batched else "")]
         if st.bounds is not None:
             lo, hi = st.bounds
             lines.append(f"extent  x {lo[0]:+.0f}..{hi[0]:+.0f}  "
@@ -162,8 +187,18 @@ class ScanPanel(QFrame):
         elif f is not None:
             lines.append(f"frame   {f.n_kept}/{f.n_scanlines} scanlines kept")
             lines.append(f"pixels  {f.n_confirmed}/{f.n_pixels} confirmed by the right eye")
-            lines.append(f"unconfirmed {f.n_rejected_unconfirmed} · "
-                         f"outside {f.n_rejected_volume}")
+            if f.veto_px == f.veto_px:            # not NaN
+                lines.append(f"veto    the eyes disagree by {f.veto_px:+.1f} px "
+                             f"about where the stripe is")
+            lines.append(f"dropped unconfirmed {f.n_rejected_unconfirmed} · blob "
+                         f"{f.n_rejected_blob} · reach {f.n_rejected_range} · "
+                         f"jump {f.n_rejected_jump} · outside {f.n_rejected_volume}"
+                         + (f" · split {f.n_split}" if f.n_split else ""))
+            if f.rs_note:
+                lines.append(f"rolling — {f.rs_note}")
+            else:
+                lines.append(f"rolling ≤ {f.rs_max_mm:.2f} mm corrected · board "
+                             f"{f.speed_mm_s:.0f} mm/s {f.spin_deg_s:.0f}°/s")
         self.stats.setText("\n".join(lines))
 
     # ── actions ───────────────────────────────────────────────────────────

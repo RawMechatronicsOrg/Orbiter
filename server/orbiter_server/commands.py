@@ -174,7 +174,40 @@ _EYE_COERCE: dict[str, Callable[[Any], Any]] = {
     "flip_h": lambda v: bool(v),
     "flip_v": lambda v: bool(v),
     "intrinsics": lambda v: _coerce_intrinsics(v),
+    "readout": lambda v: _coerce_readout(v),
 }
+
+
+def _coerce_readout(v: Any) -> dict[str, Any] | None:
+    """One eye's rolling-shutter readout time, or None to clear it.
+
+    `seconds` is the time the sensor takes to read one whole frame, signed:
+    positive when row 0 is read first. It belongs to one sensor mode, so
+    `width`/`height` travel with it like they do on the intrinsics. The
+    native app measures it from the board in motion and uses it to take
+    every scanned point into the board's frame at its own row's instant.
+    """
+    if v is None:
+        return None
+    if not isinstance(v, dict):
+        raise CommandError("readout must be an object or null")
+    try:
+        out: dict[str, Any] = {
+            "seconds": float(v["seconds"]),
+            "width": int(v["width"]), "height": int(v["height"]),
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CommandError(f"readout needs seconds, width, height: {exc}") from exc
+    if not (0.0 < abs(out["seconds"]) < 0.1):
+        raise CommandError("readout: seconds must be a non-zero frame readout time")
+    if out["width"] <= 0 or out["height"] <= 0:
+        raise CommandError("readout: width and height must be positive")
+    for key in ("sigma_s", "skew_px", "rms_px"):
+        if key in v and v[key] is not None:
+            out[key] = float(v[key])
+    if "views" in v and v["views"] is not None:
+        out["views"] = int(v["views"])
+    return out
 
 
 def _coerce_intrinsics(v: Any) -> dict[str, Any] | None:
@@ -209,7 +242,8 @@ def _coerce_intrinsics(v: Any) -> dict[str, Any] | None:
         raise CommandError("intrinsics fx/fy must be positive")
     # Provenance — how good the solve was and how many views it used. Carried
     # so a later reader can judge the numbers instead of trusting them blindly.
-    for key, cast in (("rms_px", float), ("views", int), ("solved_at", str)):
+    for key, cast in (("rms_px", float), ("views", int), ("solved_at", str),
+                      ("sigma_f", float)):
         if key in v and v[key] is not None:
             try:
                 out[key] = cast(v[key])
@@ -318,9 +352,10 @@ async def _cmd_set_stereo_rig(args: dict[str, Any]) -> dict[str, Any]:
     Payload (all optional — only keys present are applied):
       `host`, `token`, `baseline_mm`, `extrinsics`, `laser_plane`,
       `left` / `right`: `{camera_id, quarter_turns_cw, flip_h, flip_v,
-      intrinsics}`, where `intrinsics` is `{fx, fy, cx, cy, dist, width,
-      height}` (plus optional `rms_px`, `views`, `solved_at`) or null to
-      clear.
+      intrinsics, readout}`, where `intrinsics` is `{fx, fy, cx, cy, dist,
+      width, height}` (plus optional `rms_px`, `views`, `solved_at`) or null
+      to clear, and `readout` is `{seconds, width, height}` (plus optional
+      `sigma_s`, `skew_px`, `rms_px`, `views`) or null to clear.
 
     Which upstream camera is the left eye cannot be derived: camserver's ids
     follow /dev/videoN enumeration and say nothing about physical placement.

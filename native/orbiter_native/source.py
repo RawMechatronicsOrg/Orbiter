@@ -12,6 +12,11 @@ stripe is only separable in colour — see `laser.redness`. Measured at 720p on
 this machine: colour decode 2.23 ms plus 0.20 ms for the BGR→GRAY conversion,
 against 1.36 ms for a grayscale-only decode. About 1 ms per frame per camera
 buys the only channel in which the stripe exists.
+
+With `gpu=True` the JPEG is decoded by nvJPEG instead (`gpu.decode`), the
+frame stays on the GPU for the stripe score, `gray` and a half-size `display`
+are downloaded from it, and the full `bgr` only while `full_bgr` asks for it.
+Same `Frame` either way.
 """
 
 from __future__ import annotations
@@ -23,6 +28,8 @@ from dataclasses import dataclass
 import cv2
 import httpx
 import numpy as np
+
+from . import gpu
 
 log = logging.getLogger("orbiter_native.source")
 
@@ -44,10 +51,18 @@ _READ_TIMEOUT_S = 10.0
 class Frame:
     """One decoded frame plus what is needed to time it."""
 
-    #: Colour, as decoded. The laser needs it; the board does not.
-    bgr: np.ndarray
-    #: Luminance view, derived from `bgr` — what ChArUco detection consumes.
+    #: Colour, as decoded, full size — what the calibration-mode line fit
+    #: and the CPU stripe detector read. None on the GPU path when neither
+    #: wants it: the stripe is scored on `rgb_gpu` and the view is served
+    #: by `display`.
+    bgr: np.ndarray | None
+    #: Luminance view, full size — what ChArUco detection consumes.
     gray: np.ndarray
+    #: BGR for the view: the full frame, or on the GPU path a half-size
+    #: average of it. Geometry is never measured on this.
+    display: np.ndarray
+    #: The frame's true size (width, height), whatever `display` is.
+    wh: tuple[int, int]
     #: camserver's capture instant on ITS monotonic clock. Not comparable to
     #: our clock directly — see `MjpegReader.age_ms` for why this app reports
     #: arrival intervals rather than pretending to know the clock offset.
@@ -57,6 +72,10 @@ class Frame:
     server_age_ms: float | None
     #: Our monotonic clock at the moment the frame finished arriving.
     recv_mono: float
+    #: The decoded frame on the GPU — a (3, H, W) RGB uint8 torch tensor —
+    #: when the reader decodes there; `bgr` and `gray` are then its copies.
+    #: None on the OpenCV path.
+    rgb_gpu: object | None = None
 
 
 def _parse_headers(blob: bytes) -> dict[str, str]:
@@ -75,8 +94,12 @@ class MjpegReader:
     free of Qt means it can be exercised from a plain script.
     """
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, gpu: bool = False) -> None:
         self.url = url
+        self._gpu = gpu
+        #: On the GPU path, download the full BGR too. The worker sets it
+        #: while the calibration-mode line fit needs the pixels on the CPU.
+        self.full_bgr = True
         self._stop = False
 
     def stop(self) -> None:
@@ -119,7 +142,9 @@ class MjpegReader:
                     if start:
                         del buf[:start]
                     break
-                payload = bytes(buf[body:body + length])
+                # A bytearray slice is already a copy, and writable — which
+                # `torch.frombuffer` insists on for the GPU decode.
+                payload = buf[body:body + length]
                 del buf[:body + length]
                 frame = self._decode(payload, hdr)
                 if frame is not None:
@@ -129,13 +154,22 @@ class MjpegReader:
                             len(buf))
                 buf.clear()
 
-    @staticmethod
-    def _decode(payload: bytes, hdr: dict[str, str]) -> Frame | None:
-        bgr = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_COLOR)
-        if bgr is None:
-            # A torn frame. Skip it; the next one is ~33 ms away and a dropped
-            # frame is far better than propagating garbage into the detectors.
-            return None
+    def _decode(self, payload: bytearray, hdr: dict[str, str]) -> Frame | None:
+        rgb_gpu = None
+        if self._gpu:
+            rgb_gpu = gpu.decode(payload)
+            if rgb_gpu is None:
+                return None
+            bgr, gray, display = gpu.to_cpu(rgb_gpu, full=self.full_bgr)
+        else:
+            bgr = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_COLOR)
+            if bgr is None:
+                # A torn frame. Skip it; the next one is ~33 ms away and a
+                # dropped frame is far better than propagating garbage into
+                # the detectors.
+                return None
+            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            display = bgr
 
         def num(key: str) -> float | None:
             try:
@@ -145,9 +179,12 @@ class MjpegReader:
 
         return Frame(
             bgr=bgr,
-            gray=cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY),
+            gray=gray,
+            display=display,
+            wh=(gray.shape[1], gray.shape[0]),
             capture_mono=num("x-capture-monotonic"),
             seq=hdr.get("x-frame-seq"),
             server_age_ms=num("x-age-ms"),
             recv_mono=time.monotonic(),
+            rgb_gpu=rgb_gpu,
         )

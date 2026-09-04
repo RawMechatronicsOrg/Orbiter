@@ -32,6 +32,19 @@ python -m venv native/.venv
 native/.venv/Scripts/pip install -e ./server -e ./native
 ```
 
+For the GPU path — nvJPEG decode and the stripe score in torch, see
+`orbiter_native/gpu.py` — add the `gpu` extra. CUDA builds of torch live on
+PyTorch's own index, not PyPI:
+
+```bash
+native/.venv/Scripts/pip install -e "./native[gpu]" --extra-index-url https://download.pytorch.org/whl/cu128
+```
+
+Without it, or without a CUDA device, the app runs the OpenCV path. The startup
+log says which (`frames: GPU: …` or `frames: CPU (OpenCV): …`), the eye overlay
+shows `gpu` on its first line, and `--no-gpu` forces the CPU path for a
+comparison.
+
 ## Run
 
 ```bash
@@ -39,7 +52,11 @@ native/.venv/Scripts/orbiter-native
 ```
 
 `--server URL` points at a non-default Orbiter server (default
-`http://localhost:8000`); `-v` turns on debug logging.
+`http://localhost:8000`); `-v` turns on debug logging. `--cv-threads N` caps
+OpenCV's worker pool for the whole process (default 2): the eyes and the scan
+already run on threads of their own, and OpenCV's default of one worker per
+logical core on top of that burns cores for no extra frames — the numbers are
+under *Measured on this machine*.
 
 ## Design notes
 
@@ -67,16 +84,95 @@ pair — and fell further behind the cameras the longer it ran.
 `ui/src/viewer/StereoView.tsx::eyeTransform`. If the three drift, the operator
 aligns the rig against a preview the solver never sees.
 
-**Detection runs on original pixels, display is oriented afterwards.**
+**Detection runs on original pixels; the view orients, and the view draws.**
 Detecting on the oriented image would report corner coordinates in a frame that
-depends on a UI setting — useless to any calibration consumer.
+depends on a UI setting — useless to any calibration consumer. So the worker
+publishes the frame as decoded plus what it found, all in original pixels, and
+`glview.FrameView` does the rest on the GPU: the frame goes up as a texture and
+is drawn on a quad whose texture coordinates carry the orientation, the stripe
+pixels and the laser fit's points are GL points straight from the worker's
+arrays, and the cloud is GL points whose vertex shader does the whole
+projection — the eye's own board pose, the pinhole, OpenCV's Brown distortion,
+the orientation and the letterbox — from a buffer uploaded once per snapshot.
+Corners, their IDs, the fitted line and the board hull go through QPainter on
+top. Before this each detector thread oriented a copy of its 6 MB frame, wrote
+the overlays into it and, while scanning, projected 40k points with
+`cv2.projectPoints` — 7 ms per eye per frame — before the GUI thread copied the
+result again; now no oriented frame exists anywhere. The orientation is one
+3×3 matrix derived from `orient.map_points`, the function the flip-then-rotate
+contract's tests pin, so the GL view and the CPU mapping cannot disagree;
+`test_glview.py` renders a frame through the widget and checks the frame, a
+stripe pixel and a distorted cloud point against `map_points` and
+`cv2.projectPoints`.
 
 **ChArUco detection is imported, not reimplemented.** `calibration.detect_board`
 and `estimate_board_pose_disambiguated` already carry the flat-board planar-PnP
 ambiguity handling; a second copy here would eventually disagree with the one
 the calibration actually uses, invisibly.
 
+**The board is tracked between detections.** A full ChArUco pass costs 34 ms
+per eye at 1080p with the board in view, single-threaded — more than a frame,
+twice over. At 30 fps the board barely moves between frames, so
+`detect.BoardDetector` finds the corners once and then follows them: pyramidal
+KLT on a crop around the last corners, `cornerSubPix` on the new frame so each
+corner is re-found on its actual saddle, a RANSAC homography from the board
+plane that every corner must fit, and a few of the board's markers read through
+that homography, which must decode to the IDs the board puts there. The last
+check is what makes the track trustworthy: a checkerboard shifted by a whole
+square lands saddles on saddles and the homography still fits — only the
+markers can tell, and on a uniform frame KLT even reports corners that never
+moved. A full pass still runs every tenth frame, to refresh the IDs and pick up
+corners that came into view; the overlay says `tracked` or `detected` per
+frame. Tracked corners against a fresh detection of the same frame: 0.15 px
+median, 0.66 px worst — two sub-pixel refiners disagreeing, not drift.
+
+**Decode and the stripe score run on the GPU when there is one.** Per eye at
+1080p on the CPU, single-threaded, the JPEG decode costs 5.8 ms and the
+whole-frame stripe score 14.9 ms — once the board was tracked, most of what the
+detector threads still did. `gpu.py` decodes with nvJPEG through torchvision
+and scores the stripe with a torch port of `laser.stripe_score` on the frame
+that is already there; only the lit pixels come back. ChArUco needs the CPU,
+so the luminance view is downloaded, and the display still draws into a CPU
+copy of the frame. The wait for the GPU is a sleep, not a spin
+(`cudaDeviceScheduleBlockingSync`, set before the context exists), which is
+what makes the CPU figures below real: with the default spin the same work
+read as twice the CPU. nvJPEG upsamples chroma differently from libjpeg-turbo,
+so the two paths' frames differ by a level or two along colour edges — fine
+for both detectors, not bit-identical, and `test_gpu.py` pins how far apart
+they may be. MJPEG through nvJPEG rather than the cameras' H.264 through
+NVDEC on purpose: each JPEG stands alone, so camserver's per-frame capture
+clock still times it, a torn frame costs one frame, and a thin red line is
+not smeared by inter-frame prediction.
+
+**The rolling shutter is paid for per point, not per pixel.** These sensors
+read row by row, so the stripe at the bottom of a frame was seen a readout
+later than the corners that gave the board's pose; while the board turns, a
+point taken into the board's frame through that pose lands where the board
+*was* — 0.4-1 mm at a hand's 20-50 mm/s and a ~20 ms readout, the scan's own
+noise level; with the rig in the hand, more. The laser plane is rigid to the
+camera, so a stripe pixel's 3-D position is exact for its own instant; only
+the camera→board transform is at the wrong time. The pose track is a metric
+6-DoF motion estimate at 30 Hz: the twist between two consecutive left poses
+slides the pose to any instant, and `scan_frame` takes every point into the
+board's frame through the pose at its own row's instant (`rolling.py`).
+Nothing is warped or resampled. The SCAN panel reports the largest shift it
+made and the board's speed, or why it could not (no readout figure, no
+previous pose within 200 ms).
+
+The readout time itself is measured from the board in motion — the
+calibration flow banks every frame of brisk motion, with intrinsics known,
+and the solve fits a pose per frame together with one readout time, each
+frame's velocity coming from its neighbours in the same burst of motion over
+camserver's capture clock and every corner projected through
+the pose slid to its own row. On synthetic frames with 0.2 px corner noise it
+recovers 21.3 ms as 21.4 ± 0.04 with the sign right, and refuses a board that
+barely moved (the corners must move ≥ 3 px over one readout). The figure is
+stored per eye with its frame size (`stereo_rig.<eye>.readout`), like the
+intrinsics, and refused at another size; the two eyes cross-check each other.
+
 ## Known limits
+
+What is planned, and why in that order, lives in [BACKLOG.md](BACKLOG.md).
 
 **Board pose needs a calibration first.** `model.camera_fx/fy/cx/cy` and
 `camera_distortion` were solved for the *phone* on the `camera_url` path — a
@@ -104,7 +200,8 @@ The stripe is found in **colour, not luminance**, and only **inside the board**.
 
 Colour because the board is black and white and the laser is red. On a frame
 from this rig there are 68142 board pixels brighter than gray 170 — the white
-squares — and exactly 31 of them survive a redness threshold of 50. A
+squares — and exactly 31 of them survive a redness threshold of 50 (the
+detector's own `redness_min` is 45). A
 brightness threshold does not find the stripe on this board; it finds the white
 squares. `redness = r - max(g, b)` has an on-board median of 0 against a stripe
 peaking near 110.
@@ -133,16 +230,58 @@ Which needs intrinsics — see the known limits above.
 
 ## Calibration
 
-Move the board around in front of the pair with **auto-capture** on. Views are
-kept only when they show the solve something new — a different place in the
-frame, a different distance, or a different tilt — and only when the board is
-still, because motion blur rounds corners off and biases the solve.
+One switch — **calibrate continuously**, on by default — and the board does
+the rest. Move it about in front of the pair: hold it still in new places, at
+new distances and tilts; bring the laser across it and hold; twist and tilt it
+briskly now and then. `calibflow.CalibrationFlow` decides what each frame is
+good for and solves in the background as the sets grow:
 
-They are captured in **pairs**, matched on camserver's capture clock (both
-cameras are timed by that same clock, so it is what makes two frames
-simultaneous; arrival times through two sockets are not comparable). Intrinsics
-do not need the pairing. `stereoCalibrate` does, and sweeping the board twice
-would be a waste of your time.
+  * a **still** board showing the solve something new — a different place in
+    the frame, a different distance or tilt — is a view (per-eye intrinsics),
+    and both eyes seeing it at the same instant makes it a pair (the stereo
+    geometry). Still, because motion blur rounds corners off and biases the
+    solve; new, because twenty near-duplicates are worth less than six
+    different views. Pairs are matched on camserver's capture clock — the one
+    clock that times both cameras; arrival times through two sockets are not
+    comparable;
+  * a still board with the stripe straight across it and a pose is a
+    laser-plane frame;
+  * a board moving **briskly** (4 px per frame and more) is a readout frame:
+    the rolling shutter's time is measured from exactly the motion that ruins
+    a view.
+
+Every set keeps what was observed — corners, IDs, stripe pixels, capture
+instants — never what was derived from it. Each cycle (no sooner than 4 s
+after the last, and only when a set grew) solves the intrinsics from all
+views, then the pair, the laser plane and the readout from *their* raw sets
+through the intrinsics just solved: the plane's points and the readout's
+poses are recomputed, not accumulated, so they improve with the camera matrix
+that places them. A result replaces what the server holds only when it is
+better — more data at a residual no more than 15% worse, or a lower residual
+— and then goes up on its own (**save improvements to the server**, on by
+default); a bad early solve is never written over a good stored one. **Save
+now** sends every current solve regardless, **Solve now** starts a cycle
+without waiting, **Capture** takes a view still or not.
+
+The panel's scoreboard shows each solve with its residual, its data and
+whether the server has it; the yellow line under it names the weakest link
+and what to do with the board about it — tilt more for one eye, reach the
+frame's corners, hold still where both eyes see it, bring the laser across,
+twist briskly. Do that, and it moves on to the next.
+
+Above everything, large, is the number the calibration is for: the
+**expected one-sigma error of a scanned point**, in mm, at the distance the
+board is now (`calibflow.ErrorBudget`). The scan places a stripe centroid on
+the laser sheet, so the terms are the centroid's pixel noise carried through
+the sheet's geometry — dZ/dpx = Z²/(f·d) for a sheet `d` from the camera
+containing the optical axis, 2.4 mm per pixel at half a metre on this rig —
+the sheet's own fit residual, the focal length's uncertainty (from the
+solve's covariance, `calibrateCameraExtended`) over the scan volume, and the
+rolling shutter while it is unmeasured; they add in quadrature. The stripe's
+noise is read live off the calibration-mode line fits and the distance off
+the board's pose; what has not been measured is assumed and the panel says
+so. Green under 0.5 mm, amber under 1.5, red above. Keep calibrating and
+watch it fall — that is the whole loop.
 
 ### Why the panel nags about tilt
 
@@ -174,9 +313,8 @@ set it absorbs error and destabilises the focal length. Tangential terms stay
 free because these are inexpensive sensors where a tilted element is real — the
 server's phone-lens solve fixes them, but that was a different lens.
 
-**Save to server** stores the result through `POST /command/set_stereo_rig`,
-the same command the web tab uses, so the server remains the one owner of this
-state.
+Results reach the server through `POST /command/set_stereo_rig`, the same
+command the web tab uses, so the server remains the one owner of this state.
 
 ## Scanning
 
@@ -224,10 +362,105 @@ board. Points below a 5 mm floor are the stripe on the board itself.
 The board must be visible for scanning to work: it is what defines where the
 volume is.
 
+**Four gates between the veto and the cloud** — learned from a live scan that
+produced points rarely and noisily at once. One blob per scanline: a
+scanline's confirmed pixels can form several runs, the stripe and a glint the
+right eye confirmed too, and averaging them gives a point that is neither, so
+the strongest run is taken and the rest ignored. That run's width, 2-24 px:
+a lone pixel is noise and a smear is a reflection. The **reach**: a point must
+lie 150-450 mm from the line through the two camera centres (SCAN panel,
+*reach from / to*) — the scanner's working range, which drops the rig's own
+hardware and the wall without recognising either and holds without a board
+pose. And no jumps: a point 5 mm off both its neighbours along the stripe
+while they agree with each other is not on their surface; a real depth step
+keeps one neighbour close and is untouched. The panel counts each.
+
+**Where the stripe crosses a scanline** is found to a fraction of a pixel by
+a Gaussian fit of the run's score profile (`laser.stripe_centroids`), not by
+the intensity-weighted centroid of the pixels above the threshold: the
+threshold cuts the profile's tails and the centroid of what is left leans to
+the brighter flank. Where the fit has too little to go on — fewer than three
+samples, a saturated flat top — the centroid of the scores *above* the run's
+floor stands in. Measured on synthetic profiles with 4 levels of noise: the
+raw centroid 0.05-0.14 px RMS, the fit 0.016-0.058. That term is the
+largest in the error budget, 2.4 mm per pixel at half a metre. The
+calibration-mode line fit shares the estimator, so the sheet is calibrated
+with the same centroids the scan runs on. `ScanParams.centroid_fit` turns it
+off for a comparison.
+
+**The stripe is searched only where the sheet can be.** The sheet and the
+reach are both fixed in the cameras' frame, so the rows a stripe can occupy
+are fixed too: `scan.stripe_rows` samples rays through a grid of pixels,
+meets the sheet, and keeps the rows whose points fall inside the reach
+(widened 15%) — on this rig cy + f·d/450 to cy + f·d/150 for 150-450 mm.
+Both detectors take the window, in either eye (the sheet and the baseline
+carried into the right camera through the extrinsics); the scan worker
+derives it from the calibration and the reach, the window pushes it to the
+workers. Glints elsewhere never reach the veto, and the score runs on a
+fraction of the frame.
+
+**While the board holds still, frames are averaged.** The scan worker keeps
+consecutive pairs whose left pose is within 0.5 mm and 0.1° of the batch's
+first, up to five, and adds their points averaged per scanline with the
+lowest and highest dropped once a scanline has four or more of them (a glint
+that passed every gate in one frame is the extreme, not a fifth of the
+answer) — a scanline seen in fewer than half the frames is a flicker and is
+dropped, and a batch ends where the stripe's axis flips. Noise falls by about the root
+of the batch; motion flushes it at once. The SCAN
+panel shows `still ×N` while a batch is held.
+
+**The cloud is a voxel grid.** `PointCloud` merges points on 0.5 mm voxels,
+each holding the running mean of what fell in it: a surface swept ten times
+is one point, ten times less noisy, the cloud stops growing with the number
+of passes, and the export is one point per voxel. Half a millimetre is well
+under the point noise, so nothing real is lost.
+
+**While scanning, the right eye does not run ChArUco.** Its board pose is
+only ever drawn, and the window draws it from the left's through the
+extrinsics (`stereo.compose_right_pose`) — 5 ms per frame back, and one
+source of the two overlays disagreeing gone. And no eye scores the stripe
+without a pose to place it through: the left skips a frame with no board, the
+right skips while the scan worker reports the left has had no pose for half a
+second (`worker.stripe_wanted`).
+
+**The view gets a half-size frame on the GPU path.** The eyes are shown at
+about a third of their size, so the reader downloads a 2×2-averaged copy for
+display (1.5 MB instead of 6) and keeps only the luminance at full size for
+the tracker; the full colour frame is downloaded only while the
+calibration-mode line fit needs it on the CPU. The frame's true size travels
+with it, so the geometry maps in full-frame pixels whatever the texture is.
+
+Both cameras run with `power_line_frequency` at 50 Hz: at the default of
+off, mains flicker under the room's lighting bands the rows of a rolling
+shutter. Set through camserver's control API; it persists on the cameras.
+
+Pairs are matched within 20 ms of camserver's capture clock. It was 10, and
+found partners for 26 of 58 left frames — because the left camera ran at
+20 fps under auto-exposure while the right ran at 30, so every other left
+frame had its nearest right frame 16.7 ms away. The panel now shows the
+pairing rate; a rate well under 100% with both cameras at 30 fps means the
+detector threads are dropping frames, not the cameras.
+
 While scanning, the cloud so far is drawn over both eyes in orange, each eye
 projecting it through its own board pose — so the two overlays disagreeing is
 itself a sign that the board poses do. The overlay is decimated to about 40k
 points; the export (**Export PLY**, binary little-endian) carries everything.
+
+## The cloud
+
+The third panel in the side column turns the cloud over in 3-D: the live scan
+(the same decimated snapshot the eyes draw) or, with **Open PLY**, any cloud
+from disk — a million points is a 12 MB buffer drawn in a millisecond. Drag
+to orbit, wheel to zoom, right-drag to pan, double-click to fit. Points are
+drawn the way the web viewer drew them and better: size-attenuated, so a
+point's size on screen falls with its distance from the eye — what makes a
+cloud read as a volume rather than a flat speckle — and round with a soft
+edge, shaded by height above the board; a PLY that carries colour is drawn
+in it. The board's disc and axes give the cloud a floor and an up. Two
+things a desktop GL context wants that a web one does not: `#version 120`
+for `gl_PointCoord`, and `GL_POINT_SPRITE` enabled — without either every
+fragment reads (0, 0), falls outside the circle and is discarded, with a
+clean shader log. `test_cloudview.py` renders and reads back.
 
 ## Measured on this machine
 
@@ -257,6 +490,84 @@ the only channel the stripe exists in. Redness is computed inside the board's
 bounding box, not the whole frame.
 
 Both eyes running together: ~29 fps of detection each against a 30 fps stream.
+
+The board's corners at 1080p with the board in view (49 corners), one OpenCV
+thread, per eye:
+
+```
+full ChArUco pass, every frame      34.2 ms avg
+tracked, full pass every 10th        4.7 ms avg   (34.5 ms on the refresh frame)
+whole eye pass, decode to draw      56.2 ms  →  26.2 ms
+```
+
+Both eyes tracking, per pair, against `--cv-threads`:
+
+```
+threads   pairs/s   cores busy
+   1        35.9       1.9
+   2        40.6       2.4      (default)
+   4        44.8       3.0
+  16        41.5       5.6      (OpenCV's default: one per logical core)
+```
+
+Before tracking, at OpenCV's default thread count, the pair cost 4.3 cores for
+30 pairs/s with no board in view at all.
+
+Decode and the stripe score per eye, 1080p, board in view, one OpenCV thread:
+
+```
+                         CPU (OpenCV)     GPU (nvJPEG + torch)
+decode                     5.8 ms          3.0 ms   (with the downloads)
+stripe score + pixels     14.9 ms          2.3 ms
+whole eye pass            28.0 ms         12.1 ms wall, 8.6 ms CPU
+```
+
+Both eyes, per pair, the board tracked on both paths:
+
+```
+                    pairs/s   core-ms/pair   cores busy
+CPU, 2 threads        37          63            2.3
+GPU, 1 thread         65          16            1.0
+GPU, 2 threads        72          22            1.6
+```
+
+The cameras deliver 30 pairs/s, so what matters is core-ms per pair: at that
+rate the GPU path costs about half a core for both eyes, against 4.3 cores
+before tracking and the GPU.
+
+One paint of the GL view at 1080p, on the GUI thread, a new frame each time:
+
+```
+frame (texture upload)                       1.7 ms
++ 6k stripe pixels + 49 corners with IDs     2.3 ms
++ a 40k-point cloud                          2.3 ms   (uploaded once, projected on the GPU)
+```
+
+What left the detector threads with it: the oriented copy (1.5 ms), the
+drawing, and the cloud projection (7 ms per eye per frame while scanning).
+
+## Checking the rig
+
+```bash
+native/.venv/Scripts/orbiter-rigcheck
+```
+
+Measures what a scan depends on and says what is in the way, in the order the
+gates apply: exposure mode and flicker setting per eye, the frame rate each is
+really running at, how often the two eyes land close enough in the capture
+clock to pair, what calibration the server holds and how much data each piece
+rests on, where the sheet says the stripe can be against where it is, and —
+the one that decides whether a scan can confirm anything at all — how far the
+right eye's stripe sits from where the left eye's candidates project into its
+frame.
+
+That last number is the point of the tool. Every one of these failures reads
+identically from the SCAN panel: no points. A calibration whose pieces
+describe different cameras puts the stripe tens of pixels from where the other
+eye sees it, and nothing is ever confirmed, while the counts look exactly as
+they would with the laser switched off. `orbiter-rigcheck` exits non-zero when
+it finds something that stops a scan, so it is worth running after a
+calibration sweep and not only when something already looks wrong.
 
 ## Tests
 

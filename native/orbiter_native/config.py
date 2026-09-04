@@ -45,6 +45,10 @@ class Eye:
     #: Kept raw because whether it is USABLE depends on the live frame size,
     #: which config parsing does not know — see `intrinsics_for`.
     intrinsics_raw: dict[str, Any] | None = None
+    #: The sensor's rolling-shutter readout time as stored, or None until
+    #: measured. Raw for the same reason: it belongs to one frame size —
+    #: see `rolling.Readout.from_config`.
+    readout_raw: dict[str, Any] | None = None
 
     @property
     def configured(self) -> bool:
@@ -101,11 +105,13 @@ class RigConfig:
 def _eye_from(side: str, rig: dict[str, Any]) -> Eye:
     raw = rig.get(side) or {}
     k = raw.get("intrinsics")
+    r = raw.get("readout")
     return Eye(
         side=side,
         camera_id=str(raw.get("camera_id") or ""),
         orientation=Orientation.from_eye(raw),
         intrinsics_raw=k if isinstance(k, dict) else None,
+        readout_raw=r if isinstance(r, dict) else None,
     )
 
 

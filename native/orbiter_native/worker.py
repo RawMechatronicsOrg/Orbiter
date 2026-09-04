@@ -31,9 +31,10 @@ import httpx
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 
+from . import gpu
 from .config import Eye, RigConfig
 from .cvcore import BoardSpec
-from .detect import BoardDetector, BoardHit, draw_board
+from .detect import BoardDetector, BoardHit
 from .intrinsics import ViewDescriptor, describe
 from .laser import (
     LaserLine,
@@ -43,9 +44,7 @@ from .laser import (
     find_laser_line,
     find_stripe_pixels,
 )
-from .laser import draw as draw_laser
-from .orient import Orientation, apply as orient_apply, map_points
-from .scan import CloudOverlay
+from .orient import Orientation
 from .source import Frame, MjpegReader
 
 log = logging.getLogger("orbiter_native.worker")
@@ -69,6 +68,9 @@ class EyeStats:
     laser_ms: float = 0.0
     corners: int = 0
     coverage: float = 0.0
+    #: The corners were followed from the previous frame, not found by a
+    #: full ChArUco pass — see `detect.TrackParams`.
+    tracked: bool = False
     #: Laser fit, when the frame produced a usable one.
     laser_inliers: int = 0
     laser_points: int = 0
@@ -77,6 +79,8 @@ class EyeStats:
     laser_reason: str | None = None
     #: Stripe points found in scan mode.
     stripe_points: int = 0
+    #: Decoded and scored on the GPU (`gpu.py`) rather than by OpenCV.
+    gpu: bool = False
     #: Server-side age of the last frame at send time, from `X-Age-Ms`.
     server_age_ms: float | None = None
     frames: int = 0
@@ -120,9 +124,19 @@ class EyeResult:
     """One detection pass, ready for the GUI thread."""
 
     side: str
-    #: Oriented BGR frame with overlays already drawn.
+    #: The frame for the view — unoriented, nothing drawn on it, shared with
+    #: the reader rather than copied, and possibly half size on the GPU path
+    #: (`wh` is the true size). The view orients it and draws the geometry
+    #: below over it; nothing may write into it.
     bgr: np.ndarray
     stats: EyeStats
+    orientation: Orientation = Orientation()
+    #: This eye's intrinsics at this frame size, when it has them: what
+    #: projects the cloud into the view. None until the pair is calibrated.
+    intrinsics: object | None = None
+    #: Hull of the detected corners the calibration-mode laser search was
+    #: confined to, (N, 1, 2) int, or None.
+    hull: np.ndarray | None = None
     board: BoardHit | None = None
     laser: LaserLine | None = None
     #: Every stripe pixel with its score — what scanning consumes. Empty
@@ -149,9 +163,10 @@ class EyeWorker(QObject):
     #: history plug in.
     status = Signal(str, object)   # side, error-or-None
 
-    def __init__(self, side: str) -> None:
+    def __init__(self, side: str, gpu: bool = False) -> None:
         super().__init__()
         self.side = side
+        self._gpu = gpu
         self._latest = Latest()
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
@@ -168,7 +183,14 @@ class EyeWorker(QObject):
         self._laser_on = False
         self._scan_mode = False
         self._laser_params = LaserParams()
-        self._overlay: CloudOverlay | None = None
+        #: Rows the sheet can appear in while scanning (`scan.stripe_rows`),
+        #: or None for the whole frame. Pushed by the window from the scan
+        #: worker, which owns the geometry it follows from.
+        self._stripe_rows: tuple[int, int] | None = None
+        #: Whether the scan can use a stripe from this eye right now: the
+        #: scan worker answers for the right eye (it knows whether the left
+        #: has had a pose lately). None means always.
+        self._scan_gate: Callable[[], bool] | None = None
         self._sinks: list[Callable[[EyeResult], None]] = []
 
         self._recv_times: deque[float] = deque(maxlen=_WINDOW)
@@ -197,6 +219,7 @@ class EyeWorker(QObject):
             self._laser_on = enabled
             if params is not None:
                 self._laser_params = params
+        self._push_full_bgr()
 
     def set_scan_mode(self, on: bool) -> None:
         """Switch the stripe detector between its two genuinely different jobs.
@@ -211,11 +234,26 @@ class EyeWorker(QObject):
         """
         with self._cfg_lock:
             self._scan_mode = on
+        self._push_full_bgr()
 
-    def set_overlay(self, overlay: CloudOverlay | None) -> None:
-        """The scanned cloud to draw over this eye's frames while scanning."""
+    def _needs_full_bgr(self) -> bool:
+        """Only the calibration-mode line fit reads the full colour frame on
+        the CPU; scanning scores the stripe on the GPU frame."""
         with self._cfg_lock:
-            self._overlay = overlay
+            return self._laser_on and not self._scan_mode
+
+    def _push_full_bgr(self) -> None:
+        reader = self._reader
+        if reader is not None:
+            reader.full_bgr = self._needs_full_bgr()
+
+    def set_stripe_rows(self, rows: tuple[int, int] | None) -> None:
+        with self._cfg_lock:
+            self._stripe_rows = rows
+
+    def set_scan_gate(self, gate: Callable[[], bool] | None) -> None:
+        with self._cfg_lock:
+            self._scan_gate = gate
 
     def add_sink(self, sink: Callable[[EyeResult], None]) -> None:
         """Called from the detector thread with every result. Must be quick and
@@ -226,7 +264,7 @@ class EyeWorker(QObject):
         with self._cfg_lock:
             return (self._url, self._orientation, self._board_spec,
                     self._eye, self._laser_on, self._laser_params,
-                    self._scan_mode, self._overlay)
+                    self._scan_mode, self._stripe_rows, self._scan_gate)
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
@@ -263,7 +301,8 @@ class EyeWorker(QObject):
                 self._set_error("no camera assigned to this eye")
                 time.sleep(0.5)
                 continue
-            self._reader = MjpegReader(url)
+            self._reader = MjpegReader(url, gpu=self._gpu)
+            self._reader.full_bgr = self._needs_full_bgr()
             try:
                 for frame in self._reader.frames():
                     if self._stop.is_set():
@@ -309,14 +348,21 @@ class EyeWorker(QObject):
 
     def _detect_one(self, detector: BoardDetector, frame: Frame) -> None:
         (_, orientation, spec, eye, laser_on, laser_params,
-         scan_mode, overlay) = self._snapshot()
+         scan_mode, stripe_rows, scan_gate) = self._snapshot()
         detector.set_spec(spec)
 
         h, w = frame.gray.shape
         # Resolved against THIS frame's size: intrinsics solved at another
         # resolution are refused rather than silently misapplied.
         intrinsics = eye.intrinsics_for((w, h)) if eye else None
-        board = detector.detect(frame.gray, intrinsics) if detector.ready else BoardHit()
+        # While scanning, the right eye's board pose is only ever drawn — and
+        # the window draws it from the left's through the extrinsics — so
+        # the right eye skips ChArUco and spends its frame on the stripe.
+        if detector.ready and board_wanted(self.side, scan_mode):
+            board = detector.detect(frame.gray, intrinsics)
+        else:
+            detector.forget()
+            board = BoardHit()
         descriptor = (describe(board.corners, board.ids, detector.board, (w, h))
                       if board.corners is not None else None)
 
@@ -335,39 +381,38 @@ class EyeWorker(QObject):
         pixels = StripePixels()
         hull = None
         if laser_on and scan_mode:
-            pixels = find_stripe_pixels(frame.bgr, laser_params)
+            if not stripe_wanted(self.side, board.R is not None,
+                                 True if scan_gate is None else scan_gate()):
+                pixels = StripePixels(wh=(w, h), reason="no board pose — nothing to place")
+            else:
+                # The whole-frame score is the expensive one; on a GPU frame
+                # it runs where the pixels already are.
+                pixels = (gpu.stripe_pixels(frame.rgb_gpu, laser_params, stripe_rows)
+                          if frame.rgb_gpu is not None
+                          else find_stripe_pixels(frame.bgr, laser_params, stripe_rows))
         elif laser_on:
             mask = board_mask(board.corners, frame.gray.shape)
             if mask is None:
                 laser = LaserLine(reason="board not detected")
+            elif frame.bgr is None:
+                # The reader is switching to full frames; the next one has it.
+                laser = LaserLine(reason="waiting for a full-size frame")
             else:
                 laser = find_laser_line(frame.bgr, mask, laser_params)
                 hull = cv2.convexHull(board.corners.reshape(-1, 2).astype(np.int32))
 
-        # Detect on ORIGINAL pixels, then orient for display, then map the
-        # detections into the oriented frame. Detecting on the oriented
-        # image instead would report coordinates in a frame that depends on
-        # a UI setting — useless to any calibration consumer.
-        bgr = np.ascontiguousarray(orient_apply(frame.bgr, orientation))
-        draw_board(bgr, _orient_board(board, orientation, w, h))
-        if laser_on and scan_mode:
-            # Single pixels, not a polyline: the stripe breaks wherever the
-            # subject does, and a segment drawn across a break would show a
-            # surface that was never measured.
-            xy = np.stack([pixels.x, pixels.y], axis=1)
-            _draw_points(bgr, xy if orientation.is_identity
-                         else _map_all(xy, orientation, w, h))
-            if overlay is not None and board.R is not None and intrinsics is not None:
-                _draw_cloud(bgr, overlay.points(), board.R, board.t, intrinsics,
-                            orientation, w, h)
-        elif laser_on:
-            draw_laser(bgr, _orient_laser(laser, orientation, w, h),
-                       _orient_hull(hull, orientation, w, h))
-
+        # Everything above was found on ORIGINAL pixels and is published in
+        # original coordinates. Orienting is the view's job (`glview`): it
+        # draws the frame through the orientation and maps the geometry the
+        # same way, so no oriented copy of the frame is ever made, and a
+        # calibration consumer never sees coordinates that depend on a UI
+        # setting.
         self._det_times.append(time.monotonic())
-        self._publish(frame, board, laser, bgr, descriptor, pixels)
+        self._publish(frame, board, laser, hull, descriptor, pixels,
+                      orientation, intrinsics)
 
-    def _publish(self, frame, board, laser, bgr, descriptor, pixels) -> None:
+    def _publish(self, frame, board, laser, hull, descriptor, pixels,
+                 orientation, intrinsics) -> None:
         s = self._stats
         s.frames += 1
         s.recv_fps = _rate(self._recv_times)
@@ -376,6 +421,7 @@ class EyeWorker(QObject):
         s.laser_ms = laser.ms
         s.corners = board.count
         s.coverage = board.coverage(*frame.gray.shape[::-1])
+        s.tracked = board.tracked
         s.laser_points = int(len(laser.points))
         s.laser_inliers = laser.n_inliers
         s.laser_rms_px = laser.rms_px
@@ -383,11 +429,14 @@ class EyeWorker(QObject):
         s.laser_reason = (pixels.reason if pixels.count or pixels.reason != "no data"
                           else laser.reason)
         s.stripe_points = pixels.count
+        s.gpu = frame.rgb_gpu is not None
         s.server_age_ms = frame.server_age_ms
         h, w = frame.gray.shape
         res = EyeResult(
-            self.side, bgr, _copy_stats(s), board, laser, stripe=pixels,
-            wh=(w, h), descriptor=descriptor, capture_mono=frame.capture_mono,
+            self.side, frame.display, _copy_stats(s), orientation=orientation,
+            intrinsics=intrinsics, hull=hull, board=board, laser=laser,
+            stripe=pixels, wh=(w, h), descriptor=descriptor,
+            capture_mono=frame.capture_mono,
         )
         for sink in self._sinks:
             sink(res)
@@ -396,47 +445,22 @@ class EyeWorker(QObject):
 # ── helpers ───────────────────────────────────────────────────────────────
 
 
-def _draw_points(bgr: np.ndarray, pts: np.ndarray) -> None:
-    """Draw the raw stripe pixels — one each, no line joining them.
+def board_wanted(side: str, scan_mode: bool) -> bool:
+    """Whether this eye runs ChArUco on the frame. While scanning, the right
+    eye's board pose is only drawn, and the window draws it from the left's
+    through the extrinsics — so the right eye spends its frame on the stripe."""
+    return not (scan_mode and side == "right")
 
-    Not a polyline: the stripe breaks wherever the subject does, and drawing a
-    segment across a break would show a surface that was never measured.
+
+def stripe_wanted(side: str, has_pose: bool, left_recent: bool) -> bool:
+    """Whether the stripe is worth scoring on this frame while scanning.
+
+    The scan places points through the LEFT eye's board pose, so a left
+    frame without one has nothing to place and the right eye's stripe is
+    only wanted while the left has had a pose lately — the right eye does
+    not detect the board while scanning, so it asks the scan worker.
     """
-    if not len(pts):
-        return
-    p = np.rint(pts).astype(np.int32)
-    ok = ((p[:, 0] >= 0) & (p[:, 0] < bgr.shape[1])
-          & (p[:, 1] >= 0) & (p[:, 1] < bgr.shape[0]))
-    bgr[p[ok, 1], p[ok, 0]] = (80, 235, 80)
-
-
-def _draw_cloud(bgr: np.ndarray, pts_board: np.ndarray, R: np.ndarray,
-                t: np.ndarray, k, o: Orientation, w: int, h: int) -> None:
-    """Project the scanned cloud into this eye and draw it, 2×2 px per point.
-
-    Board-frame points through THIS eye's own board pose: each eye places the
-    cloud from what it sees, so the two overlays disagreeing is itself a sign
-    that the board poses do. Two pixels because the 1080p frame is shown at
-    about a third of its size and a single pixel would be lost to the scaling.
-    """
-    if not len(pts_board):
-        return
-    cam = pts_board @ np.asarray(R, float).T + np.asarray(t, float).reshape(1, 3)
-    ahead = cam[:, 2] > 1.0
-    if not ahead.any():
-        return
-    px, _ = cv2.projectPoints(cam[ahead], np.zeros(3), np.zeros(3), k.K, k.D)
-    px = px.reshape(-1, 2)
-    if not o.is_identity:
-        px = map_points(px, w, h, o)
-    p = np.rint(px).astype(np.int32)
-    hh, ww = bgr.shape[:2]
-    ok = ((p[:, 0] >= 0) & (p[:, 0] < ww - 1)
-          & (p[:, 1] >= 0) & (p[:, 1] < hh - 1))
-    p = p[ok]
-    for dx in (0, 1):
-        for dy in (0, 1):
-            bgr[p[:, 1] + dy, p[:, 0] + dx] = (0, 150, 255)
+    return has_pose if side == "left" else left_recent
 
 
 def _rate(times: "deque[float]") -> float:
@@ -451,44 +475,3 @@ def _copy_stats(s: EyeStats) -> EyeStats:
     return EyeStats(**vars(s))
 
 
-def _map_all(pts: np.ndarray, o: Orientation, w: int, h: int) -> np.ndarray:
-    """Map an (N, 2) array of (x, y) into oriented coordinates."""
-    return map_points(pts, w, h, o).astype(np.float32)
-
-
-def _orient_board(hit: BoardHit, o: Orientation, w: int, h: int) -> BoardHit:
-    """Copy of `hit` with corners mapped into oriented coordinates, for drawing."""
-    if hit.corners is None or o.is_identity:
-        return hit
-    mapped = _map_all(hit.corners.reshape(-1, 2), o, w, h).reshape(-1, 1, 2)
-    return BoardHit(corners=mapped, ids=hit.ids, R=hit.R, t=hit.t, ms=hit.ms)
-
-
-def _orient_laser(line: LaserLine, o: Orientation, w: int, h: int) -> LaserLine:
-    """Copy of `line` in oriented coordinates, for drawing only.
-
-    The line handed to any calibration consumer stays in original coordinates —
-    this is purely so the overlay lands on the pixels it describes.
-    """
-    if o.is_identity or line.points.size == 0:
-        return line
-    pts = _map_all(line.points, o, w, h)
-    out = LaserLine(points=pts, inliers=line.inliers, rms_px=line.rms_px,
-                    ms=line.ms, reason=line.reason)
-    if line.point is not None and line.direction is not None:
-        # Map two points on the line and rebuild it, rather than trying to
-        # rotate a direction vector through a transform that also mirrors.
-        a = line.point - line.direction * 100.0
-        b = line.point + line.direction * 100.0
-        ma, mb = _map_all(np.stack([a, b]), o, w, h)
-        d = mb - ma
-        n = float(np.hypot(d[0], d[1]))
-        if n > 1e-6:
-            out.point, out.direction = ma, d / n
-    return out
-
-
-def _orient_hull(hull: np.ndarray | None, o: Orientation, w: int, h: int):
-    if hull is None or o.is_identity:
-        return hull
-    return _map_all(hull.reshape(-1, 2), o, w, h).astype(np.int32).reshape(-1, 1, 2)

@@ -198,3 +198,11 @@ def test_as_config_carries_the_resolution(board) -> None:
     assert cfg["width"] == WH[0] and cfg["height"] == WH[1]
     assert cfg["views"] == res.n_views
     assert len(cfg["dist"]) == 5
+
+
+def test_solve_reports_the_focal_length_sigma(board) -> None:
+    views = _sweep(board, 24, 0.55, noise=0.15)
+    res, why = solve(views, board, tilt_spread=_spread(views))
+    assert res is not None, why
+    assert np.isfinite(res.sigma_f_px) and 0.0 < res.sigma_f_px < 10.0
+    assert res.as_config()["sigma_f"] == res.sigma_f_px

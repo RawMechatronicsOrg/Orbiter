@@ -35,7 +35,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from .cvcore import Intrinsics
+from .cvcore import Intrinsics, estimate_pose
 
 log = logging.getLogger("orbiter_native.laserplane")
 
@@ -246,11 +246,31 @@ def fit(points: np.ndarray, wh: tuple[int, int],
                       n_frames=n_frames, wh=wh), None
 
 
+@dataclass
+class PlaneFrame:
+    """One banked frame as observed: the stripe's pixels and the corners
+    the pose came from. With these the plane can be fitted again through
+    better intrinsics than the ones in force when it was banked."""
+
+    pixels: np.ndarray
+    corners: np.ndarray
+    ids: np.ndarray
+    wh: tuple[int, int]
+    #: The rotation the pose had when banked. A flat board admits two poses
+    #: that reproject almost alike; re-solving through other intrinsics must
+    #: land on the same twin, and this is the prior that makes it.
+    R_hint: np.ndarray | None = None
+
+
 class PlaneCollector:
-    """Accumulates stripe-on-board points across frames."""
+    """Accumulates stripe-on-board points across frames — and, when the
+    corners are handed in too, the raw frames they came from."""
 
     def __init__(self) -> None:
         self._chunks: list[np.ndarray] = []
+        #: Aligned with `_chunks`: the raw frame, or None when only the
+        #: points were given.
+        self._raw: list[PlaneFrame | None] = []
         self._frames = 0
         self._n = 0
         self._last_t: np.ndarray | None = None
@@ -265,8 +285,18 @@ class PlaneCollector:
     def frames(self) -> int:
         return self._frames
 
+    def copy(self) -> "PlaneCollector":
+        """A snapshot a solve thread can own while banking goes on."""
+        c = PlaneCollector()
+        c._chunks = list(self._chunks)
+        c._raw = list(self._raw)
+        c._frames, c._n, c._last_t = self._frames, self._n, self._last_t
+        c.skipped = dict(self.skipped)
+        return c
+
     def clear(self) -> None:
         self._chunks.clear()
+        self._raw.clear()
         self._frames = 0
         self._n = 0
         self._last_t = None
@@ -274,8 +304,13 @@ class PlaneCollector:
 
     def add_frame(self, pixels: np.ndarray, k: Intrinsics,
                   board_R: np.ndarray, board_t: np.ndarray,
-                  stripe_rms_px: float | None = None) -> int:
+                  stripe_rms_px: float | None = None,
+                  corners: np.ndarray | None = None, ids: np.ndarray | None = None,
+                  wh: tuple[int, int] | None = None) -> int:
         """Contribute one frame's stripe. Returns how many points it added.
+
+        With `corners`/`ids`/`wh` the frame is also kept raw, so `refit` can
+        redo its points through other intrinsics.
 
         Two gates, both learned from a set that would not fit. A frame taken
         while the board was moving carries a smeared stripe and a lagging pose,
@@ -297,10 +332,17 @@ class PlaneCollector:
             return 0
         self._last_t = t
         self._chunks.append(pts)
+        self._raw.append(
+            PlaneFrame(np.asarray(pixels, np.float32).reshape(-1, 2).copy(),
+                       np.array(corners, np.float32).reshape(-1, 1, 2),
+                       np.array(ids, np.int32).reshape(-1, 1), tuple(wh),
+                       R_hint=np.array(board_R, float))
+            if corners is not None and ids is not None and wh is not None else None)
         self._frames += 1
         self._n += len(pts)
         while self._n > MAX_POINTS and len(self._chunks) > 1:
             self._n -= len(self._chunks.pop(0))
+            self._raw.pop(0)
         return len(pts)
 
     def points(self) -> np.ndarray:
@@ -310,3 +352,30 @@ class PlaneCollector:
 
     def fit(self, wh: tuple[int, int]):
         return fit(self.points(), wh, self._frames)
+
+    @property
+    def raw_frames(self) -> int:
+        return sum(1 for f in self._raw if f is not None)
+
+    def refit(self, board, k: Intrinsics, wh: tuple[int, int]):
+        """Fit the plane again from the raw frames through `k`: each frame's
+        pose re-solved from its corners, its points re-placed on the board.
+        Frames banked without corners keep the points they were banked with."""
+        chunks: list[np.ndarray] = []
+        n_frames = 0
+        for raw, pts in zip(self._raw, self._chunks):
+            if raw is None:
+                chunks.append(pts)
+                n_frames += 1
+                continue
+            # The bank-time rotation breaks the planar-pose ambiguity: frames
+            # are not consecutive here, so a chain of priors would not.
+            pose = estimate_pose(raw.corners, raw.ids, board, k, raw.R_hint)
+            if pose is None:
+                continue
+            placed = points_on_board(raw.pixels, k, pose[0], pose[1])
+            if len(placed):
+                chunks.append(placed)
+                n_frames += 1
+        points = np.concatenate(chunks, axis=0) if chunks else np.empty((0, 3))
+        return fit(points, wh, n_frames)
