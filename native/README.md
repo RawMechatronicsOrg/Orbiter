@@ -243,6 +243,18 @@ Which needs intrinsics — see the known limits above.
 
 ## Calibration
 
+**When the rig moves.** Re-aiming or moving the cameras or the laser stales
+the pair's geometry and the sheet, not the intrinsics: a lens is what it was.
+Press **Rig moved** in the CALIBRATION panel: it keeps every eye's views for
+the intrinsics, splits the pairs into single views, drops the sheet's frames,
+and lets the first new stereo and plane solves replace the server's — the rule
+that refuses a solve on less data is right while the rig stands still and
+exactly wrong once it has moved, and without the button the stale solve would
+win on views forever. The scoreboard says the server's geometry is stale until
+the new one lands; until then the scan's veto and the pose gap on the SCAN
+panel show the disagreement. Then: pairs where both eyes see the board, the
+stripe across it, and `orbiter-rigcheck`.
+
 One switch — **calibrate continuously**, on by default — and the board does
 the rest. Move it about in front of the pair: hold it still in new places, at
 new distances and tilts; bring the laser across it and hold; twist and tilt it

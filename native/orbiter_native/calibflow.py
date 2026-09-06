@@ -311,6 +311,49 @@ class CalibrationFlow:
             q.clear()
         self._last_corners.clear()
 
+    def rig_moved(self) -> int:
+        """The cameras were re-aimed, or moved against each other or the
+        laser. Returns how many pairs were split.
+
+        What that stales is the pair's geometry and the sheet — the sheet is
+        expressed in the left camera's frame — and every pair captured before
+        the move, AS a pair. Each eye's view of the board is as good as it
+        was, so the pairs are split into one-eyed samples and stay for the
+        intrinsics; the sheet's frames go; the readout is per eye and stays.
+
+        The server's stereo and plane stop being a bar to beat: the rule that
+        refuses a solve on less data is right while the rig stands still and
+        exactly wrong once it has moved — the stale solve would win on views
+        forever. A sentinel (no views, infinite residual) takes their place,
+        so the first new solve of each is accepted and saved, and the
+        scoreboard says the server's is stale until then.
+        """
+        split = 0
+        kept = []
+        for s in self.samples.samples:
+            if s.both:
+                kept.append(PairSample(left=s.left, right=None))
+                kept.append(PairSample(left=None, right=s.right))
+                split += 1
+            else:
+                kept.append(s)
+        self.samples.samples = kept
+        self.plane.clear()
+        for key in ("stereo", "plane"):
+            self.results.pop(key, None)
+            self.reasons.pop(key, None)
+            self.saved[key] = Saved.first(0, float("inf"))
+        self.stored_plane = None
+        self.solved_plane = None
+        self.request()
+        return split
+
+    def _stale(self, key: str) -> bool:
+        """Is what the server holds for `key` known to be from before a rig
+        move — the sentinel `rig_moved` leaves?"""
+        s = self.saved.get(key)
+        return s is not None and s.count == 0 and not np.isfinite(s.residual)
+
     # ── the live feed ─────────────────────────────────────────────────────
 
     def offer(self, res, auto: bool = True) -> str | None:
@@ -757,14 +800,17 @@ class CalibrationFlow:
                              f"{'  saved' if self._is_saved(key, r) else ''}")
             else:
                 lines.append(f"K {side[0].upper()}   — {self.reasons.get(key, 'not yet')}")
+        stale = "  · the server's is stale: rig moved"
         s = self.results.get("stereo")
-        lines.append(f"pair  baseline {s.baseline_mm:.1f} mm rms {s.rms_px:.2f} px / {s.n_views}"
-                     f"{'  saved' if self._is_saved('stereo', s) else ''}"
-                     if s is not None else f"pair  — {self.reasons.get('stereo', 'not yet')}")
+        lines.append((f"pair  baseline {s.baseline_mm:.1f} mm rms {s.rms_px:.2f} px / {s.n_views}"
+                      f"{'  saved' if self._is_saved('stereo', s) else ''}"
+                      if s is not None else f"pair  — {self.reasons.get('stereo', 'not yet')}")
+                     + (stale if self._stale("stereo") else ""))
         p = self.results.get("plane")
-        lines.append(f"laser rms {p.rms_mm:.2f} mm / {p.n_frames} poses, {p.n_points} pts"
-                     f"{'  saved' if self._is_saved('plane', p) else ''}"
-                     if p is not None else f"laser — {self.reasons.get('plane', 'not yet')}")
+        lines.append((f"laser rms {p.rms_mm:.2f} mm / {p.n_frames} poses, {p.n_points} pts"
+                      f"{'  saved' if self._is_saved('plane', p) else ''}"
+                      if p is not None else f"laser — {self.reasons.get('plane', 'not yet')}")
+                     + (stale if self._stale("plane") else ""))
         for side in ("left", "right"):
             key = f"readout:{side}"
             r = self.results.get(key)

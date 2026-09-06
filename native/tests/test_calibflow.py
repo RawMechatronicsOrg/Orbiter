@@ -229,8 +229,9 @@ class _Plane(PlaneCollector):
         return LaserPlane(np.array([0.0, 1.0, 0.0]), 74.0, self.rms, 1000, self._frames, wh), None
 
 
-def _fill(flow: CalibrationFlow, board, n_views: int = MIN_VIEWS, motion: int = 25) -> None:
-    rng = np.random.default_rng(3)
+def _fill(flow: CalibrationFlow, board, n_views: int = MIN_VIEWS, motion: int = 25,
+          seed: int = 3) -> None:
+    rng = np.random.default_rng(seed)
     t = 100.0
     for i in range(n_views):
         pose = ((rng.uniform(-0.5, 0.5), rng.uniform(-0.5, 0.5), rng.uniform(-1, 1)),
@@ -290,6 +291,30 @@ def test_save_now_records_what_the_server_will_hold(board) -> None:
     before = {k: v.floor for k, v in flow.saved.items()}
     assert flow.payload_current() is not None
     assert {k: v.floor for k, v in flow.saved.items()} == before
+
+
+def test_rig_moved_keeps_the_eyes_views_and_lets_new_geometry_in(board) -> None:
+    flow = _flow(board)
+    flow.solvers = _fake_solvers()
+    flow.plane = _Plane()
+    _fill(flow, board)
+    flow.finish(flow.run(flow.snapshot(now=1000.0)), now=1001.0)
+    assert flow.samples.paired() and "stereo" in flow.saved and "plane" in flow.saved
+    n_left, n_right = len(flow.samples.views("left")), len(flow.samples.views("right"))
+    split = flow.rig_moved()
+    assert split == MIN_VIEWS and not flow.samples.paired()
+    assert (len(flow.samples.views("left")), len(flow.samples.views("right"))) == (n_left, n_right)
+    assert flow.plane.frames == 0
+    assert "stereo" not in flow.results and "plane" not in flow.results
+    assert "stale" in " ".join(flow.scoreboard())
+    assert "BOTH eyes" in flow.advice()
+    # New pairs from the moved rig - no more of them than the stale solve had -
+    # are accepted and sent to the server all the same.
+    _fill(flow, board, seed=11)
+    assert flow.due(now=2000.0)
+    payload = flow.finish(flow.run(flow.snapshot(now=2000.0)), now=2001.0)
+    assert payload is not None and "_extrinsics" in payload and "_laser_plane" in payload
+    assert not flow._stale("stereo") and "stale" not in " ".join(flow.scoreboard())
 
 
 def test_a_worse_solve_is_kept_off_the_server(board) -> None:

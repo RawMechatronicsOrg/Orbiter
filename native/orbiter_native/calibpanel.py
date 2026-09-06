@@ -179,7 +179,17 @@ class CalibrationPanel(QFrame):
         self.btn_save.clicked.connect(self._save_all)
         self.btn_clear = QPushButton("Clear")
         self.btn_clear.clicked.connect(self._clear)
-        for b in (self.btn_capture, self.btn_solve, self.btn_save, self.btn_clear):
+        self.btn_moved = QPushButton("Rig moved")
+        self.btn_moved.setToolTip(
+            "Press after re-aiming or moving the cameras or the laser. Keeps every "
+            "eye's views for the intrinsics, drops the pairs and the sheet's frames, "
+            "and lets the first new stereo and plane solves replace the server's "
+            "stale ones even with fewer views. Then: pairs where both eyes see the "
+            "board, and the stripe across it."
+        )
+        self.btn_moved.clicked.connect(self._rig_moved)
+        for b in (self.btn_capture, self.btn_solve, self.btn_save, self.btn_clear,
+                  self.btn_moved):
             row.addWidget(b)
         root.addLayout(row)
 
@@ -435,6 +445,13 @@ class CalibrationPanel(QFrame):
         self.flow.clear()
         self._persist()
         self._activity = "cleared"
+        self._refresh()
+
+    def _rig_moved(self) -> None:
+        n = self.flow.rig_moved()
+        self._persist()
+        self._activity = (f"rig moved: {n} pairs kept as single views, the sheet dropped — "
+                          "new pairs and stripe frames replace the server's geometry")
         self._refresh()
 
     def _persist(self) -> None:
