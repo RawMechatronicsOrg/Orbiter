@@ -529,7 +529,13 @@ class CalibrationFlow:
                 payload["_laser_plane"] = res.as_config()
             elif kind == "readout":
                 payload.setdefault(side, {})["readout"] = res.as_config()
-            self.saved[key] = Saved(*_measure(key, res))
+            # The server will hold this solve: record it the way an accepted
+            # cycle does, so the floor carries on (or starts here). Building
+            # Saved() by hand skipped the floor and raised on the button.
+            count, resid = _measure(key, res)
+            old = self.saved.get(key)
+            self.saved[key] = (old.adopt(count, resid) if old is not None
+                               else Saved.first(count, resid))
         return payload or None
 
     def due(self, now: float) -> bool:

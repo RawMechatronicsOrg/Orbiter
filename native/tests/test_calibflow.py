@@ -269,6 +269,29 @@ def test_a_cycle_solves_everything_in_order_and_saves_what_is_new(board) -> None
     assert all("saved" in line for line in flow.scoreboard())
 
 
+def test_save_now_records_what_the_server_will_hold(board) -> None:
+    # The button sends every current solve, better or not; the server then
+    # holds it, and the flow has to remember that WITH a floor, the way an
+    # accepted cycle does. Built by hand, Saved() missed the floor and the
+    # button raised instead of saving.
+    flow = _flow(board)
+    flow.solvers = _fake_solvers()
+    flow.plane = _Plane()
+    _fill(flow, board)
+    out = flow.run(flow.snapshot(now=1000.0))
+    flow.finish(out, now=1001.0)
+    flow.saved.clear()                                   # nothing held yet
+    payload = flow.payload_current()
+    assert payload and {"left", "right", "_extrinsics", "_laser_plane"} <= set(payload)
+    for key in out.results:
+        s = flow.saved[key]
+        assert np.isfinite(s.floor) and s.floor == s.residual
+    # Saving the same solves again keeps the floor and does not raise.
+    before = {k: v.floor for k, v in flow.saved.items()}
+    assert flow.payload_current() is not None
+    assert {k: v.floor for k, v in flow.saved.items()} == before
+
+
 def test_a_worse_solve_is_kept_off_the_server(board) -> None:
     flow = _flow(board)
     flow.solvers = _fake_solvers(intr_rms=0.3)
