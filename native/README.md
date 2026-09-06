@@ -181,9 +181,10 @@ Feeding them to `solvePnP` yields a plausible pose that is simply wrong, so the
 panel says `pose needs per-eye intrinsics` until this pair has its own. Run the
 calibration below; pose appears once the solve is saved. Stored intrinsics also
 carry the resolution they were solved at and are refused against a frame of any
-other size — camserver can be reconfigured under a running app, and 1280x720
-intrinsics on a 1080p frame put the principal point in the wrong place and
-scale the focal length by two thirds.
+other size — camserver 2.0 pins its capture format per server start, not for
+good, and a stream URL can ask for another size; 1280x720 intrinsics on a 1080p
+frame put the principal point in the wrong place and scale the focal length by
+two thirds.
 
 **The laser plane is not solved.** Scanning does not need it — triangulation
 from two cameras gives the 3D point directly — but it would be a second,

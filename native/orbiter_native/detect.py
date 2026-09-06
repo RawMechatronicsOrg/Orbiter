@@ -280,7 +280,7 @@ class BoardDetector:
         p = self._track
         prev, pts = self._prev_gray, self._corners
         if prev is None or prev.shape != gray.shape:
-            return None, None                    # the stream was reconfigured
+            return None, None                    # the frame size changed under us
         h, w = gray.shape
         xy = pts.reshape(-1, 2)
         lo = np.maximum(np.floor(xy.min(axis=0)).astype(int) - p.roi_margin_px, 0)

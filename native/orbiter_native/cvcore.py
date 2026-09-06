@@ -189,12 +189,14 @@ def intrinsics_from_eye(
     answer, and the UI says so.
 
     `frame_wh` guards the same failure one step further on. A camera matrix is
-    only valid at the resolution it was solved at, and camserver can be
-    reconfigured between runs; 1280x720 intrinsics applied to a 1080p frame
-    put the principal point in the wrong place and scale the focal length by
-    two thirds, which again yields a plausible, wrong pose. When the size does
-    not match, this returns None rather than rescaling — rescaling would be a
-    guess about the sensor's crop-vs-scale behaviour that nobody has verified.
+    only valid at the resolution it was solved at, and the frame size is not
+    fixed for good — camserver 2.0 pins the capture format per server start,
+    and a stream URL can ask for another size; 1280x720 intrinsics applied to
+    a 1080p frame put the principal point in the wrong place and scale the
+    focal length by two thirds, which again yields a plausible, wrong pose.
+    When the size does not match, this returns None rather than rescaling —
+    rescaling would be a guess about the sensor's crop-vs-scale behaviour that
+    nobody has verified.
     """
     if not eye:
         return None

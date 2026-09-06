@@ -101,7 +101,8 @@ class Readout:
     @staticmethod
     def from_config(d: Any, frame_wh: tuple[int, int] | None) -> "Readout | None":
         """The stored figure, usable at `frame_wh`, or None — a readout time
-        belongs to a sensor mode, and camserver can be reconfigured."""
+        belongs to a sensor mode, and the frame size can change between
+        camserver starts or with a `size` on the stream URL."""
         if not isinstance(d, dict):
             return None
         try:

@@ -62,8 +62,10 @@ class Eye:
         """Intrinsics usable at `frame_wh`, or None.
 
         Resolved per frame rather than once at parse time: a camera matrix is
-        only valid at the resolution it was solved at, and camserver can be
-        reconfigured under a running app.
+        only valid at the resolution it was solved at, and the frame size can
+        still change under a running app — camserver 2.0 pins the capture
+        format per server start rather than for good, and a stream URL can ask
+        for another size outright.
         """
         return intrinsics_from_eye({"intrinsics": self.intrinsics_raw}, frame_wh)
 

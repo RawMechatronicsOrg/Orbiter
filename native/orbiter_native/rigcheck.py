@@ -96,10 +96,11 @@ def _snapshot(host: str, cam: str) -> np.ndarray | None:
 def _controls(host: str, cam: str) -> dict[str, Any]:
     """The driver's controls for one camera, by slug.
 
-    camserver answers 503 "camera is not running" when nothing is holding the
-    stream open, and a control read that lands then reports every value as
-    null — which reads exactly like a camera on auto. So this is only ever
-    called while `_with_streams` has the cameras up.
+    camserver 2.0 keeps both cameras open for the life of the process, so
+    this answers whether or not a stream is held; a 503 now means the camera
+    itself is not answering. It still runs under `_with_streams` so the knobs
+    are read at the moment the frame rate is measured. A null value means
+    the driver would not say — reported as that, never read as auto.
     """
     r = httpx.get(f"{host}/api/controls/{cam}", timeout=8)
     if r.status_code != 200:
@@ -118,10 +119,10 @@ def say(state: str, line: str) -> None:
 def _with_streams(host: str, cams: dict[str, str], seconds: float, work):
     """Hold both streams open for `seconds`, running `work()` meanwhile.
 
-    Everything that asks the driver a question has to ask it while the camera
-    is running: camserver refuses a control read otherwise. Holding the
-    streams also measures the frame rate and the offset between the eyes,
-    which is the same measurement the pairing needs.
+    Holding the streams measures the frame rate and the offset between the
+    eyes, which is the same measurement the pairing needs; `work()` runs in
+    the middle of it so the driver is asked about the cameras in the state
+    the frame rate was measured in.
     """
     got: dict[str, list[float]] = {s: [] for s in cams}
     threads = [threading.Thread(target=_stamps, args=(host, cam, seconds, got[side]),
