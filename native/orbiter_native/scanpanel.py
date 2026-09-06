@@ -256,7 +256,10 @@ class ScanPanel(QFrame):
                 lines.append(f"sync    {f.sync_note}")
             if f.veto_px == f.veto_px:            # not NaN
                 lines.append(f"veto    the eyes disagree by {f.veto_px:+.1f} px "
-                             f"about where the stripe is")
+                             f"about where the stripe is"
+                             + (f" · judged {f.veto_shift_px:+.1f} px along, as the frame agrees"
+                                if f.veto_shift_px else "")
+                             + (f" · {f.veto_note}" if f.veto_note else ""))
             if f.refine_note:
                 lines.append(f"refine  — {f.refine_note}")
             elif f.n_refined:
@@ -264,7 +267,8 @@ class ScanPanel(QFrame):
                              f"{f.refine_shift_mm:.2f} mm · right eye {100 * f.refine_share:.0f} %")
             lines.append(f"dropped unconfirmed {f.n_rejected_unconfirmed} · blob "
                          f"{f.n_rejected_blob} · reach {f.n_rejected_range} · "
-                         f"jump {f.n_rejected_jump} · outside {f.n_rejected_volume}"
+                         f"jump {f.n_rejected_jump} · offside {f.n_rejected_offside} · "
+                         f"outside {f.n_rejected_volume}"
                          + (f" · split {f.n_split}" if f.n_split else ""))
             if f.rs_note:
                 lines.append(f"rolling — {f.rs_note}")

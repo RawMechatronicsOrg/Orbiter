@@ -73,7 +73,7 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-from .laser import StripePixels, stripe_centroids
+from .laser import BLOB_GAP_PX, StripePixels, stripe_centroids
 from .laserplane import LaserPlane, rays
 from .rolling import Motion
 from .stereo import StereoRig
@@ -138,6 +138,21 @@ class ScanParams:
     #: Locate the stripe on each scanline by a Gaussian fit of its profile
     #: rather than the centroid — see `laser.stripe_centroids`.
     centroid_fit: bool = True
+    #: The veto asks whether the right eye has stripe within `confirm_px` of
+    #: where a candidate projects. The pair's calibration puts that
+    #: projection a couple of pixels off — the same couple of pixels for
+    #: every candidate of the frame, the frame's `veto_px` — and at 2-3 px
+    #: of residual half a frame's true points fail a 3 px veto for nothing
+    #: they did. With `veto_follow` the projections are first moved by the
+    #: frame's median offset, when that offset is small (under
+    #: `veto_follow_max_px`: a calibration's slack, not a stale pair) and
+    #: the candidates agree on it (median absolute deviation under
+    #: `veto_follow_mad_px`: a stripe, not fog); the veto then judges each
+    #: candidate against the consensus, which is what it was for. Depth is
+    #: untouched — the sheet gives it; the offset stays on the panel.
+    veto_follow: bool = True
+    veto_follow_max_px: float = 8.0
+    veto_follow_mad_px: float = 2.0
     #: Refine each point's depth by the RIGHT eye's own stripe centroid
     #: (`refine_by_right`). The sheet gives depth through one eye across a
     #: baseline of only the laser's offset — 74 mm on this rig — while the
@@ -214,6 +229,13 @@ class ScanFrame:
     n_rejected_range: int = 0
     #: Points standing off both their neighbours along the stripe.
     n_rejected_jump: int = 0
+    #: Scanlines whose centroid, put on the sheet, projects farther than
+    #: `confirm_px` from the right eye's nearest stripe run on that
+    #: scanline. The pixel veto's dilation and the two stripes' widths let
+    #: a candidate through from up to ~9 px away — ±7 mm of depth at 400 mm
+    #: on this rig (f·B/Z² = 1.3 px/mm); this is the veto done centroid to
+    #: centroid, ±2.3 mm.
+    n_rejected_offside: int = 0
     n_rejected_volume: int = 0
     #: The stereo refinement (`refine_by_right`): how many kept points the
     #: right eye's centroid took part in, the median correction it made,
@@ -227,6 +249,11 @@ class ScanFrame:
     #: where the left eye's candidates project into its frame. NaN when the
     #: eyes share no scanline. See `_veto_offset`.
     veto_px: float = float("nan")
+    #: The offset the veto was moved by before judging (`veto_follow`),
+    #: 0 when it judged the projections as they were, and why not when it
+    #: did not follow a measured offset.
+    veto_shift_px: float = 0.0
+    veto_note: str | None = None
     reason: str | None = None
     #: Which eyes the board pose came from — "left+right", "left" or
     #: "right" — and, with both, how far their independent poses stood apart
@@ -263,8 +290,16 @@ def _on_plane(k, plane: LaserPlane, pixels: np.ndarray) -> np.ndarray:
 
 
 def _veto_offset(right: StripePixels, uv: np.ndarray) -> float:
-    """Median signed distance, px, from where the left eye puts the stripe in
-    the right frame to where the right eye actually has it.
+    """Median of `_veto_offsets`, NaN when the two eyes share no scanline."""
+    off = _veto_offsets(right, uv)
+    return float(np.median(off)) if len(off) else float("nan")
+
+
+def _veto_offsets(right: StripePixels, uv: np.ndarray) -> np.ndarray:
+    """Per candidate, the signed distance, px along the scanline, from where
+    the left eye puts the stripe in the right frame to where the right eye
+    actually has it — for the candidates on a scanline the right eye has
+    stripe on; the others are left out.
 
     The veto asks whether those coincide within `confirm_px`; this says by
     how much they miss, which is what tells a calibration that cannot scan
@@ -274,25 +309,61 @@ def _veto_offset(right: StripePixels, uv: np.ndarray) -> float:
     panel reads exactly as it would with the laser switched off. NaN when the
     two eyes share no scanline.
     """
-    if not len(uv) or not len(right.x):
-        return float("nan")
-    w, h = right.wh
-    n = w if right.along_x else h
-    key_px = (right.x if right.along_x else right.y).astype(np.int64)
-    across_px = (right.y if right.along_x else right.x).astype(np.float64)
-    weight = np.maximum(right.w.astype(np.float64), 1.0)
-    total = np.bincount(key_px, weights=weight, minlength=n)
-    moment = np.bincount(key_px, weights=weight * across_px, minlength=n)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        seen = moment / total                      # NaN on scanlines with none
+    runs = right_runs(right)
+    if runs is None or not len(uv):
+        return np.empty(0)
     key = np.rint(uv[:, 0] if right.along_x else uv[:, 1])
     across = uv[:, 1] if right.along_x else uv[:, 0]
-    on = np.isfinite(key) & (key >= 0) & (key < n)
-    if not on.any():
-        return float("nan")
-    off = across[on] - seen[key[on].astype(np.int64)]
-    off = off[np.isfinite(off)]
-    return float(np.median(off)) if len(off) else float("nan")
+    fin = np.isfinite(key) & np.isfinite(across)
+    off = np.full(len(uv), np.nan)
+    off[fin] = -nearest_run_residual(runs, key[fin].astype(np.int64), across[fin])
+    return off[np.isfinite(off)]
+
+
+def right_runs(right: StripePixels) -> tuple[np.ndarray, np.ndarray] | None:
+    """The right eye's stripe as one centroid per RUN — a scanline can hold
+    the stripe and a glint, and a candidate is judged against the nearest,
+    not the mean of both — as `(key, pos)` sorted by key then pos. None
+    without pixels."""
+    if not len(right.x):
+        return None
+    key = (right.x if right.along_x else right.y).astype(np.int64)
+    across = (right.y if right.along_x else right.x).astype(np.float64)
+    w = np.maximum(right.w.astype(np.float64), 1.0)
+    order = np.lexsort((across, key))
+    key, across, w = key[order], across[order], w[order]
+    new = np.ones(len(key), bool)
+    new[1:] = (key[1:] != key[:-1]) | (across[1:] - across[:-1] > BLOB_GAP_PX)
+    run = np.cumsum(new) - 1
+    nb = int(run[-1]) + 1
+    pos = np.bincount(run, weights=w * across, minlength=nb) / np.bincount(run, weights=w, minlength=nb)
+    rk = key[new]
+    order = np.lexsort((pos, rk))
+    return rk[order], pos[order]
+
+
+#: Runs looked at per scanline when finding the nearest: a scanline holds
+#: the stripe and perhaps a glint or two, not more.
+_RUNS_PER_LINE = 4
+
+
+def nearest_run_residual(runs: tuple[np.ndarray, np.ndarray], key: np.ndarray,
+                         across: np.ndarray) -> np.ndarray:
+    """Per query `(key, across)`, the signed distance from `across` to the
+    nearest run's centroid on scanline `key`: run minus query. NaN where
+    the scanline has no run."""
+    rk, pos = runs
+    key = np.asarray(key, np.int64)
+    across = np.asarray(across, np.float64)
+    start = np.searchsorted(rk, key, side="left")
+    best = np.full(len(key), np.nan)
+    for i in range(_RUNS_PER_LINE):
+        j = np.minimum(start + i, len(rk) - 1)
+        hit = (start + i < len(rk)) & (rk[j] == key)
+        d = np.where(hit, pos[j] - across, np.nan)
+        take = hit & (~np.isfinite(best) | (np.abs(d) < np.abs(best)))
+        best = np.where(take, d, best)
+    return best
 
 
 def _whole_blobs(px: StripePixels, confirmed: np.ndarray, reach: int) -> np.ndarray:
@@ -489,7 +560,8 @@ class Refined:
 
 def refine_by_right(rig: StereoRig, plane: LaserPlane, xyz_cam: np.ndarray,
                     pix_left: np.ndarray, left_along_x: bool, right: StripePixels,
-                    params: ScanParams) -> Refined:
+                    params: ScanParams,
+                    runs: tuple[np.ndarray, np.ndarray] | None = None) -> Refined:
     """Fuse each point's sheet depth with the depth the right eye's stripe
     centroid implies, along the left ray.
 
@@ -531,25 +603,23 @@ def refine_by_right(rig: StereoRig, plane: LaserPlane, xyz_cam: np.ndarray,
     if not right.ok:
         none.note = "no right stripe"
         return none
-    key_r = right.x if right.along_x else right.y
-    across_r = right.y if right.along_x else right.x
-    scan_r, pos_r, *_ = stripe_centroids(key_r, across_r, right.w, params.blob_width_px,
-                                         fit=params.centroid_fit)
-    if not len(scan_r):
+    runs = right_runs(right) if runs is None else runs
+    if runs is None:
         none.note = "no right centroids"
         return none
-    order = np.argsort(scan_r)
-    scan_r, pos_r = scan_r[order], pos_r[order]
 
     uv = rig.project_right(xyz_cam)
     fin = np.isfinite(uv).all(axis=1)
     scan_axis, across_axis = (0, 1) if right.along_x else (1, 0)
     k = np.full(n, -1, np.int64)
     k[fin] = np.rint(uv[fin, scan_axis]).astype(np.int64)
+    # NOT moved by the frame's consensus offset the veto follows: to a pair
+    # trusted this far (`stereo_refine_max_rms_px`) a consistent offset is
+    # depth, and reading it as slack would be to undo the refinement.
     v_sheet = uv[:, across_axis]
-    j = np.clip(np.searchsorted(scan_r, k), 0, len(scan_r) - 1)
-    found = fin & (scan_r[j] == k)
-    resid = np.where(found, pos_r[j] - v_sheet, np.nan)
+    resid = np.full(n, np.nan)
+    resid[fin] = nearest_run_residual(runs, k[fin], v_sheet[fin])
+    found = np.isfinite(resid)
     ok = found & (np.abs(resid) <= params.stereo_refine_window_px)
 
     # How the right's across-coordinate answers a move of 1 mm along the ray.
@@ -628,9 +698,26 @@ def scan_frame(
     # the candidate projects.
     confirmed = np.zeros(len(px), bool)
     veto_px = float("nan")
+    veto_shift, veto_note = 0.0, None
     if ok.any():
         uv = rig.project_right(cand[ok])
-        veto_px = _veto_offset(right, uv)
+        offsets = _veto_offsets(right, uv)
+        veto_px = float(np.median(offsets)) if len(offsets) else float("nan")
+        if params.veto_follow and len(offsets):
+            mad = float(np.median(np.abs(offsets - veto_px)))
+            if abs(veto_px) > params.veto_follow_max_px:
+                veto_note = (f"offset {veto_px:+.1f} px is over {params.veto_follow_max_px:g}: "
+                             "not a slack to follow — the pair or the sheet is off")
+            elif mad > params.veto_follow_mad_px:
+                veto_note = (f"candidates disagree on the offset (MAD {mad:.1f} px): "
+                             "not followed")
+            elif abs(veto_px) >= 0.5:
+                # `veto_px` is candidate minus stripe: the stripe sits at
+                # minus that from the projections, so that is the move.
+                veto_shift = -veto_px
+                across = 1 if right.along_x else 0
+                uv = uv.copy()
+                uv[:, across] += veto_shift
         seen = right.mask(params.confirm_px)
         w, h = right.wh
         fin = np.isfinite(uv).all(axis=1)
@@ -661,6 +748,26 @@ def scan_frame(
     rows = centroids[finite, 1] if len(centroids) else np.empty(0)
     pix = centroids[finite] if len(centroids) else np.empty((0, 2))
 
+    # The veto again, centroid to centroid: the pixel veto's dilation and
+    # the stripes' widths admit a candidate from ~9 px away, ±7 mm of
+    # depth at 400 mm; the sheet point's projection must sit within
+    # `confirm_px` of the right eye's nearest run on that scanline, after
+    # the frame's consensus offset. Scanlines the right eye has no run on
+    # are not judged here — the pixel veto already saw stripe there.
+    runs = right_runs(right)
+    n_offside = 0
+    if runs is not None and len(xyz_cam):
+        uv_c = rig.project_right(xyz_cam)
+        fin_c = np.isfinite(uv_c).all(axis=1)
+        k_c = np.rint(np.where(fin_c, uv_c[:, 0] if right.along_x else uv_c[:, 1], -1)).astype(np.int64)
+        v_c = (uv_c[:, 1] if right.along_x else uv_c[:, 0]) + veto_shift
+        resid_c = np.full(len(xyz_cam), np.nan)
+        resid_c[fin_c] = nearest_run_residual(runs, k_c[fin_c], v_c[fin_c])
+        offside = np.isfinite(resid_c) & (np.abs(resid_c) > params.confirm_px)
+        n_offside = int(offside.sum())
+        keep = ~offside
+        xyz_cam, scan, rows, pix = xyz_cam[keep], scan[keep], rows[keep], pix[keep]
+
     # The reach: the baseline is the one line both cameras share, and the
     # subject sits a known distance from it whatever the board does.
     lo, hi = params.range_mm
@@ -675,7 +782,8 @@ def scan_frame(
     xyz_cam, rows, pix = xyz_cam[smooth], rows[smooth], pix[smooth]
 
     # The right eye's own centroid, fused into the depth along each ray.
-    refined = refine_by_right(rig, plane, xyz_cam, pix, bool(left.along_x), right, params)
+    refined = refine_by_right(rig, plane, xyz_cam, pix, bool(left.along_x), right, params,
+                              runs=runs)
     xyz_cam = refined.xyz
 
     # Into the board's frame: the volume is defined relative to the board, so
@@ -709,6 +817,8 @@ def scan_frame(
         n_rejected_blob=n_blob,
         n_split=n_split,
         n_rejected_range=n_range,
+        veto_shift_px=veto_shift,
+        veto_note=veto_note,
         n_refined=int(refined.used[inside].sum()) if len(refined.used) else 0,
         refine_shift_mm=(float(np.median(np.abs(refined.shift_mm[inside & refined.used])))
                          if (inside & refined.used).any() else float("nan")),
@@ -716,6 +826,7 @@ def scan_frame(
                       if (inside & refined.used).any() else float("nan")),
         refine_note=refined.note,
         n_rejected_jump=n_jump,
+        n_rejected_offside=n_offside,
         n_rejected_volume=int((~inside).sum()),
         veto_px=veto_px,
         rs_max_mm=rs_max,

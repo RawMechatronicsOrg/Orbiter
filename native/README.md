@@ -438,6 +438,24 @@ over 2° or 15 mm — the pair's geometry then describes another rig, and the
 SCAN panel says so rather than scattering points where that rig would put
 them.
 
+**The veto, twice.** A candidate is real only if the right eye has stripe
+where it projects, within `confirm_px` (3 px). Two things about that were
+found by measuring. The pair's calibration puts every projection of a
+frame the same couple of pixels off (`veto_px` on the SCAN panel), and a
+3 px veto would fail half a frame's true points for it — so the veto first
+moves the projections by the frame's median offset when that offset is
+small (under 8 px: slack, not a stale pair) and the frame agrees on it
+(median absolute deviation under 2 px: a stripe, not fog); depth is the
+sheet's regardless, and the offset stays on the panel. And the pixel veto's
+dilation plus the two stripes' widths admit a candidate from ~9 px away —
+±7 mm of depth at 400 mm on this rig, which is where the fog beside a
+surface came from — so the veto is done again centroid to centroid: the
+sheet point's projection must sit within `confirm_px` of the right eye's
+NEAREST stripe run on that scanline (nearest, so a glint beside the stripe
+does not steal a true point), ±2.3 mm; what fails is `offside` on the
+panel. The whole budget — every sensitivity, threshold and measured
+number from photon to voxel — is in `docs/ERROR_BUDGET.md`.
+
 **The right eye in the depth.** The sheet fixes each point where the left
 ray meets it, across a baseline of only the laser's offset from the left
 camera — 74 mm on this rig — so a pixel of stripe centroid is Z²/(f·d) of

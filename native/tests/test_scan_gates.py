@@ -141,9 +141,14 @@ def test_a_glint_on_one_scanline_is_dropped_by_the_jump_gate() -> None:
     r_all = StripePixels(x=rx[ok].astype(np.int32), y=ry[ok].astype(np.int32),
                          w=np.full(int(ok.sum()), 200, np.uint8), wh=WH,
                          along_x=True, reason=None)
-    unfiltered = scan_frame(rig, plane, l2, r_all, BOARD2_R, BOARD2_T, _params(jump_mm=0.0))
+    # The centroid veto would catch it too (`n_rejected_offside`); it is
+    # opened wide here so the jump gate is what is tested.
+    unfiltered = scan_frame(rig, plane, l2, r_all, BOARD2_R, BOARD2_T,
+                            _params(jump_mm=0.0, confirm_px=100))
     assert unfiltered.n_rejected_jump == 0
     assert np.abs(unfiltered.points_camera[:, 2] - 500.0).max() > 20.0   # the glint is in
-    out = scan_frame(rig, plane, l2, r_all, BOARD2_R, BOARD2_T, _params(jump_mm=5.0))
+    caught = scan_frame(rig, plane, l2, r_all, BOARD2_R, BOARD2_T, _params(jump_mm=0.0))
+    assert caught.n_rejected_offside >= 1                                # the veto alone gets it
+    out = scan_frame(rig, plane, l2, r_all, BOARD2_R, BOARD2_T, _params(jump_mm=5.0, confirm_px=100))
     assert out.n_rejected_jump >= 1
     assert np.abs(out.points_camera[:, 2] - 500.0).max() < 1.0

@@ -673,3 +673,78 @@ def test_the_refinement_stays_out_when_it_cannot_be_trusted() -> None:
     assert out.n_refined > 0.9 * out.n_kept
     # With a rms of 2.3 px counted as noise the right eye weighs much less.
     assert out.refine_share < 0.4
+
+
+# ── the veto follows the frame's own offset ──────────────────────────────
+
+def test_the_veto_judges_against_the_frames_consensus_offset() -> None:
+    """The pair puts every projection 7 px off — past the 3 px veto and the
+    stripe's own half-width. Judged as they are, the frame's true points
+    fail; judged against the frame's own median offset, they pass, and the
+    depth is the sheet's regardless. Fog that agrees on nothing is not
+    followed, nor is an offset too large to be slack."""
+    rig, plane = _rig(), _plane()
+    truth = _curve(_z_true)
+    left = _pixels(KL, np.eye(3), np.zeros(3), truth)
+    right = _pixels(KR, R_TRUE, T_TRUE, truth)
+    slid = StripePixels(x=right.x, y=right.y + 7, w=right.w, wh=right.wh, along_x=True,
+                        reason=None)
+    stiff = scan_frame(rig, plane, left, slid, BOARD2_R, BOARD2_T,
+                       ScanParams(range_mm=(0.0, 1e9), stereo_refine=False, veto_follow=False))
+    assert stiff.n_kept == 0 and stiff.veto_px == pytest.approx(-7.0, abs=0.6)
+    eased = scan_frame(rig, plane, left, slid, BOARD2_R, BOARD2_T,
+                       ScanParams(range_mm=(0.0, 1e9), stereo_refine=False))
+    assert eased.n_kept > 250 and eased.veto_shift_px == pytest.approx(7.0, abs=0.6)
+    assert eased.veto_px == pytest.approx(-7.0, abs=0.6)               # still reported
+    honest = scan_frame(rig, plane, left, right, BOARD2_R, BOARD2_T,
+                        ScanParams(range_mm=(0.0, 1e9), stereo_refine=False))
+    assert np.allclose(eased.points_camera, honest.points_camera, atol=1e-6)   # depth untouched
+    # Too far to be slack: a stale pair, said so, not followed.
+    far = StripePixels(x=right.x, y=right.y + 12, w=right.w, wh=right.wh, along_x=True,
+                       reason=None)
+    out = scan_frame(rig, plane, left, far, BOARD2_R, BOARD2_T,
+                     ScanParams(range_mm=(0.0, 1e9), stereo_refine=False))
+    assert out.n_kept == 0 and out.veto_shift_px == 0.0 and "over 8" in out.veto_note
+    # Fog: every column's stripe somewhere else, no consensus to follow.
+    rng = np.random.default_rng(5)
+    per_col = rng.integers(-6, 7, right.wh[0])
+    fog = StripePixels(x=right.x, y=(right.y + per_col[right.x]).astype(np.int32),
+                       w=right.w, wh=right.wh, along_x=True, reason=None)
+    out = scan_frame(rig, plane, left, fog, BOARD2_R, BOARD2_T,
+                     ScanParams(range_mm=(0.0, 1e9), stereo_refine=False))
+    assert out.veto_shift_px == 0.0 and "disagree" in out.veto_note
+
+
+def test_a_glint_beside_the_stripe_is_offside_and_the_stripe_is_not() -> None:
+    """The right eye has the stripe AND, on a third of its scanlines, a
+    brighter blob 12 px away. Judged against the nearest run, the true
+    points stay; a left candidate whose sheet point lands on the glint's
+    side is offside and dropped — the pixel veto's dilation let it through."""
+    from orbiter_native.scan import nearest_run_residual, right_runs
+
+    rig, plane = _rig(), _plane()
+    truth = _curve(_z_true)
+    left = _pixels(KL, np.eye(3), np.zeros(3), truth)
+    right = _pixels(KR, R_TRUE, T_TRUE, truth)
+    every_third = (right.x % 3 == 0)
+    glint = StripePixels(x=right.x[every_third], y=right.y[every_third] + 12,
+                         w=np.full(int(every_third.sum()), 255, np.uint8), wh=right.wh,
+                         along_x=True, reason=None)
+    both = _join(right, glint)
+    runs = right_runs(both)
+    # Two runs on a glinting column, one elsewhere; the nearest is found by sign.
+    cols, counts = np.unique(runs[0], return_counts=True)
+    assert counts.max() == 2 and counts.min() == 1
+    col = int(cols[counts == 2][0])
+    stripe_pos = right.y[right.x == col].mean()
+    assert nearest_run_residual(runs, np.array([col, col]), np.array([stripe_pos, stripe_pos + 11.0])) == pytest.approx([0.0, 1.0], abs=1.0)
+    clean = scan_frame(rig, plane, left, right, BOARD2_R, BOARD2_T, WIDE)
+    out = scan_frame(rig, plane, left, both, BOARD2_R, BOARD2_T, WIDE)
+    assert out.n_kept >= 0.95 * clean.n_kept and out.n_rejected_offside == 0
+    assert np.allclose(out.points_camera[:, 2].mean(), clean.points_camera[:, 2].mean(), atol=0.05)
+    # A right eye that holds only the displaced blob: every scanline offside.
+    out = scan_frame(rig, plane, left, StripePixels(x=right.x, y=right.y + 7, w=right.w, wh=right.wh,
+                                                     along_x=True, reason=None),
+                     BOARD2_R, BOARD2_T, ScanParams(range_mm=(0.0, 1e9), stereo_refine=False,
+                                                    veto_follow=False))
+    assert out.n_kept == 0 and out.n_rejected_offside > 0        # what the pixel veto let through
