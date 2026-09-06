@@ -401,14 +401,15 @@ def test_scan_worker_pairs_oldest_first_by_capture_clock() -> None:
     sw.set_active(True)
     sw.offer(_eye_result("left", 0.000))
     sw.offer(_eye_result("right", 0.0005))
-    a, b, _, _ = sw._take_pair()
-    assert (a.capture_mono, b.capture_mono) == (0.000, 0.0005)
+    a, b, other, _, _ = sw._take_pair()
+    assert (a.capture_mono, b.capture_mono, other) == (0.000, 0.0005, None)
 
     sw.offer(_eye_result("left", 0.033))
     sw.offer(_eye_result("left", 0.066))
     sw.offer(_eye_result("right", 0.040))
-    a, b, _, _ = sw._take_pair()
+    a, b, other, _, _ = sw._take_pair()
     assert (a.capture_mono, b.capture_mono) == (0.033, 0.040)
+    assert other.capture_mono == 0.0005                # the last right consumed brackets from below
     # 0.066 has no partner yet, and none can be ruled out: wait.
     assert sw._take_pair() is None
 
@@ -416,9 +417,13 @@ def test_scan_worker_pairs_oldest_first_by_capture_clock() -> None:
     # Now every right that could have matched 0.066 has arrived: skip it.
     assert sw._take_pair() is None
     sw.offer(_eye_result("left", 0.1002))
-    a, b, _, _ = sw._take_pair()
-    assert (a.capture_mono, b.capture_mono) == (0.1002, 0.100)
-    assert not sw._hist["left"] and not sw._hist["right"]
+    # Its partner came before it: wait one frame for the right that brackets it.
+    assert sw._take_pair() is None
+    sw.offer(_eye_result("right", 0.133))
+    a, b, other, _, _ = sw._take_pair()
+    assert (a.capture_mono, b.capture_mono, other.capture_mono) == (0.1002, 0.100, 0.133)
+    assert not sw._hist["left"]
+    assert [r.capture_mono for r in sw._hist["right"]] == [0.133]   # the far side stays
 
     sw.set_active(False)
     sw.offer(_eye_result("left", 0.2))

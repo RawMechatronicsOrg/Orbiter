@@ -213,6 +213,10 @@ class ScanFrame:
     pose_gap_deg: float = float("nan")
     pose_gap_mm: float = float("nan")
     pose_rms_px: float = float("nan")
+    #: How far off the left's instant the right frame was, ms, and what
+    #: `timealign` did about it.
+    sync_gap_ms: float = float("nan")
+    sync_note: str = ""
     #: Rolling shutter: the largest shift the per-row poses made to a kept
     #: point, the board's speed the twist implied, or why none was applied.
     rs_max_mm: float = 0.0

@@ -102,6 +102,24 @@ def test_a_still_pair_becomes_a_view_and_a_duplicate_does_not(board) -> None:
     assert note is None and len(flow.samples) == 1          # nothing new to see
 
 
+def test_a_pair_is_made_at_the_lefts_instant_when_no_right_frame_is_close(board) -> None:
+    """Left frames 16.5 ms from every right frame, the board creeping 0.8 px a
+    frame: still enough to capture, too fast for the drift gate at that gap.
+    The right eye is interpolated to the left's instant instead."""
+    flow = _flow(board)
+    pose = ((0.3, -0.2, 0.1), (0.0, 0.0, 0.5))
+    flow.offer(_result(board, "right", *pose, 1.000, shift_px=0.0))
+    flow.offer(_result(board, "left", *pose, 1.0165, shift_px=0.4))
+    flow.offer(_result(board, "right", *pose, 1.033, shift_px=0.8))
+    flow.offer(_result(board, "left", *pose, 1.0495, shift_px=1.2))
+    note = flow.offer(_result(board, "right", *pose, 1.066, shift_px=1.6))
+    assert note == "view 1", (note, flow.gate_report())
+    pair = flow.samples.paired()[0]
+    assert pair.right.capture_mono == 1.0495
+    expected = _result(board, "right", *pose, 1.0495, shift_px=1.2).board.corners
+    assert np.allclose(pair.right.corners, expected, atol=1e-3)
+
+
 def test_the_gate_report_names_what_stops_a_view(board) -> None:
     flow = _flow(board)
     pose = ((0.3, -0.2, 0.1), (0.0, 0.0, 0.5))
@@ -144,8 +162,11 @@ def test_a_pair_is_judged_by_the_board_it_saw_not_by_the_clock(board) -> None:
     for i in range(4):
         sliding.offer(_result(board, "left", *pose, 1.000 + 0.033 * i, shift_px=6.0 * i))
         sliding.offer(_result(board, "right", *pose, 1.012 + 0.033 * i, shift_px=6.0 * i))
-    # 6 px a frame is 180 px/s: 2 px of board across the same 12 ms gap.
-    assert sliding._find_pair() == (None, None)
+    # 6 px a frame is 180 px/s: 2 px of board across the same 12 ms gap. No
+    # real pair is simultaneous enough, so the right eye is brought to the
+    # left's instant instead — and what refuses the view is the motion itself.
+    a, b = sliding._find_pair()
+    assert a is not None and b.capture_mono == a.capture_mono
     assert len(sliding.samples) == 0
 
 

@@ -59,6 +59,8 @@ from .scan import ScanVolume
 from .rolling import MotionCollector, MotionView, Readout, solve_readout
 from .stereo import StereoResult
 from .stereo import calibrate as solve_stereo
+from .intrinsics import describe as _describe
+from .timealign import interpolate_corners
 
 log = logging.getLogger("orbiter_native.calibflow")
 
@@ -226,6 +228,24 @@ def _better(new_count: int, new_res: float, old: Saved | None) -> bool:
     if new_res < old.residual:
         return True
     return new_count > old.count and new_res <= old.floor * WORSE_TOLERANCE
+
+
+@dataclass
+class _Corners:
+    corners: np.ndarray
+    ids: np.ndarray
+
+
+@dataclass
+class _Synthetic:
+    """A right-eye result made at the left's instant by `timealign` — the
+    fields `_capture` reads from a real one."""
+
+    side: str
+    board: _Corners
+    descriptor: Any
+    wh: tuple[int, int]
+    capture_mono: float
 
 
 class CalibrationFlow:
@@ -421,7 +441,16 @@ class CalibrationFlow:
 
     def _best_pair(self):
         """The closest left/right results in the capture clock, as
-        `(gap_s, left, right)`, or None while either eye has nothing recent."""
+        `(gap_s, left, right)`, or None while either eye has nothing recent.
+
+        When the closest real pair would be refused — too far apart in the
+        clock, or the board slid too far between the two exposures — the
+        right eye is instead brought to the newest left's instant by
+        interpolating between the two right frames that bracket it
+        (`timealign`), and that synthetic pair has no gap at all. What the
+        gates measure is the board's motion between the two exposures; a
+        view made AT the left's exposure has none.
+        """
         left, right = self._recent["left"], self._recent["right"]
         if not left or not right:
             # Deliberately not "whichever eye has something": the history is
@@ -439,7 +468,38 @@ class CalibrationFlow:
                 gap = abs(a.capture_mono - b.capture_mono)
                 if best is None or gap < best[0]:
                     best = (gap, a, b)
+        if (best is not None and best[0] <= PAIR_MAX_GAP_S
+                and self._drift_px(best[0]) <= PAIR_MOVE_PX):
+            return best
+        synthetic = self._bracketed_right(left[-1])
+        if synthetic is not None:
+            return (0.0, left[-1], synthetic)
         return best
+
+    def _bracketed_right(self, a):
+        """The right eye at the left result `a`'s instant: its corners
+        interpolated between the two right results that bracket that instant,
+        both with the board in view. None when there is no such bracket."""
+        if a.capture_mono is None or self.board is None:
+            return None
+        rights = [r for r in self._recent["right"]
+                  if r.capture_mono is not None and r.board is not None
+                  and r.board.corners is not None]
+        before = [r for r in rights if r.capture_mono <= a.capture_mono]
+        after = [r for r in rights if r.capture_mono >= a.capture_mono]
+        if not before or not after:
+            return None
+        r0, r1 = before[-1], after[0]
+        fit = interpolate_corners(r0.board.corners, r0.board.ids, r0.capture_mono,
+                                  r1.board.corners, r1.board.ids, r1.capture_mono,
+                                  a.capture_mono)
+        if fit is None:
+            return None
+        corners, ids = fit
+        descriptor = _describe(corners, ids, self.board, r1.wh)
+        if descriptor is None:
+            return None
+        return _Synthetic("right", _Corners(corners, ids), descriptor, r1.wh, a.capture_mono)
 
     def _find_pair(self):
         best = self._best_pair()

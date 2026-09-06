@@ -44,8 +44,10 @@ from .scan import (
     write_ply,
 )
 from .stereo import StereoRig, compose_left_pose, result_from_config
+from .timealign import align_right
 from .worker import EyeResult, Latest
-from .cvcore import build_board, refine_pose_pair
+from .cvcore import build_board, estimate_pose, refine_pose_pair
+from dataclasses import replace
 from scipy.spatial.transform import Rotation
 
 log = logging.getLogger("orbiter_native.scanworker")
@@ -280,6 +282,9 @@ class ScanWorker:
         self._prev: tuple[PoseFix, float, float] | None = None
         #: When either eye last offered a board pose.
         self._pose_at = -1e9
+        #: The right result the last pair used: it brackets the next left
+        #: instant from below when no older right is left in the history.
+        self._last_right: ScanInput | None = None
         # Consecutive frames of a still board, averaged before they join the
         # cloud; the pose they are still against is the first one's.
         self._batch: list[ScanFrame] = []
@@ -359,6 +364,7 @@ class ScanWorker:
                 for q in self._hist.values():
                     q.clear()
                 self._prev = None
+                self._last_right = None
                 # The next session starts its own batch: kept, this pose
                 # would be what the first frame of that session is judged
                 # still against.
@@ -460,13 +466,20 @@ class ScanWorker:
                     log.exception("scan frame raised; continuing")
 
     def _take_pair(self):
-        """The oldest left result that has a partner, with that partner.
+        """The oldest left result that has a partner, with that partner and
+        the right result on the far side of the left's instant — what
+        `timealign` interpolates against — or None for that when there is
+        none.
 
-        Both are removed, along with everything older on either side — those
-        could only have paired with results already gone. A left without a
-        partner is kept waiting while one could still arrive, that is while the
-        newest right is not yet later than the left plus the window; once it
-        is, that left has been passed over and is skipped.
+        The pair is removed, along with everything older on either side —
+        those could only have paired with results already gone; the far-side
+        right stays, it is the next pair's partner. A left without a partner
+        is kept waiting while one could still arrive, that is while the newest
+        right is not yet later than the left plus the window; once it is, that
+        left has been passed over and is skipped. A left whose partner came
+        BEFORE it also waits for the right frame after it — one frame at most,
+        and only while no newer left says time has moved on — because that
+        frame is what brings the partner to the left's instant.
         """
         with self._lock:
             left, right = self._hist["left"], self._hist["right"]
@@ -477,18 +490,27 @@ class ScanWorker:
                     if gap <= PAIR_WINDOW_S and (best is None or gap < best[0]):
                         best = (gap, j)
                 if best is not None:
-                    b = right[best[1]]
+                    j = best[1]
+                    b = right[j]
+                    if b.capture_mono >= a.capture_mono:
+                        other = right[j - 1] if j >= 1 else self._last_right
+                    else:
+                        other = right[j + 1] if j + 1 < len(right) else None
+                        if (other is None
+                                and left[-1].capture_mono - a.capture_mono <= PAIR_WINDOW_S):
+                            return None  # the frame that would bracket it may still come
                     for _ in range(i + 1):
                         left.popleft()
-                    for _ in range(best[1] + 1):
+                    for _ in range(j + 1):
                         right.popleft()
-                    return a, b, self._cfg, self._params
+                    self._last_right = b
+                    return a, b, other, self._cfg, self._params
                 if not right or right[-1].capture_mono <= a.capture_mono + PAIR_WINDOW_S:
                     return None          # its partner may still be on the way
             return None
 
-    def _process(self, a: ScanInput, b: ScanInput, cfg: RigConfig | None,
-                 params: ScanParams) -> None:
+    def _process(self, a: ScanInput, b: ScanInput, other: ScanInput | None,
+                 cfg: RigConfig | None, params: ScanParams) -> None:
         rig, plane, readout, board = self._geometry(cfg, a.wh, b.wh)
         if rig is None:
             self._publish(None, "no pair calibration for this frame size — "
@@ -497,6 +519,20 @@ class ScanWorker:
         if a.stripe is None or b.stripe is None:
             self._publish(None, "laser detector is off")
             return
+        # The right eye at the left's instant: corners and stripe interpolated
+        # against the right frame on the far side, and the right's own pose
+        # re-solved through the moved corners, so every comparison below —
+        # the joint pose, the veto — is between two views of one moment.
+        aligned = align_right(a.capture_mono, b, other)
+        if aligned.corners is not b.corners:
+            pose = (estimate_pose(aligned.corners, aligned.ids, board, rig.right_k, b.board_R)
+                    if board is not None else None)
+            b = replace(b, stripe=aligned.stripe, corners=aligned.corners, ids=aligned.ids,
+                        capture_mono=a.capture_mono,
+                        board_R=pose[0] if pose is not None else b.board_R,
+                        board_t=pose[1] if pose is not None else b.board_t)
+        elif aligned.stripe is not b.stripe:
+            b = replace(b, stripe=aligned.stripe)
         fix = fuse_pose(a, b, rig, board)
         if fix is None:
             self._prev = None
@@ -509,6 +545,7 @@ class ScanWorker:
                            motion=motion, rs_note=note)
         frame.pose_source, frame.pose_rms_px = fix.source, fix.rms_px
         frame.pose_gap_deg, frame.pose_gap_mm = fix.gap_deg, fix.gap_mm
+        frame.sync_gap_ms, frame.sync_note = aligned.gap_ms, aligned.note
         if frame.n_kept and a.bgr is not None:
             frame.colours = sample_beside(a.bgr, frame.pixels_left, frame.along_x,
                                           params.colour_offset_px, a.wh)

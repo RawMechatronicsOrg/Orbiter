@@ -223,6 +223,8 @@ class ScanPanel(QFrame):
                              f"{f.pose_gap_mm:.1f} mm · {fit}")
             elif f.pose_source:
                 lines.append(f"pose    {f.pose_source} eye only")
+            if f.sync_note:
+                lines.append(f"sync    {f.sync_note}")
             if f.veto_px == f.veto_px:            # not NaN
                 lines.append(f"veto    the eyes disagree by {f.veto_px:+.1f} px "
                              f"about where the stripe is")

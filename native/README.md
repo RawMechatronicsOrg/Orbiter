@@ -434,6 +434,21 @@ dropped, and a batch ends where the stripe's axis flips. Noise falls by about th
 of the batch; motion flushes it at once. The SCAN
 panel shows `still ×N` while a batch is held.
 
+**The right eye is brought to the left eye's instant.** The cameras free-run:
+camserver stamps both from one clock, so the gap inside a pair is known — a
+median of 7-13 ms here, up to half a frame — but nothing holds them in phase
+and nothing can. Whatever moves in that gap is seen by the right eye a little
+later or earlier than by the left, and every comparison across the eyes would
+carry the shift. So before anything is compared the right eye's observations
+are interpolated to the left's instant between the two right frames that
+bracket it (`timealign`): the board corners per id, the stripe per scanline,
+and the right's own pose re-solved through the moved corners. The joint pose
+and the veto then compare two views of one moment; the SCAN panel's `sync`
+line says how far off the raw frame was and what was moved. Calibration does
+the same for a pair whose real frames are too far apart in the clock or slid
+too far between exposures. The left is the reference because its pixels are
+what is triangulated and its rows are what the readout correction times.
+
 **The board pose comes from whichever eye sees the board.** Points are placed
 in the board's frame through one pose per pair: the left eye's, the right
 eye's carried across through the pair's geometry, or — when both see the
