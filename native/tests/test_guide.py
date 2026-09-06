@@ -16,7 +16,6 @@ from orbiter_native.cvcore import BoardSpec, build_board
 from orbiter_native.detect import BoardHit
 from orbiter_native.guide import (
     GRID,
-    K_CELLS,
     K_VIEWS,
     PAIR_SCALE_SPREAD,
     PAIR_VIEWS,
@@ -28,7 +27,7 @@ from orbiter_native.guide import (
     pair_scale_spread,
     place_name,
 )
-from orbiter_native.intrinsics import MIN_TILT_SPREAD, EyeView, PairSample, ViewDescriptor
+from orbiter_native.intrinsics import EyeView, PairSample, ViewDescriptor
 from orbiter_native.orient import Orientation
 
 WH = (1280, 720)
@@ -102,7 +101,8 @@ def _frame(side: str, t: float, cx: float | None = 0.5, cy: float = 0.5, shift: 
 def test_the_stage_is_the_first_one_not_done(board) -> None:
     flow, guide = _flow(board), Guide()
     p = guide.update(flow)
-    assert (p.stage, p.step, p.solo, flow.solo) == ("left", 1, "left", None)   # the window copies it
+    assert (p.stage, p.solo, flow.solo) == ("left", "left", None)   # the window copies it
+    assert p.title.startswith("STEP 1/6")
     assert "LEFT CAMERA" in p.title and p.eye == "left"
     _lens_done(flow, "left")
     p = guide.update(flow)
@@ -132,9 +132,11 @@ def test_a_lens_stage_needs_coverage_and_tilt_not_just_a_count(board) -> None:
 
 def test_the_check_reads_the_switches_and_the_scans_veto(board) -> None:
     flow, guide = _flow(board), Guide()
-    for fill in (lambda: _lens_done(flow, "left"), lambda: _lens_done(flow, "right"),
-                 lambda: _pair_done(flow), lambda: _plane_done(flow), lambda: _readout_done(flow)):
-        fill()
+    _lens_done(flow, "left")
+    _lens_done(flow, "right")
+    _pair_done(flow)
+    _plane_done(flow)
+    _readout_done(flow)
     p = guide.update(flow, laser_on=False)
     assert p.stage == "check" and p.tone == "stop" and "laser line" in p.action
     p = guide.update(flow, laser_on=True, scanning=False)
@@ -355,6 +357,21 @@ def test_the_solo_gate_waits_with_a_live_partner_instead_of_saying_ok(board) -> 
     assert flow.gate()[0] == "ok"                                # so the view is this eye's alone
 
 
+def test_a_sparse_detection_of_the_solo_eye_is_neither_a_view_nor_a_duplicate(board) -> None:
+    """Below four matched corners `describe` gives no descriptor — routine at
+    the frame's edges, where a lens stage sends the board. Such a frame must
+    not become a one-eyed view of the OTHER eye, nor read as a duplicate."""
+    flow = _flow(board)
+    flow.solo = "left"
+    for t in (1.0, 1.033, 1.066):
+        flow.offer(_frame("right", t, 0.5, 0.5))
+        sparse = _frame("left", t + 0.002, 0.05, 0.5)
+        sparse.descriptor = None
+        flow.offer(sparse)
+    assert len(flow.samples) == 0
+    assert flow.gate()[0] == "wait" and "fuller left" in flow.gate_report()
+
+
 def test_the_solo_gate_only_asks_its_own_eye(board) -> None:
     flow = _flow(board)
     flow.solo = "right"
@@ -426,11 +443,12 @@ def test_back_and_next_pin_the_stage_and_it_only_moves_forward(board) -> None:
     guide.back()
     assert guide.update(flow).stage == "right"
     _lens_done(flow, "right")
-    assert guide.update(flow).stage == "pair"                       # done: forward on its own
+    _pair_done(flow)
+    assert guide.update(flow).stage == "plane"                      # done stages passed in one go
     _lens_done(flow, "left")
-    assert guide.update(flow).stage == "pair"                       # never back by itself
+    assert guide.update(flow).stage == "plane"                      # never back by itself
     guide.restart()
-    assert guide.update(flow).stage == "pair" and not guide.pinned  # first not done
+    assert guide.update(flow).stage == "plane" and not guide.pinned  # first not done
     for _ in range(len(STAGES) + 2):
         guide.next()
     assert guide.stage == "check"
@@ -495,7 +513,7 @@ def test_the_banner_shows_the_prompt_in_its_tone(board) -> None:
     assert "<u>1 LEFT</u>" in banner.steps.text()
     assert "#4a3406" in banner.styleSheet()                          # amber: adjust
     from orbiter_native.guide import Prompt
-    banner.set_prompt(Prompt("check", 6, "STEP 6/6", "READY", "", "done"))
+    banner.set_prompt(Prompt("check", "STEP 6/6", "READY", "", "done"))
     assert "#0e2c4a" in banner.styleSheet() and "<u>6 CHECK</u>" in banner.steps.text()
     fired = []
     banner.toggled.connect(fired.append)

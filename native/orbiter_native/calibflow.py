@@ -50,13 +50,11 @@ from .intrinsics import (
     EyeView,
     PairSample,
     SampleSet,
-    SolveResult,
 )
 from .intrinsics import solve as solve_intrinsics
 from .laserplane import LaserPlane, PlaneCollector
 from .scan import ScanVolume
-from .rolling import MotionCollector, MotionView, Readout, solve_readout
-from .stereo import StereoResult
+from .rolling import MotionCollector, MotionView, solve_readout
 from .stereo import calibrate as solve_stereo
 from .intrinsics import describe as _describe
 from .timealign import interpolate_corners
@@ -397,9 +395,8 @@ class CalibrationFlow:
         moved = self._movement(res)
         board = res.board
         has_board = board is not None and board.corners is not None
-        self._last_desc[res.side] = getattr(res, "descriptor", None) if has_board else None
-        line = getattr(res, "laser", None)
-        self._last_stripe_ok[res.side] = bool(line is not None and line.ok)
+        self._last_desc[res.side] = res.descriptor if has_board else None
+        self._last_stripe_ok[res.side] = bool(res.laser is not None and res.laser.ok)
         notes = []
         if has_board:
             self._recent[res.side].append(res)
@@ -594,6 +591,9 @@ class CalibrationFlow:
                              f"over {PAIR_MOVE_PX:g}: hold stiller")
         if solo is not None:
             d = (a if solo == "left" else b).descriptor
+            if d is None:
+                # Too few corners to describe: not a duplicate, not a view yet.
+                return "wait", f"waiting for a fuller {solo} detection"
             if self.samples.novelty(solo, d) < self.samples.novelty_threshold:
                 return "dup", (f"still, nothing new for the {solo} eye: a new place in the "
                                "frame or a new tilt")
@@ -625,6 +625,8 @@ class CalibrationFlow:
         if not self._recent[side]:
             return "wait", f"waiting for the next {side} frame"
         d = self._recent[side][-1].descriptor
+        if d is None:
+            return "wait", f"waiting for a fuller {side} detection"
         if self.samples.novelty(side, d) < self.samples.novelty_threshold:
             return "dup", (f"still, nothing new for the {side} eye: a new place in the frame "
                            "or a new tilt")
@@ -698,11 +700,13 @@ class CalibrationFlow:
                                   r.descriptor, capture_mono=r.capture_mono)
         if views["left"] is None and views["right"] is None:
             return 0
-        own = views.get(self.solo) if self.solo is not None else None
-        if not force and own is not None:
+        if not force and self.solo is not None:
             # A lens stage: new for THIS eye, or it is a duplicate for the
-            # solve the stage is for, whatever the other eye is seeing.
-            if self.samples.novelty(self.solo, own.descriptor) < self.samples.novelty_threshold:
+            # solve the stage is for, whatever the other eye is seeing — and
+            # a frame of this eye too sparse to describe is no view of it.
+            own = views.get(self.solo)
+            if own is None or (self.samples.novelty(self.solo, own.descriptor)
+                               < self.samples.novelty_threshold):
                 return 0
         elif not force and not self.samples.is_new(
                 views["left"].descriptor if views["left"] else None,

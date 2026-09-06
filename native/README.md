@@ -259,8 +259,8 @@ to: the least-visited cell nearest to where the board is, so the sweep is a
 path across the frame rather than a jump to its far corner each time, named
 as the monitor shows it whatever way the eye is turned. The stage is the
 first one not done, found afresh every quarter second — the pair after
-**Rig moved**, a lens whose re-solve was refused, take the guide back to
-them; **Back** and **Next** pin a stage the operator chose, which then only
+**Rig moved**, a lens whose tilt variety fell under the solver's floor,
+take the guide back to them; **Back** and **Next** pin a stage the operator chose, which then only
 moves forward. **Clear** starts the guide over.
 
 A lens stage is done at 30 views over 24 of the 36 cells with tilt variety

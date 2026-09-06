@@ -83,8 +83,6 @@ class Prompt:
     """One stage's instruction, as the banner and the eye views show it."""
 
     stage: str
-    #: 1-based, of `len(STAGES)`.
-    step: int
     title: str
     #: The big line: what to do this instant.
     action: str
@@ -100,6 +98,8 @@ class Prompt:
     target: tuple[float, float, float, float] | None = None
     #: The eye whose own lens stage this is — what `flow.solo` should be.
     solo: str | None = None
+    #: The check stage's "ready": every other stage is left behind the
+    #: moment it is done, so no prompt of theirs carries it.
     done: bool = False
 
 
@@ -108,10 +108,10 @@ class Guide:
 
     Unpinned (the start, and after `restart`), the stage is the first one
     not done, found afresh on every `update`: a stage that stops being done
-    — the pair after 'Rig moved', a lens whose re-solve was refused — takes
-    the operator back to it. `back` and `next` pin the stage the operator
-    chose; a pinned stage still moves forward when it is done, and never
-    back.
+    — the pair after 'Rig moved', a lens whose tilt variety fell under the
+    floor — takes the operator back to it. `back` and `next` pin the stage
+    the operator chose; a pinned stage still moves forward when it is done,
+    and never back.
     """
 
     def __init__(self) -> None:
@@ -146,12 +146,12 @@ class Guide:
         is down — no board instruction helps those."""
         frames = frames or {}
         if flow.board is None:
-            return Prompt(self.stage, self.index + 1, "CALIBRATION GUIDE",
+            return Prompt(self.stage, "CALIBRATION GUIDE",
                           "NO BOARD SPEC FROM THE SERVER — SET THE BOARD IN THE WEB UI",
                           "", "stop")
         done = {s: self._done(s, flow) for s in STAGES}
         if self.pinned:
-            if done[self.stage] and self.index < len(STAGES) - 1:
+            while done[self.stage] and self.index < len(STAGES) - 1:
                 self.index += 1
         else:
             self.index = next(i for i, s in enumerate(STAGES) if not done[s])   # check never is
@@ -202,8 +202,7 @@ class Guide:
     # ── the stages ────────────────────────────────────────────────────────
 
     def _prompt(self, stage: str, action: str, detail: str, tone: str, **kw) -> Prompt:
-        return Prompt(stage, STAGES.index(stage) + 1,
-                      f"STEP {STAGES.index(stage) + 1}/{len(STAGES)} · {_TITLES[stage]}",
+        return Prompt(stage, f"STEP {STAGES.index(stage) + 1}/{len(STAGES)} · {_TITLES[stage]}",
                       action, detail, tone, **kw)
 
     def _lens(self, flow, side: str, frame) -> Prompt:
@@ -218,7 +217,7 @@ class Guide:
         tilt_short = tilt < MIN_TILT_SPREAD and n >= 2
         need_tilt = ", TILTED" if tilt_short else ""
         target, place = self._target(flow, side, frame, skip_current=gate == "dup")
-        tone, done = "adjust", self._done(side, flow)
+        tone = "adjust"
         if gate == "board":
             action = f"SHOW THE BOARD TO THE {cam}"
         elif gate in ("settling", "wait"):
@@ -237,8 +236,6 @@ class Guide:
             action = (f"LENS REFUSED: {reason.upper()} — MORE VIEWS, HELD STILLER" if reason
                       else "HOLD ON — SOLVING THE LENS…")
             tone = "adjust" if reason else "go"
-        elif done:
-            action, tone = f"LENS DONE — NEXT: {place}", "done"
         elif n >= K_VIEWS and cells >= K_CELLS:
             action = "TILT THE BOARD MORE — HOLD STILL AT EACH TILT"
         else:
@@ -251,8 +248,7 @@ class Guide:
             fx = float(res.intrinsics.K[0, 0])
             sig = res.sigma_f_px / fx * 100.0 if fx > 0 and np.isfinite(res.sigma_f_px) else float("nan")
             detail += f" · f ±{sig:.2f} % · {'saved' if flow.is_saved(key) else 'not saved'}"
-        return self._prompt(side, action, detail, tone, eye=side, target=target,
-                            solo=side, done=done)
+        return self._prompt(side, action, detail, tone, eye=side, target=target, solo=side)
 
     def _pair(self, flow) -> Prompt:
         paired = flow.samples.paired()
@@ -281,8 +277,6 @@ class Guide:
             action = (f"PAIR REFUSED: {reason.upper()} — MORE PAIRS" if reason
                       else "HOLD ON — SOLVING THE PAIR…")
             tone = "adjust" if reason else "go"
-        elif self._done("pair", flow):
-            action, tone = "PAIR DONE — MORE PAIRS ONLY REFINE IT", "done"
         else:
             action = ("CHANGE THE DISTANCE — EVERY PAIR SO FAR IS AT ONE RANGE" if one_range
                       else "NEW PLACE, TILT OR DISTANCE — BOTH CAMERAS ON THE BOARD")
@@ -290,8 +284,7 @@ class Guide:
         if res is not None:
             detail += (f" · rms {res.rms_px:.2f} px · baseline {res.baseline_mm:.0f} mm · "
                        f"{'saved' if flow.is_saved('stereo') else 'not saved'}")
-        return self._prompt("pair", action, detail, tone, eye="both",
-                            done=self._done("pair", flow))
+        return self._prompt("pair", action, detail, tone, eye="both")
 
     def _plane(self, flow, laser_on: bool) -> Prompt:
         frames, pts = flow.plane.frames, len(flow.plane)
@@ -311,16 +304,13 @@ class Guide:
             action = (f"SHEET REFUSED: {reason.upper()} — MORE POSES" if reason
                       else "HOLD ON — SOLVING THE SHEET…")
             tone = "adjust" if reason else "go"
-        elif self._done("plane", flow):
-            action, tone = "SHEET DONE — MORE POSES ONLY REFINE IT", "done"
         else:
             action, tone = "GOOD — HOLD… THEN A NEW TILT OR DISTANCE", "go"
         detail = f"poses {frames}/{PLANE_FRAMES} · {pts} pts"
         if res is not None:
             detail += (f" · rms {res.rms_mm:.2f} mm · d {res.d:.1f} mm · "
                        f"{'saved' if flow.is_saved('plane') else 'not saved'}")
-        return self._prompt("plane", action, detail, tone, eye="left",
-                            done=self._done("plane", flow))
+        return self._prompt("plane", action, detail, tone, eye="left")
 
     def _readout(self, flow) -> Prompt:
         c = {s: flow.motion.count(s) for s in ("left", "right")}
@@ -332,8 +322,7 @@ class Guide:
             action, tone = "HOLD ON — SOLVING THE READOUT…", "go"
         detail = (f"L {c['left']}/{READOUT_VIEWS} · R {c['right']}/{READOUT_VIEWS} frames · "
                   "optional — NEXT skips it")
-        return self._prompt("readout", action, detail, tone, eye="both",
-                            done=self._done("readout", flow))
+        return self._prompt("readout", action, detail, tone, eye="both")
 
     def _check(self, flow, laser_on: bool, scanning: bool, veto_px, kept: int) -> Prompt:
         tone, done = "adjust", False

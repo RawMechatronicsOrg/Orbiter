@@ -32,6 +32,16 @@ def test_the_guide_is_wired_through_the_main_window() -> None:
         title, action = win.banner.title.text(), win.banner.action.text()
         assert action and ("STEP" in title or "CALIBRATION" in title)
         assert "BOARD SPEC" in action                          # no server: no board
+        assert win.calib.flow.solo is None
+        # With a board the first stage is the left lens, and the window is
+        # what carries that into the flow — the one line joining the two.
+        import cv2
+        from orbiter_native.cvcore import BoardSpec, build_board
+        spec = BoardSpec(8, 8, 36.0, 26.64, cv2.aruco.DICT_5X5_100)
+        win.calib.flow.set_board(spec, build_board(spec))
+        win._guide_tick()
+        assert win.calib.flow.solo == "left" and "STEP 1/6" in win.banner.title.text()
+        assert win.panels["left"].view._highlight and not win.panels["right"].view._highlight
         # Navigation reaches the guide and re-ticks without raising.
         win._guide_next()
         win._guide_back()
