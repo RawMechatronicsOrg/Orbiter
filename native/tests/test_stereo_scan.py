@@ -221,6 +221,9 @@ def test_scan_points_remember_their_left_pixel() -> None:
     back = _project(KL, np.eye(3), np.zeros(3), out.points_camera)
     assert np.abs(back - out.pixels_left).max() < 1e-3
     assert out.colours is None                              # the worker fills these
+    # And its precision weight, from the depth it was seen at.
+    assert out.weights.shape == (out.n_kept,)
+    assert np.allclose(out.weights, (300.0 / out.points_camera[:, 2]) ** 4)
 
 
 def test_scan_vetoes_what_the_right_eye_did_not_see() -> None:

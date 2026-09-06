@@ -33,12 +33,15 @@ from .laserplane import LaserPlane, from_config as plane_from_config
 from .rolling import Motion, Readout
 from .scan import (
     CloudOverlay,
+    Confident,
     PointCloud,
     ScanFrame,
     ScanParams,
+    confident,
     sample_beside,
     scan_frame,
     stripe_rows,
+    write_ply,
 )
 from .stereo import StereoRig, compose_left_pose, result_from_config
 from .worker import EyeResult, Latest
@@ -104,21 +107,30 @@ def average_still(frames: list[ScanFrame]) -> tuple[np.ndarray, np.ndarray | Non
     keeps only 70% of it). A scanline seen once in five is a flicker, not a
     surface.
 
-    Returns `(points, colours)`. The colours go through the same trimmed
-    mean, channel by channel, when every frame of the batch carried them;
-    a batch with a colourless frame in it gives None — half a colour is
-    worse than none.
+    Returns `(points, colours, weights)`. The colours and the precision
+    weights go through the same trimmed mean, column by column, when every
+    frame of the batch carried them; a batch with a colourless frame in it
+    gives None for the colours — half a colour is worse than none — and a
+    frame without weights (an older ScanFrame) makes every weight 1.
     """
     coloured = all(f.colours is not None for f in frames)
+    weighted = all(len(f.weights) == len(f.points_board) for f in frames)
+
+    def one_weight(f: ScanFrame) -> np.ndarray:
+        return f.weights if weighted else np.ones(len(f.points_board))
+
     if len(frames) == 1:
-        return frames[0].points_board, (frames[0].colours if coloured else None)
+        f = frames[0]
+        return f.points_board, (f.colours if coloured else None), one_weight(f)
     keys = np.concatenate([f.scanlines for f in frames])
     pts = np.concatenate([f.points_board for f in frames])
+    pts = np.concatenate([pts, np.concatenate([one_weight(f) for f in frames])[:, None]], axis=1)
     if coloured:
         rgb = np.concatenate([f.colours for f in frames]).astype(np.float64)
         pts = np.concatenate([pts, rgb], axis=1)
     if not len(keys):
-        return np.empty((0, 3)), (np.empty((0, 3), np.uint8) if coloured else None)
+        return (np.empty((0, 3)), (np.empty((0, 3), np.uint8) if coloured else None),
+                np.empty(0))
     order = np.argsort(keys, kind="stable")
     keys, pts = keys[order], pts[order]
     uniq, start, counts = np.unique(keys, return_index=True, return_counts=True)
@@ -134,9 +146,10 @@ def average_still(frames: list[ScanFrame]) -> tuple[np.ndarray, np.ndarray | Non
     keep = np.where(trim, (ranks >= 1) & (ranks <= counts[:, None] - 2), ranks < counts[:, None])
     weights = keep.astype(np.float64)[:, :, None]
     out = np.nansum(table * weights, axis=1) / weights.sum(axis=1)
+    xyz, w = out[:, :3], out[:, 3]
     if not coloured:
-        return out, None
-    return out[:, :3], np.clip(np.rint(out[:, 3:]), 0, 255).astype(np.uint8)
+        return xyz, None, w
+    return xyz, np.clip(np.rint(out[:, 4:]), 0, 255).astype(np.uint8), w
 
 
 @dataclass
@@ -225,6 +238,12 @@ class ScanStatus:
     frame: ScanFrame | None = None
     #: A blocking condition — no calibration, no board, laser off.
     note: str | None = None
+    #: The confident cloud (see `scan.confident`): how many points it has,
+    #: and how many voxels were dropped as lonely or as flickers. -1 while
+    #: cleaning is off.
+    n_confident: int = -1
+    n_lonely: int = 0
+    n_flicker: int = 0
 
 
 class ScanWorker:
@@ -270,6 +289,56 @@ class ScanWorker:
         self.overlay = CloudOverlay()
         #: Newest counters; the GUI takes them on its own clock.
         self.status = Latest()
+        # The confident cloud, built from the grid when it changed and the
+        # last build has had time to pay for itself: (grid version, the
+        # cleaning parameters, the result, when, how long it took).
+        self._clean: tuple[int, tuple, Confident, float, float] | None = None
+
+    # ── the confident cloud ───────────────────────────────────────────────
+
+    @staticmethod
+    def _clean_key(p: ScanParams) -> tuple:
+        return (p.clean_merge_mm, p.clean_cell_mm, p.clean_neighbours, p.clean_flicker_obs)
+
+    def _confident(self, params: ScanParams, force: bool = False) -> Confident | None:
+        """The confident cloud for the grid as it stands, or None with
+        cleaning off. Rebuilt when the grid or the parameters changed, and
+        no more often than three times its own cost — a million voxels take
+        a few hundred milliseconds, and the scan thread has frames to pair.
+        `force` rebuilds regardless: an export wants the grid as it is."""
+        if not params.clean:
+            return None
+        key = self._clean_key(params)
+        now = time.monotonic()
+        with self._cloud_lock:
+            version = self.cloud.version
+            cached = self._clean
+            if cached is not None and cached[0] == version and cached[1] == key:
+                return cached[2]
+            if (cached is not None and cached[1] == key and not force
+                    and now - cached[3] < 3.0 * cached[4]):
+                return cached[2]                            # stale, but paid for
+            pts = self.cloud.points().copy()
+            cnt = self.cloud.counts().copy()
+            wts = self.cloud.weights().copy()
+            rgb = self.cloud.colors()
+            rgb = None if rgb is None else rgb.copy()
+        out = confident(pts, cnt, rgb, params.clean_merge_mm, params.clean_cell_mm,
+                        params.clean_neighbours, params.clean_flicker_obs, weights=wts)
+        with self._cloud_lock:
+            self._clean = (version, key, out, now, time.monotonic() - now)
+        return out
+
+    def _snapshot(self, params: ScanParams) -> tuple[np.ndarray, np.ndarray | None]:
+        """What the eyes and the cloud view draw: the confident cloud when
+        cleaning is on, every voxel otherwise, decimated to OVERLAY_MAX."""
+        clean = self._confident(params)
+        if clean is None:
+            with self._cloud_lock:
+                return self.cloud.snapshot(OVERLAY_MAX)
+        stride = max(1, -(-len(clean.points) // OVERLAY_MAX))
+        rgb = clean.colours
+        return clean.points[::stride].copy(), (None if rgb is None else rgb[::stride].copy())
 
     # ── configuration (GUI thread) ────────────────────────────────────────
 
@@ -296,8 +365,7 @@ class ScanWorker:
                 self._batch_pose = None
                 spilled = self._take_batch()
         if self._merge(spilled):
-            with self._cloud_lock:
-                snap = self.cloud.snapshot(OVERLAY_MAX)
+            snap = self._snapshot(self._params)
         if snap is not None:
             # The batch's points joined the cloud; the eyes and the panel
             # must see them even though no pair follows.
@@ -312,13 +380,20 @@ class ScanWorker:
             self._offered_left = 0
         with self._cloud_lock:
             self.cloud.clear()
-            snap = self.cloud.snapshot(OVERLAY_MAX)
-        self.overlay.publish(*snap)
+            self._clean = None
+        self.overlay.publish(*self._snapshot(self._params))
         self._publish(None, None)
 
     def export(self, path: str) -> int:
-        with self._cloud_lock:
-            return self.cloud.write_ply(path)
+        """The cloud as shown: confident when cleaning is on, every voxel
+        otherwise."""
+        with self._lock:
+            params = self._params
+        clean = self._confident(params, force=True)
+        if clean is None:
+            with self._cloud_lock:
+                return self.cloud.write_ply(path)
+        return write_ply(path, clean.points, clean.colours)
 
     # ── input (detector threads) ──────────────────────────────────────────
 
@@ -444,8 +519,7 @@ class ScanWorker:
         # Deliberately outside that lock: `offer` takes it on both detector
         # threads, and a voxel merge under it stalls both eyes every pair.
         if self._merge(spilled):
-            with self._cloud_lock:
-                snap = self.cloud.snapshot(OVERLAY_MAX)
+            snap = self._snapshot(params)
         if snap is not None:
             self.overlay.publish(*snap)
         self._publish(frame, None)
@@ -487,11 +561,11 @@ class ScanWorker:
         offer lock."""
         if not frames:
             return False
-        pts, rgb = average_still(frames)
+        pts, rgb, w = average_still(frames)
         if not len(pts):
             return False
         with self._cloud_lock:
-            self.cloud.add(pts, rgb)
+            self.cloud.add(pts, rgb, w)
         return True
 
     def _motion(self, a: ScanInput, fix: PoseFix, readout: Readout | None):
@@ -557,7 +631,11 @@ class ScanWorker:
     def _publish(self, frame: ScanFrame | None, note: str | None) -> None:
         with self._cloud_lock:
             n, bounds = len(self.cloud), self.cloud.bounds()
+            clean = self._clean[2] if self._clean is not None else None
         with self._lock:
             st = ScanStatus(n, bounds, self._pairs,
                             self._offered_left, len(self._batch), frame, note)
+            if self._params.clean and clean is not None:
+                st.n_confident = len(clean.points)
+                st.n_lonely, st.n_flicker = clean.n_lonely, clean.n_flicker
         self.status.put(st)

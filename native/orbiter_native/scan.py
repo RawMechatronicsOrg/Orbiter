@@ -144,6 +144,18 @@ class ScanParams:
     #: strobed off-frame (BACKLOG) would make this exact; until then 8 px
     #: clears the 4-10 px stripes this rig produces with room to spare.
     colour_offset_px: float = 8.0
+    #: Show and export the CONFIDENT cloud rather than every voxel — see
+    #: `confident`: a voxel with fewer than `clean_neighbours` other voxels
+    #: within a `clean_cell_mm` cell of it is lonely (a glint, a hand), a
+    #: voxel seen once where its neighbours were seen `clean_flicker_obs`
+    #: times or more is a flicker the passes never confirmed, and what
+    #: survives is merged on `clean_merge_mm` voxels, each weighted by how
+    #: often it was seen.
+    clean: bool = True
+    clean_merge_mm: float = 1.0
+    clean_cell_mm: float = 2.0
+    clean_neighbours: int = 3
+    clean_flicker_obs: int = 3
     volume: ScanVolume = field(default_factory=ScanVolume)
 
 
@@ -165,6 +177,9 @@ class ScanFrame:
     #: RGB per kept point, uint8, read beside the stripe by the scan worker
     #: - or None while no colour image came with the frame.
     colours: np.ndarray | None = None
+    #: How much each kept point is worth against others of the same place:
+    #: its precision, from the depth it was seen at (`precision_weights`).
+    weights: np.ndarray = field(default_factory=lambda: np.empty(0, np.float64))
     #: Scanlines (columns or rows) holding any stripe in the left eye.
     n_scanlines: int = 0
     #: Which of the two `scanlines` counts along: columns when True, rows
@@ -357,6 +372,27 @@ def _not_a_jump(xyz_cam: np.ndarray, scan: np.ndarray, jump_mm: float) -> np.nda
     return keep
 
 
+#: The depth a point's weight is 1 at; nearer points weigh more, farther less.
+Z_REF_MM = 300.0
+
+
+def precision_weights(xyz_cam: np.ndarray) -> np.ndarray:
+    """One weight per camera-frame point: how much to trust it against
+    others that land in the same place.
+
+    A ray meeting the sheet: a pixel of error across the stripe moves the
+    point along the ray by about Z² / (f·d) — twice the depth, four times
+    the error. Inverse variance is then (Z_REF / Z)⁴: a point seen at
+    150 mm outweighs one seen at 450 mm eighty-one to one, so a close pass
+    over a surface overrides what a far pass left there, and the far pass
+    still stands wherever nothing closer came. Depth is floored at 50 mm,
+    a place nothing is scanned from, so a stray candidate cannot swamp a
+    voxel."""
+    xyz = np.asarray(xyz_cam, np.float64).reshape(-1, 3)
+    z = np.maximum(xyz[:, 2], 50.0)
+    return (Z_REF_MM / z) ** 4
+
+
 def sample_beside(bgr: np.ndarray, pixels: np.ndarray, along_x: bool,
                   offset_px: float, wh: tuple[int, int]) -> np.ndarray:
     """The surface's colour at each stripe point, read BESIDE the stripe.
@@ -493,6 +529,7 @@ def scan_frame(
         points_board=xyz_board[inside],
         points_camera=xyz_cam[inside],
         pixels_left=pix[inside],
+        weights=precision_weights(xyz_cam[inside]),
         scanlines=scan[smooth][inside].astype(np.int64) if len(scan) else np.empty(0, np.int64),
         n_scanlines=n_lines,
         along_x=bool(left.along_x),
@@ -541,16 +578,23 @@ class PointCloud:
         # million points, and that sat under the lock the detector threads
         # take to offer frames.
         self._index: dict[int, int] = {}
+        # Positions are a WEIGHTED mean: each point counts for its precision
+        # (`precision_weights`), so a close pass overrides a far one; `_count`
+        # stays the plain number of hits, which is what "seen once" means.
         self._sum = np.empty((0, 3), np.float64)
+        self._wsum = np.empty(0, np.float64)
         self._count = np.empty(0, np.int64)
         self._mean = np.empty((0, 3), np.float64)
-        # Colour alongside, with a count of its own: a sweep that carried no
-        # colour image must not darken a voxel a coloured sweep lit.
+        # Colour alongside, with a weight sum of its own: a sweep that
+        # carried no colour image must not darken a voxel a coloured one lit.
         self._csum = np.empty((0, 3), np.float64)
-        self._ccount = np.empty(0, np.int64)
+        self._cwsum = np.empty(0, np.float64)
         self._rgb = np.empty((0, 3), np.uint8)
         self._coloured = False
         self._n = 0
+        #: Bumped by every add and clear: what tells a cache built from
+        #: `points()` that it is stale.
+        self.version = 0
         self._lo = np.full(3, np.inf)
         self._hi = np.full(3, -np.inf)
 
@@ -574,16 +618,21 @@ class PointCloud:
             grown = np.zeros((cap, 3), dtype)
             grown[: self._n] = getattr(self, name)[: self._n]
             setattr(self, name, grown)
-        for name in ("_count", "_ccount"):
-            count = np.zeros(cap, np.int64)
-            count[: self._n] = getattr(self, name)[: self._n]
-            setattr(self, name, count)
+        for name, dtype in (("_count", np.int64), ("_wsum", np.float64),
+                            ("_cwsum", np.float64)):
+            grown = np.zeros(cap, dtype)
+            grown[: self._n] = getattr(self, name)[: self._n]
+            setattr(self, name, grown)
 
-    def add(self, pts: np.ndarray, rgb: np.ndarray | None = None) -> None:
-        """Merge points, and their (N, 3) uint8 colours when there are any."""
+    def add(self, pts: np.ndarray, rgb: np.ndarray | None = None,
+            weights: np.ndarray | None = None) -> None:
+        """Merge points, their (N, 3) uint8 colours when there are any, and
+        their weights (`precision_weights`; 1 each when not given)."""
         if not len(pts):
             return
         pts = np.asarray(pts, np.float64).reshape(-1, 3)
+        w = (np.ones(len(pts)) if weights is None
+             else np.maximum(np.asarray(weights, np.float64).ravel(), 1e-12))
         keys = self._keys(pts)
         uniq, first, inverse = np.unique(keys, return_index=True, return_inverse=True)
         # In order of first appearance, so a cloud of distinct points reads
@@ -592,7 +641,8 @@ class PointCloud:
         uniq = uniq[order]
         inverse = np.argsort(order)[inverse]
         sums = np.zeros((len(uniq), 3))
-        np.add.at(sums, inverse, pts)
+        np.add.at(sums, inverse, pts * w[:, None])
+        wsums = np.bincount(inverse, weights=w, minlength=len(uniq))
         counts = np.bincount(inverse, minlength=len(uniq))
         rows = np.array([self._index.get(int(k), -1) for k in uniq])
         fresh = rows < 0
@@ -604,24 +654,27 @@ class PointCloud:
                 self._index[int(k)] = start + offset
             rows[fresh] = start + np.arange(n_new)
             self._sum[start: start + n_new] = 0.0
+            self._wsum[start: start + n_new] = 0.0
             self._count[start: start + n_new] = 0
             self._csum[start: start + n_new] = 0.0
-            self._ccount[start: start + n_new] = 0
+            self._cwsum[start: start + n_new] = 0.0
             self._rgb[start: start + n_new] = 0
             self._n += n_new
         self._sum[rows] += sums
+        self._wsum[rows] += wsums
         self._count[rows] += counts
-        self._mean[rows] = self._sum[rows] / self._count[rows, None]
+        self._mean[rows] = self._sum[rows] / self._wsum[rows, None]
         if rgb is not None:
             csums = np.zeros((len(uniq), 3))
-            np.add.at(csums, inverse, np.asarray(rgb, np.float64).reshape(-1, 3))
+            np.add.at(csums, inverse, np.asarray(rgb, np.float64).reshape(-1, 3) * w[:, None])
             self._csum[rows] += csums
-            self._ccount[rows] += counts
+            self._cwsum[rows] += wsums
             self._rgb[rows] = np.clip(
-                np.rint(self._csum[rows] / self._ccount[rows, None]), 0, 255)
+                np.rint(self._csum[rows] / self._cwsum[rows, None]), 0, 255)
             self._coloured = True
         np.minimum(self._lo, pts.min(axis=0), out=self._lo)
         np.maximum(self._hi, pts.max(axis=0), out=self._hi)
+        self.version += 1
 
     def clear(self) -> None:
         self._index.clear()
@@ -629,11 +682,21 @@ class PointCloud:
         self._coloured = False
         self._lo[:] = np.inf
         self._hi[:] = -np.inf
+        self.version += 1
 
     def points(self) -> np.ndarray:
         """One point per voxel: the mean of what fell in it. A view — copy
         before keeping it across an `add`."""
         return self._mean[: self._n]
+
+    def counts(self) -> np.ndarray:
+        """How many points fell into each voxel — how often it was seen. A
+        view, like `points()`."""
+        return self._count[: self._n]
+
+    def weights(self) -> np.ndarray:
+        """The precision behind each voxel: the sum of its points' weights."""
+        return self._wsum[: self._n]
 
     def colors(self) -> np.ndarray | None:
         """RGB per voxel, uint8: the mean of what was read beside the stripe
@@ -665,27 +728,133 @@ class PointCloud:
 
     def write_ply(self, path: str) -> int:
         """Write a binary little-endian PLY, one point per voxel. Returns the
-        point count. Binary because an ASCII writer loops in Python: a million
-        points took seconds, on the GUI thread, behind the Export button."""
-        p = np.ascontiguousarray(self.points().astype("<f4"))
-        rgb = self.colors()
-        props = "property float x\nproperty float y\nproperty float z\n"
-        if rgb is None:
-            body = p.tobytes()
-        else:
-            # red/green/blue as uchar: what every viewer, and `read_ply`, expects.
-            props += "property uchar red\nproperty uchar green\nproperty uchar blue\n"
-            rec = np.empty(len(p), dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
-                                          ("red", "u1"), ("green", "u1"), ("blue", "u1")])
-            rec["x"], rec["y"], rec["z"] = p[:, 0], p[:, 1], p[:, 2]
-            rec["red"], rec["green"], rec["blue"] = rgb[:, 0], rgb[:, 1], rgb[:, 2]
-            body = rec.tobytes()
-        header = ("ply\nformat binary_little_endian 1.0\n"
-                  f"element vertex {len(p)}\n" + props + "end_header\n")
-        with open(path, "wb") as f:
-            f.write(header.encode("ascii"))
-            f.write(body)
-        return len(p)
+        point count."""
+        return write_ply(path, self.points(), self.colors())
+
+
+def write_ply(path: str, points: np.ndarray, rgb: np.ndarray | None = None) -> int:
+    """Write (N, 3) points, and (N, 3) uint8 colours when given, as a binary
+    little-endian PLY. Returns the point count. Binary because an ASCII
+    writer loops in Python: a million points took seconds, on the GUI
+    thread, behind the Export button."""
+    p = np.ascontiguousarray(np.asarray(points, np.float64).reshape(-1, 3).astype("<f4"))
+    props = "property float x\nproperty float y\nproperty float z\n"
+    if rgb is None:
+        body = p.tobytes()
+    else:
+        # red/green/blue as uchar: what every viewer, and `read_ply`, expects.
+        props += "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+        rgb = np.asarray(rgb, np.uint8).reshape(-1, 3)
+        rec = np.empty(len(p), dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+                                      ("red", "u1"), ("green", "u1"), ("blue", "u1")])
+        rec["x"], rec["y"], rec["z"] = p[:, 0], p[:, 1], p[:, 2]
+        rec["red"], rec["green"], rec["blue"] = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+        body = rec.tobytes()
+    header = ("ply\nformat binary_little_endian 1.0\n"
+              f"element vertex {len(p)}\n" + props + "end_header\n")
+    with open(path, "wb") as f:
+        f.write(header.encode("ascii"))
+        f.write(body)
+    return len(p)
+
+
+@dataclass
+class Confident:
+    """The cloud a viewer should trust — merged a step coarser, the lonely
+    and the unconfirmed dropped — and how many went."""
+
+    points: np.ndarray
+    colours: np.ndarray | None
+    #: How many observations stand behind each point.
+    obs: np.ndarray
+    n_lonely: int = 0
+    n_flicker: int = 0
+
+
+def _cell_keys(pts: np.ndarray, size_mm: float) -> np.ndarray:
+    """One integer per point naming its `size_mm` cell — `PointCloud._keys`
+    at any size."""
+    ijk = np.floor(pts / size_mm).astype(np.int64) + (1 << 20)
+    return (ijk[:, 0] << 42) | (ijk[:, 1] << 21) | ijk[:, 2]
+
+
+def confident(points: np.ndarray, counts: np.ndarray, colours: np.ndarray | None = None,
+              merge_mm: float = 1.0, cell_mm: float = 2.0, min_neighbours: int = 3,
+              flicker_obs: int = 3, weights: np.ndarray | None = None) -> Confident:
+    """Which voxels to trust, merged a step coarser.
+
+    A scan passes the same surface many times, and the voxel grid keeps a
+    count of how often each voxel was hit. Two kinds of voxel are not the
+    subject:
+
+      * **lonely** — fewer than `min_neighbours` other voxels within the
+        3×3×3 block of `cell_mm` cells around it. A surface is never one
+        voxel; a glint, a hand, a bounced reflection is.
+      * **flicker** — seen once, where the voxels around it were seen
+        `flicker_obs` times or more on average. The passes that confirmed
+        its neighbours went past it and did not see it again: the point was
+        never there. A voxel seen once in a region only swept once is not a
+        flicker, just young, and is kept.
+
+    What survives is merged on `merge_mm` cells, each voxel weighted by
+    `weights` — its precision (`PointCloud.weights`), or its count when no
+    weights are given — so a surface the 0.5 mm grid renders as a fuzz two
+    or three voxels thick reads back as one confident point, placed where
+    the close passes put it, with its observations added up. All of it is
+    bincounts and one sort; a million voxels take a fraction of a second.
+    """
+    pts = np.asarray(points, np.float64).reshape(-1, 3)
+    cnt = np.asarray(counts, np.float64).ravel()
+    wts = cnt if weights is None else np.maximum(np.asarray(weights, np.float64).ravel(), 1e-12)
+    none_rgb = None if colours is None else np.empty((0, 3), np.uint8)
+    if not len(pts):
+        return Confident(np.empty((0, 3)), none_rgb, np.empty(0, np.int64))
+
+    key = _cell_keys(pts, cell_mm)
+    uniq, inv = np.unique(key, return_inverse=True)
+    inv = inv.ravel()
+    vox = np.bincount(inv).astype(np.float64)
+    obs = np.bincount(inv, weights=cnt)
+    nb_vox = np.zeros(len(uniq))
+    nb_obs = np.zeros(len(uniq))
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dz in (-1, 0, 1):
+                shifted = uniq + ((dx << 42) + (dy << 21) + dz)
+                j = np.minimum(np.searchsorted(uniq, shifted), len(uniq) - 1)
+                hit = uniq[j] == shifted
+                nb_vox += np.where(hit, vox[j], 0.0)
+                nb_obs += np.where(hit, obs[j], 0.0)
+    others = nb_vox[inv] - 1.0                              # not counting itself
+    around = (nb_obs[inv] - cnt) / np.maximum(others, 1.0)  # how often they were seen
+    lonely = others < min_neighbours
+    flicker = ~lonely & (cnt <= 1.0) & (around >= flicker_obs)
+    keep = ~(lonely | flicker)
+    n_lonely, n_flicker = int(lonely.sum()), int(flicker.sum())
+    if not keep.any():
+        return Confident(np.empty((0, 3)), none_rgb, np.empty(0, np.int64), n_lonely, n_flicker)
+
+    p, c, wk = pts[keep], cnt[keep], wts[keep]
+    mkey = _cell_keys(p, merge_mm)
+    muniq, first, minv = np.unique(mkey, return_index=True, return_inverse=True)
+    # First-appearance order, like the grid itself, so a cloud reads back
+    # the way it was scanned.
+    order = np.argsort(first, kind="stable")
+    rank = np.empty_like(order)
+    rank[order] = np.arange(len(order))
+    minv = rank[minv.ravel()]
+    m = len(muniq)
+    w = np.bincount(minv, weights=wk, minlength=m)
+    obs = np.bincount(minv, weights=c, minlength=m)
+    merged = np.column_stack([np.bincount(minv, weights=p[:, i] * wk, minlength=m)
+                              for i in range(3)]) / w[:, None]
+    rgb = None
+    if colours is not None:
+        col = np.asarray(colours, np.float64).reshape(-1, 3)[keep]
+        rgb = np.column_stack([np.bincount(minv, weights=col[:, i] * wk, minlength=m)
+                               for i in range(3)]) / w[:, None]
+        rgb = np.clip(np.rint(rgb), 0, 255).astype(np.uint8)
+    return Confident(merged, rgb, np.rint(obs).astype(np.int64), n_lonely, n_flicker)
 
 
 _PLY_TYPES = {

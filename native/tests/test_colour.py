@@ -88,8 +88,9 @@ def _sf(scan, pts, rgb=None) -> ScanFrame:
 def test_still_average_carries_colour_with_the_points() -> None:
     frames = [_sf([1, 2], [[0, 0, 0], [10, 10, 10]], [[10, 20, 30], [200, 200, 200]]),
               _sf([1, 2], [[2, 0, 0], [10, 12, 10]], [[30, 20, 10], [200, 200, 200]])]
-    pts, rgb = average_still(frames)
+    pts, rgb, w = average_still(frames)
     assert pts.tolist() == [[1, 0, 0], [10, 11, 10]]
+    assert w.tolist() == [1.0, 1.0]                         # frames without weights
     assert rgb.tolist() == [[20, 20, 20], [200, 200, 200]]
     # One frame without colour: the batch has no colour to give.
     frames[1].colours = None

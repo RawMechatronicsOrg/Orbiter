@@ -79,7 +79,7 @@ def test_average_still_cuts_noise_and_drops_flickers() -> None:
         one = _frame(rng, 1.0)
         batch = [_frame(rng, 1.0) for _ in range(STILL_BATCH)]
         single = np.linalg.norm(one.points_board - truth, axis=1).std()
-        averaged, _ = average_still(batch)
+        averaged, _, _ = average_still(batch)
         assert len(averaged) == 200
         gains.append(single / np.linalg.norm(averaged - truth, axis=1).std())
     assert np.median(gains) > 1.8, gains
@@ -225,7 +225,7 @@ def test_a_glint_in_one_frame_of_five_does_not_move_the_average() -> None:
     batch[2].points_board[50] += [0.0, 0.0, 40.0]           # one frame, one glint
     truth = np.column_stack([np.arange(200) * 3.0, np.zeros(200),
                              100.0 + 20.0 * np.sin(np.arange(200) / 30.0)])
-    averaged, _ = average_still(batch)
+    averaged, _, _ = average_still(batch)
     assert abs(averaged[50, 2] - truth[50, 2]) < 0.5      # a mean would be 8 mm off
 
 

@@ -122,6 +122,31 @@ class ScanPanel(QFrame):
             w.valueChanged.connect(self._push_params)
         root.addLayout(box)
 
+        clean_row = QHBoxLayout()
+        self.clean = QCheckBox("clean, merge to")
+        self.clean.setToolTip(
+            "Show and export the confident cloud rather than every voxel: a voxel "
+            "with fewer than three neighbours within 2 mm is a glint or a hand; "
+            "a voxel seen once where its neighbours were seen three times or "
+            "more is a flicker the later passes never confirmed. What survives "
+            "is merged on cells of the size beside, each voxel weighted by its "
+            "precision — a point seen from close outweighs one seen from far."
+        )
+        self.clean.setChecked(ScanParams().clean)
+        self.clean.toggled.connect(self._push_params)
+        clean_row.addWidget(self.clean)
+        self.merge_mm = QDoubleSpinBox()
+        self.merge_mm.setRange(0.5, 5.0)
+        self.merge_mm.setSingleStep(0.5)
+        self.merge_mm.setValue(ScanParams().clean_merge_mm)
+        self.merge_mm.setSuffix(" mm")
+        self.merge_mm.setToolTip("Cell size of the confident cloud. Larger is quieter and "
+                                 "loses detail; the point noise is about 1 mm at 400 mm.")
+        self.merge_mm.valueChanged.connect(self._push_params)
+        clean_row.addWidget(self.merge_mm)
+        clean_row.addStretch(1)
+        root.addLayout(clean_row)
+
         row = QHBoxLayout()
         self.btn_clear = QPushButton("Clear cloud")
         self.btn_clear.clicked.connect(self._scanner.clear)
@@ -143,7 +168,8 @@ class ScanPanel(QFrame):
 
     def params(self) -> ScanParams:
         lo, hi = sorted((self.reach_lo.value(), self.reach_hi.value()))
-        return ScanParams(range_mm=(lo, hi),
+        return ScanParams(range_mm=(lo, hi), clean=self.clean.isChecked(),
+                          clean_merge_mm=self.merge_mm.value(),
                           volume=ScanVolume(height_mm=self.height_mm.value(),
                                             radius_mm=self.radius_mm.value(),
                                             floor_mm=self.floor_mm.value()))
@@ -179,6 +205,9 @@ class ScanPanel(QFrame):
             lo, hi = st.bounds
             lines.append(f"extent  x {lo[0]:+.0f}..{hi[0]:+.0f}  "
                          f"y {lo[1]:+.0f}..{hi[1]:+.0f}  z {lo[2]:+.0f}..{hi[2]:+.0f} mm")
+        if st.n_confident >= 0:
+            lines.append(f"clean   {st.n_confident} confident · dropped {st.n_lonely} lonely, "
+                         f"{st.n_flicker} unconfirmed")
         f = st.frame
         if st.note:
             lines.append(f"frame   — {st.note}")
