@@ -339,8 +339,8 @@ class MainWindow(QMainWindow):
             self._gpu_label.hide()
             return
         text = (f"OpenGL draws on {renderer}, this monitor is on {adapter}: every "
-                f"frame is copied between the two GPUs. Move the window to a "
-                f"{renderer} monitor, or make this monitor the primary display.")
+                f"frame is copied between the two GPUs. Move the window to a monitor "
+                f"on {renderer}, or make this monitor the primary display.")
         if self._gpu_label.text() != "⚠ " + text:
             log.warning(text)
         self._gpu_label.setText("⚠ " + text)
