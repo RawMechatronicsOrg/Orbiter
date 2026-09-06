@@ -696,13 +696,14 @@ def _qmat4(m: np.ndarray) -> QMatrix4x4:
 
 
 class _FullscreenCloud(QWidget):
-    """The cloud alone on the whole screen.
+    """The cloud alone in a big window of its own — maximised, but a normal
+    window: a frame, a title, movable and resizable, so it can share the
+    screen with anything else.
 
     A second CloudView fed the same arrays, not the panel's view moved out: a
     QOpenGLWidget reparented into another top-level window loses its GL
     context and rebuilds it, and the dance around that is worse than one more
-    context that lives only while the screen is taken. Esc or F11 gives the
-    screen back.
+    context that lives only while the window is open. Esc or F11 closes it.
     """
 
     def __init__(self, panel: "CloudPanel") -> None:
@@ -715,7 +716,7 @@ class _FullscreenCloud(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
         root.addWidget(self.view, 1)
-        hint = QLabel("Esc or F11 to come back · drag to turn · wheel to zoom · "
+        hint = QLabel("Esc or F11 to close · drag to turn · wheel to zoom · "
                       "right-drag to pan · double-click to fit")
         hint.setStyleSheet(
             "color:#8b9aac; font-family:Consolas; font-size:10px; padding:2px 8px;")
@@ -796,8 +797,9 @@ class CloudPanel(QFrame):
         self.btn_png.setToolTip("Save the view as drawn to a PNG.")
         self.btn_png.clicked.connect(self._save_png)
         row2.addWidget(self.btn_png)
-        self.btn_full = QPushButton("Full screen")
-        self.btn_full.setToolTip("The cloud alone on the whole screen (F11); Esc comes back.")
+        self.btn_full = QPushButton("Big window")
+        self.btn_full.setToolTip("The cloud alone in a maximised window of its own (F11); "
+                                 "Esc or F11 closes it.")
         self.btn_full.clicked.connect(self.expand)
         row2.addWidget(self.btn_full)
         row2.addStretch(1)
@@ -850,7 +852,7 @@ class CloudPanel(QFrame):
         self.hint.setText(f"saved {Path(path).name}" if ok else f"could not write {path}")
 
     def expand(self) -> None:
-        """The cloud on the whole screen — or back, if it already is."""
+        """The cloud in a big window of its own — or closed, if it is open."""
         if self._big is not None:
             self._big.close()
             return
@@ -859,9 +861,12 @@ class CloudPanel(QFrame):
         big.view.set_spinning(self.spin.isChecked())
         screen = self.screen()
         if screen is not None:
-            big.move(screen.geometry().topLeft())       # the screen this panel is on
+            # On the screen this panel is on, then maximised there: a normal
+            # window with a frame, not the screen taken over.
+            big.move(screen.availableGeometry().topLeft())
+            big.resize(screen.availableGeometry().size())
         self._big = big
-        big.showFullScreen()
+        big.showMaximized()
 
     def _fullscreen_closed(self, big: "_FullscreenCloud") -> None:
         if self._big is big:

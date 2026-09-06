@@ -518,10 +518,11 @@ average colours the way they average positions, the PLY carries them as
 own colour, the height shading, or whichever is there. Until the laser is
 strobed (BACKLOG) this is the room's light on the surface beside the stripe,
 not under it, so a white next to a red stripe comes out slightly warm.
-**spin** turns the cloud on its own; **PNG** saves the view as drawn; **Full
-screen** (F11, Esc back) gives the cloud the whole screen in a second view fed
-the same arrays; the view is multisampled, so points and the board's lines
-stop crawling as it turns.
+**spin** turns the cloud on its own; **PNG** saves the view as drawn; **Big
+window** (F11; Esc or F11 closes) gives the cloud a maximised window of its
+own — a normal one, with a frame — in a second view fed the same arrays; the
+view is multisampled, so points and the board's lines stop crawling as it
+turns.
 
 **shade** draws every point as a small lit sphere: the fragment shader gives
 each sprite fragment the depth of the sphere's surface there (`gl_FragDepth`),
