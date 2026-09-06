@@ -376,14 +376,16 @@ class CalibrationFlow:
             line.inlier_points, k, board.R, board.t, line.rms_px,
             corners=board.corners, ids=board.ids, wh=res.wh))
 
-    def _find_pair(self):
+    def _best_pair(self):
+        """The closest left/right results in the capture clock, as
+        `(gap_s, left, right)`, or None while either eye has nothing recent."""
         left, right = self._recent["left"], self._recent["right"]
         if not left or not right:
             # Deliberately not "whichever eye has something": the history is
             # cleared after every capture, so the next result would always find
             # the other side empty and be stored one-eyed — and the stereo
             # solve needs the paired ones.
-            return None, None
+            return None
         best = None
         for a in left:
             if a.capture_mono is None:
@@ -394,6 +396,10 @@ class CalibrationFlow:
                 gap = abs(a.capture_mono - b.capture_mono)
                 if best is None or gap < best[0]:
                     best = (gap, a, b)
+        return best
+
+    def _find_pair(self):
+        best = self._best_pair()
         if best is None or best[0] > PAIR_MAX_GAP_S:
             return None, None
         if self._drift_px(best[0]) > PAIR_MOVE_PX:
@@ -412,6 +418,44 @@ class CalibrationFlow:
     def _still(self, side: str) -> bool:
         m = self._moved.get(side)
         return m is not None and m <= STILL_PX
+
+    def gate_report(self) -> str:
+        """Why the automatic capture is not taking a view right now: the first
+        gate the current frames fail, in the order `_capture` applies them.
+
+        From the outside every gate looks the same — the view count does not
+        move — and an operator waving the board sees nothing to correct. Which
+        eye, and by how many pixels, is the difference between "hold still"
+        and knowing that the right eye has never seen the board at all.
+        """
+        if self.board is None:
+            return "no board spec from the server"
+        if len(self.samples) >= MAX_VIEWS:
+            return f"{MAX_VIEWS} views held, the ceiling"
+        absent = [s for s in ("left", "right") if self._last_corners.get(s) is None]
+        if absent:
+            return ("no board in either eye" if len(absent) == 2
+                    else f"no board in the {absent[0]} eye: a view needs both")
+        if any(self._moved.get(s) is None for s in ("left", "right")):
+            return "settling: stillness is measured over two frames"
+        moving = [s for s in ("left", "right") if not self._still(s)]
+        if moving:
+            return ("moving " + ", ".join(f"{s} {self._moved[s]:.1f} px" for s in moving)
+                    + f": hold still, under {STILL_PX:g} px per frame")
+        best = self._best_pair()
+        if best is None:
+            return "waiting for the next frame of both eyes"
+        gap, a, b = best
+        if gap > PAIR_MAX_GAP_S:
+            return (f"eyes {gap * 1000:.0f} ms apart, over {PAIR_MAX_GAP_S * 1000:.0f}: "
+                    "waiting for a closer pair")
+        drift = self._drift_px(gap)
+        if drift > PAIR_MOVE_PX:
+            return (f"board slides {drift:.2f} px between the eyes' exposures, "
+                    f"over {PAIR_MOVE_PX:g}: hold stiller")
+        if not self.samples.is_new(a.descriptor, b.descriptor):
+            return "still and paired, nothing new: a new place in the frame or a new tilt"
+        return "taking a view"
 
     def capture(self) -> int:
         """Manual capture: whatever is there, still or not. Returns the count."""

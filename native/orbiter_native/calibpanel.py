@@ -220,6 +220,15 @@ class CalibrationPanel(QFrame):
             "color:#ffd166; font-family:Consolas; font-size:11px;")
         root.addWidget(self.advice)
 
+        # The automatic capture's gates, live: from the outside every one of
+        # them looks the same — the view count does not move — and "hold it
+        # still" is only actionable when it says which eye and by how much.
+        self.gate = QLabel("")
+        self.gate.setWordWrap(True)
+        self.gate.setStyleSheet(
+            "color:#8b9aac; font-family:Consolas; font-size:11px;")
+        root.addWidget(self.gate)
+
         self.report = QLabel("")
         self.report.setWordWrap(True)
         self.report.setStyleSheet(
@@ -322,6 +331,8 @@ class CalibrationPanel(QFrame):
         self.scoreboard.setText("\n".join(flow.scoreboard()))
         self.advice.setText(flow.advice() if flow.board is not None
                             else "no board spec from the server")
+        self.gate.setText("capture: " + (flow.gate_report() if self.auto.isChecked()
+                                         else "continuous capture is off"))
         status = self._activity
         if self._solving_since is not None:
             status = f"solving… {time.monotonic() - self._solving_since:.0f} s" \

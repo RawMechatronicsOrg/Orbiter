@@ -102,6 +102,33 @@ def test_a_still_pair_becomes_a_view_and_a_duplicate_does_not(board) -> None:
     assert note is None and len(flow.samples) == 1          # nothing new to see
 
 
+def test_the_gate_report_names_what_stops_a_view(board) -> None:
+    flow = _flow(board)
+    pose = ((0.3, -0.2, 0.1), (0.0, 0.0, 0.5))
+    assert flow.gate_report() == "no board in either eye"
+    flow.offer(_result(board, "left", *pose, 1.000))
+    assert flow.gate_report() == "no board in the right eye: a view needs both"
+    flow.offer(_result(board, "right", *pose, 1.000))
+    assert flow.gate_report().startswith("settling")
+    # Second frames; the left eye's board has shifted 3 px: moving.
+    flow.offer(_result(board, "left", *pose, 1.033, shift_px=3.0))
+    flow.offer(_result(board, "right", *pose, 1.033))
+    assert flow.gate_report().startswith("moving left 3.0 px"), flow.gate_report()
+    # Still again: the pair is taken, on whichever eye's frame completes it.
+    flow.offer(_result(board, "left", *pose, 1.066, shift_px=3.0))
+    flow.offer(_result(board, "right", *pose, 1.066))
+    assert len(flow.samples) == 1
+    # The capture cleared the history; a lone far-apart pair is the clock.
+    flow.offer(_result(board, "left", *pose, 2.000, shift_px=3.0))
+    flow.offer(_result(board, "right", *pose, 2.030))
+    assert flow.gate_report().startswith("eyes 30 ms apart"), flow.gate_report()
+    # A close pair of the pose already held is nothing new.
+    flow.offer(_result(board, "left", *pose, 3.000, shift_px=3.0))
+    flow.offer(_result(board, "right", *pose, 3.000))
+    assert len(flow.samples) == 1
+    assert "nothing new" in flow.gate_report(), flow.gate_report()
+
+
 def test_a_pair_is_judged_by_the_board_it_saw_not_by_the_clock(board) -> None:
     """The cameras free-run and the offset between the eyes walks: a fixed few
     millisecond window takes nothing for tens of seconds at a stretch. A board
