@@ -231,6 +231,7 @@ class MainWindow(QMainWindow):
             spin = QSpinBox()
             spin.setRange(EXPOSURE_MIN, 2000)
             spin.setSingleStep(10)
+            spin.setSpecialValueText("—")            # the minimum stands for "not known yet"
             spin.setToolTip(f"Exposure time of the {side} camera, in 0.1 ms steps "
                             "(100 = 10 ms; 330 is a whole frame at 30 fps).")
             spin.setEnabled(not self.exposure.auto)
@@ -442,8 +443,10 @@ class MainWindow(QMainWindow):
         self._exposure_syncing = True
         try:
             for side, eye in snap.items():
-                if eye.target is not None and self._exp_spin[side].value() != eye.target:
-                    self._exp_spin[side].setValue(eye.target)
+                spin = self._exp_spin[side]
+                want = spin.minimum() if eye.target is None else eye.target
+                if spin.value() != want and (eye.target is not None or self._exp_auto.isChecked()):
+                    spin.setValue(want)
         finally:
             self._exposure_syncing = False
         now = time.monotonic()
