@@ -150,7 +150,7 @@ def _plane():
 
 #: These tests are about the veto, the sheet and the cylinder; the reach gate
 #: has its own tests, so it is opened wide here.
-WIDE = ScanParams(range_mm=(0.0, 1e9))
+WIDE = ScanParams(range_mm=(0.0, 1e9), stereo_refine=False)
 
 #: A board 600 mm out, facing the camera, its centre under the sheet: the
 #: centred, face-out frame `cvcore.estimate_pose` hands out.
@@ -588,3 +588,88 @@ def test_a_pose_that_is_not_a_rotation_is_neither_returned_nor_believed() -> Non
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(cvcore, "estimate_board_pose", lambda *a, **kw: nan_pose)
         assert estimate_pose(corners, ids, board, k) is None
+
+
+# ── the right eye's centroid in the depth ────────────────────────────────
+
+def _z_true(x):
+    return 500.0 + 30.0 * np.sin(x / 25.0)
+
+
+#: A pair whose baseline stands ACROSS the sheet, as on the real scanner
+#: (T ≈ (−2, 146, 23) mm): the right eye's stripe then moves with depth.
+#: `_rig()` has its baseline along x, parallel to the stripe, and the right
+#: eye's centroid says nothing about depth there.
+R_UP = cv2.Rodrigues(np.array([0.05, 0.0, 0.0]))[0]
+T_UP = np.array([0.0, -150.0, 20.0])
+
+
+def _rig_up(rms_px: float = 0.1) -> StereoRig:
+    from orbiter_native.stereo import StereoResult
+    return StereoRig(KL, KR, StereoResult(R=R_UP, T=T_UP, E=np.zeros((3, 3)), F=np.zeros((3, 3)),
+                                          rms_px=rms_px, n_views=40, wh=WH))
+
+
+def _shifted_left(rows: int):
+    """The left stripe as a clipped core reports it: every centroid `rows`
+    pixels off across the stripe — the sheet then puts every point off by
+    that many times Z²/(f·d)."""
+    left = _pixels(KL, np.eye(3), np.zeros(3), _curve(_z_true))
+    return StripePixels(x=left.x, y=left.y + rows, w=left.w, wh=left.wh, along_x=True,
+                        reason=None)
+
+
+def _depth_error(out) -> float:
+    x, _, z = out.points_camera.T
+    mid = np.abs(x) < 78.0
+    return float(np.sqrt(np.mean((z[mid] - _z_true(x[mid])) ** 2)))
+
+
+def test_the_right_eye_pulls_the_depth_back_when_the_pair_is_good() -> None:
+    rig, plane = _rig_up(), _plane()                       # pair rms 0.1 px
+    left = _shifted_left(1)
+    right = _pixels(KR, R_UP, T_UP, _curve(_z_true))
+    sheet_only = scan_frame(rig, plane, left, right, BOARD2_R, BOARD2_T, WIDE)
+    fused = scan_frame(rig, plane, left, right, BOARD2_R, BOARD2_T,
+                       ScanParams(range_mm=(0.0, 1e9)))
+    assert sheet_only.reason is None and fused.reason is None
+    assert sheet_only.refine_note == "off" and fused.refine_note is None
+    # One pixel across the stripe is Z²/(f·d) ≈ 3.8 mm of sheet depth here.
+    assert 3.0 < _depth_error(sheet_only) < 4.5
+    # The right eye sees the stripe where it is, but the stereo depth still
+    # carries the left pixel's error by Z²/(f·B): half of the sheet's, with
+    # B twice d here. With equal centroid noise and B = 2d the fusion is
+    # the stereo depth alone.
+    assert _depth_error(fused) < 0.6 * _depth_error(sheet_only)
+    assert fused.n_refined > 0.9 * fused.n_kept
+    assert fused.refine_share > 0.85
+    assert 1.5 < fused.refine_shift_mm < 4.0
+    # A baseline along the stripe has no depth in the right eye: nothing is done.
+    flat = scan_frame(_rig(), plane, left, _pixels(KR, R_TRUE, T_TRUE, _curve(_z_true)),
+                      BOARD2_R, BOARD2_T, ScanParams(range_mm=(0.0, 1e9)))
+    assert flat.n_refined == 0 and "epipolar" in flat.refine_note
+    # Points move along their own rays: the left pixel still owns them.
+    assert np.allclose(fused.pixels_left, sheet_only.pixels_left)
+
+
+def test_the_refinement_stays_out_when_it_cannot_be_trusted() -> None:
+    plane, left = _plane(), _shifted_left(1)
+    right = _pixels(KR, R_UP, T_UP, _curve(_z_true))
+    on = ScanParams(range_mm=(0.0, 1e9))
+    # A poorly calibrated pair: the gate keeps the sheet's depth.
+    poor = _rig_up(rms_px=2.3)
+    out = scan_frame(poor, plane, left, right, BOARD2_R, BOARD2_T, on)
+    assert out.n_refined == 0 and "pair rms 2.30 px over 1" in out.refine_note
+    assert 3.0 < _depth_error(out) < 4.5
+    # A right stripe that is somewhere else (a glint, the wrong blob): not used.
+    far = StripePixels(x=right.x, y=right.y + 30, w=right.w, wh=right.wh, along_x=True,
+                       reason=None)
+    out = scan_frame(_rig_up(), plane, left, far, BOARD2_R, BOARD2_T,
+                     ScanParams(range_mm=(0.0, 1e9), confirm_px=40))
+    assert out.n_refined == 0 and "within 6 px" in out.refine_note
+    # And the gate is the operator's to move.
+    out = scan_frame(poor, plane, left, right, BOARD2_R, BOARD2_T,
+                     ScanParams(range_mm=(0.0, 1e9), stereo_refine_max_rms_px=3.0))
+    assert out.n_refined > 0.9 * out.n_kept
+    # With a rms of 2.3 px counted as noise the right eye weighs much less.
+    assert out.refine_share < 0.4

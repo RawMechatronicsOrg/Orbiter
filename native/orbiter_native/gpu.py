@@ -221,10 +221,11 @@ def stripe_pixels(rgb, p: LaserParams = LaserParams(),
         return StripePixels(wh=(w, h), reason="no stripe above the redness threshold",
                             ms=(time.perf_counter() - t0) * 1000.0)
     weight = score[lit].round_().clamp_(0, 255).to(_torch.uint8)
+    red = rgb[0, y0:y1][yx[:, 0], yx[:, 1]].to(_torch.uint8)
     yx_cpu = yx.cpu().numpy()
     x = yx_cpu[:, 1].astype(np.int32)
     y = (yx_cpu[:, 0] + y0).astype(np.int32)
     along_x = bool((x.max() - x.min()) >= (y.max() - y.min()))
-    return StripePixels(x=x, y=y, w=weight.cpu().numpy(), wh=(w, h),
+    return StripePixels(x=x, y=y, w=weight.cpu().numpy(), r=red.cpu().numpy(), wh=(w, h),
                         along_x=along_x, reason=None,
                         ms=(time.perf_counter() - t0) * 1000.0)

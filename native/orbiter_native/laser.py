@@ -220,6 +220,11 @@ class StripePixels:
     x: np.ndarray = field(default_factory=lambda: np.empty(0, np.int32))
     y: np.ndarray = field(default_factory=lambda: np.empty(0, np.int32))
     w: np.ndarray = field(default_factory=lambda: np.empty(0, np.uint8))
+    #: The red channel under each pixel, when the producer had it: what says
+    #: whether the stripe's core is clipped at 255 — a stripe that saturates
+    #: has a flat score profile, and its centroid is guesswork. Empty when
+    #: not measured.
+    r: np.ndarray = field(default_factory=lambda: np.empty(0, np.uint8))
     wh: tuple[int, int] = (0, 0)
     #: True when the stripe runs mostly along x (scanlines are columns).
     along_x: bool = True
@@ -297,8 +302,40 @@ def find_stripe_pixels(bgr: np.ndarray, p: LaserParams = LaserParams(),
     xy = cv2.findNonZero(lit).reshape(-1, 2)
     return done(StripePixels(x=xy[:, 0].astype(np.int32),
                              y=(xy[:, 1] + y0).astype(np.int32),
-                             w=lit[xy[:, 1], xy[:, 0]], wh=(w, h),
+                             w=lit[xy[:, 1], xy[:, 0]],
+                             r=bgr[xy[:, 1] + y0, xy[:, 0], 2], wh=(w, h),
                              along_x=along_x, reason=None))
+
+
+#: A red value this high is the sensor's ceiling, as the JPEG hands it over.
+CLIP_R = 250
+
+
+def exposure_of(red: np.ndarray) -> tuple[float, float]:
+    """What the stripe says about the camera's exposure, from the red values
+    under its pixels: `(peak, clipped)` — the 90th percentile of red, and
+    the share of pixels at the ceiling. NaN, NaN without pixels.
+
+    The profile across a stripe is a Gaussian only while its top is below
+    255. Clipped, the top is flat and the score no longer knows where the
+    middle is; the centroid then wanders by a pixel or more, which on this
+    rig is more than a millimetre of depth. A peak in the low 200s is the
+    stripe at its brightest with the top still there."""
+    r = np.asarray(red).ravel()
+    if not len(r):
+        return float("nan"), float("nan")
+    return float(np.percentile(r, 90)), float(np.mean(r >= CLIP_R))
+
+
+def red_at(bgr: np.ndarray, points: np.ndarray) -> np.ndarray:
+    """The red channel at (N, 2) sub-pixel (x, y) points of a BGR frame."""
+    p = np.asarray(points, np.float64).reshape(-1, 2)
+    if not len(p):
+        return np.empty(0, np.uint8)
+    h, w = bgr.shape[:2]
+    x = np.clip(np.rint(p[:, 0]).astype(int), 0, w - 1)
+    y = np.clip(np.rint(p[:, 1]).astype(int), 0, h - 1)
+    return bgr[y, x, 2]
 
 
 #: Lit pixels this far apart across a scanline are still one run: a stripe

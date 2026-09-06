@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction
@@ -37,6 +38,7 @@ import httpx
 from .calibpanel import CalibrationPanel
 from .cloudview import CloudPanel
 from .config import ConfigClient, RigConfig
+from .exposure import EXPOSURE_MIN, ExposureKeeper
 from .guide import Guide
 from .guidepanel import GuideBanner
 from .laser import LaserParams
@@ -119,6 +121,13 @@ class MainWindow(QMainWindow):
         #: The scan's last frame while scanning, for the guide's check.
         self._scan_frame = None
 
+        # Each eye's exposure: steered by the stripe's brightness and set
+        # again whenever camserver reopens a device and forgets it.
+        self.exposure = ExposureKeeper(Path.home() / ".orbiter-native" / "exposure.json")
+        self.exposure.start()
+        #: The toolbar's spin boxes are being set from the keeper, not by hand.
+        self._exposure_syncing = False
+
         split = QSplitter(Qt.Orientation.Horizontal)
         split.addWidget(self.panels["left"])
         split.addWidget(self.panels["right"])
@@ -166,6 +175,10 @@ class MainWindow(QMainWindow):
         self._guide_timer.timeout.connect(self._guide_tick)
         self._guide_timer.start(_GUIDE_MS)
 
+        self._exposure_timer = QTimer(self)
+        self._exposure_timer.timeout.connect(self._exposure_tick)
+        self._exposure_timer.start(1000)
+
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll_config)
         self._timer.start(_CONFIG_POLL_MS)
@@ -201,6 +214,34 @@ class MainWindow(QMainWindow):
         bar.addWidget(self._threshold)
 
         bar.addSeparator()
+        self._exp_auto = QCheckBox("auto exposure")
+        self._exp_auto.setToolTip(
+            "Steer each camera's exposure time by the laser stripe: its red peak is "
+            "kept in the low 200s, bright but not clipped — a clipped stripe has a "
+            "flat profile and its centroid wanders by a pixel, more than a millimetre "
+            "of depth here. Off, the times beside are yours. Either way they are set "
+            "again when camserver reopens a camera and forgets them."
+        )
+        self._exp_auto.setChecked(self.exposure.auto)
+        self._exp_auto.toggled.connect(self._on_exposure_auto)
+        bar.addWidget(self._exp_auto)
+        self._exp_spin: dict[str, QSpinBox] = {}
+        for side in ("left", "right"):
+            bar.addWidget(QLabel(f"  {side[0].upper()} "))
+            spin = QSpinBox()
+            spin.setRange(EXPOSURE_MIN, 2000)
+            spin.setSingleStep(10)
+            spin.setToolTip(f"Exposure time of the {side} camera, in 0.1 ms steps "
+                            "(100 = 10 ms; 330 is a whole frame at 30 fps).")
+            spin.setEnabled(not self.exposure.auto)
+            spin.valueChanged.connect(lambda v, s=side: self._on_exposure_spin(s, v))
+            bar.addWidget(spin)
+            self._exp_spin[side] = spin
+        self._exp_label = QLabel("")
+        self._exp_label.setStyleSheet("color:#8b9aac; font-family:Consolas;")
+        bar.addWidget(self._exp_label)
+
+        bar.addSeparator()
         reload_act = QAction("Reload config", self)
         reload_act.triggered.connect(self._poll_config)
         bar.addAction(reload_act)
@@ -211,6 +252,7 @@ class MainWindow(QMainWindow):
         for w in self.workers.values():
             w.set_laser(on, params)
         self.calib.set_laser_active(on)
+        self.exposure.set_laser(on)
 
     # ── config ────────────────────────────────────────────────────────────
 
@@ -233,6 +275,9 @@ class MainWindow(QMainWindow):
 
         self.calib.set_config(cfg)
         self.scanner.set_config(cfg)
+        self.exposure.configure(cfg.camserver, {
+            side: getattr(getattr(cfg, side, None), "camera_id", None)
+            for side in ("left", "right")})
         for side, worker in self.workers.items():
             eye = getattr(cfg, side)
             self.panels[side].set_eye(eye)
@@ -313,6 +358,7 @@ class MainWindow(QMainWindow):
         for side, res in fresh.items():
             if res is not None:
                 self._wh[side] = res.wh
+                self.exposure.observe(side, res.stats.stripe_peak, res.stats.stripe_clipped)
             if res is not None and res.board is not None and res.board.R is not None:
                 self._poses[side] = (res.board.R, res.board.t, now, res.wh)
         for side, held in self._poses.items():
@@ -368,13 +414,46 @@ class MainWindow(QMainWindow):
             veto_px=None if f is None else float(f.veto_px),
             kept=0 if f is None else int(f.n_kept),
             auto=self.calib.auto.isChecked(),
-            offline={side for side, err in self._offline.items() if err})
+            offline={side for side, err in self._offline.items() if err},
+            saturated=self.exposure.saturated(),
+            exposure_auto=self._exp_auto.isChecked())
         # The guide reads the flow; this is where its stage reaches it.
         self.calib.flow.solo = prompt.solo
         self.banner.set_prompt(prompt)
         for side, panel in self.panels.items():
             panel.view.set_target(prompt.target if prompt.eye == side else None)
             panel.view.set_highlight(prompt.eye in (side, "both"))
+
+    # ── exposure ──────────────────────────────────────────────────────────
+
+    def _on_exposure_auto(self, on: bool) -> None:
+        self.exposure.set_auto(on)
+        for spin in self._exp_spin.values():
+            spin.setEnabled(not on)
+
+    def _on_exposure_spin(self, side: str, value: int) -> None:
+        if not self._exposure_syncing and not self._exp_auto.isChecked():
+            self.exposure.set_target(side, value)
+
+    def _exposure_tick(self) -> None:
+        """The toolbar follows the keeper: the times it holds, the stripe's
+        peak per eye, and the last thing it had to do."""
+        snap = self.exposure.snapshot()
+        self._exposure_syncing = True
+        try:
+            for side, eye in snap.items():
+                if eye.target is not None and self._exp_spin[side].value() != eye.target:
+                    self._exp_spin[side].setValue(eye.target)
+        finally:
+            self._exposure_syncing = False
+        now = time.monotonic()
+        peaks = []
+        for side, eye in snap.items():
+            r = eye.recent(now)
+            peaks.append(f"{side[0].upper()} {r[0]:.0f}" + ("!" if eye.saturated else "")
+                         if r is not None else f"{side[0].upper()} —")
+        note = max((e.note for e in snap.values() if e.note), key=len, default="")
+        self._exp_label.setText("  peak " + " ".join(peaks) + (f"  · {note}" if note else ""))
 
     def _guide_back(self) -> None:
         self.guide.back()
@@ -441,5 +520,6 @@ class MainWindow(QMainWindow):
         for w in self.workers.values():
             w.stop()
         self.scanner.stop()
+        self.exposure.stop()
         self._client.close()
         super().closeEvent(event)

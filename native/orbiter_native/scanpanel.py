@@ -147,6 +147,30 @@ class ScanPanel(QFrame):
         clean_row.addStretch(1)
         root.addLayout(clean_row)
 
+        refine_row = QHBoxLayout()
+        self.refine = QCheckBox("stereo refine, pair ≤")
+        self.refine.setToolTip(
+            "Fuse each point's sheet depth with the depth the right eye's own stripe "
+            "centroid implies: the pair's baseline is longer than the laser's offset, "
+            "so the right eye reads depth finer — as long as the pair is calibrated. "
+            "Off above the pair residual beside: a poor pair would bend the surface "
+            "rather than sharpen it."
+        )
+        self.refine.setChecked(ScanParams().stereo_refine)
+        self.refine.toggled.connect(self._push_params)
+        refine_row.addWidget(self.refine)
+        self.refine_rms = QDoubleSpinBox()
+        self.refine_rms.setRange(0.2, 5.0)
+        self.refine_rms.setSingleStep(0.1)
+        self.refine_rms.setValue(ScanParams().stereo_refine_max_rms_px)
+        self.refine_rms.setSuffix(" px")
+        self.refine_rms.setToolTip("The pair's reprojection residual above which the right "
+                                   "eye is not trusted with depth.")
+        self.refine_rms.valueChanged.connect(self._push_params)
+        refine_row.addWidget(self.refine_rms)
+        refine_row.addStretch(1)
+        root.addLayout(refine_row)
+
         row = QHBoxLayout()
         self.btn_clear = QPushButton("Clear cloud")
         self.btn_clear.clicked.connect(self._scanner.clear)
@@ -170,6 +194,8 @@ class ScanPanel(QFrame):
         lo, hi = sorted((self.reach_lo.value(), self.reach_hi.value()))
         return ScanParams(range_mm=(lo, hi), clean=self.clean.isChecked(),
                           clean_merge_mm=self.merge_mm.value(),
+                          stereo_refine=self.refine.isChecked(),
+                          stereo_refine_max_rms_px=self.refine_rms.value(),
                           volume=ScanVolume(height_mm=self.height_mm.value(),
                                             radius_mm=self.radius_mm.value(),
                                             floor_mm=self.floor_mm.value()))
@@ -228,6 +254,11 @@ class ScanPanel(QFrame):
             if f.veto_px == f.veto_px:            # not NaN
                 lines.append(f"veto    the eyes disagree by {f.veto_px:+.1f} px "
                              f"about where the stripe is")
+            if f.refine_note:
+                lines.append(f"refine  — {f.refine_note}")
+            elif f.n_refined:
+                lines.append(f"refine  {f.n_refined}/{f.n_kept} points · median shift "
+                             f"{f.refine_shift_mm:.2f} mm · right eye {100 * f.refine_share:.0f} %")
             lines.append(f"dropped unconfirmed {f.n_rejected_unconfirmed} · blob "
                          f"{f.n_rejected_blob} · reach {f.n_rejected_range} · "
                          f"jump {f.n_rejected_jump} · outside {f.n_rejected_volume}"

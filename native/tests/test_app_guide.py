@@ -22,11 +22,13 @@ def _app():
         pytest.skip(f"no Qt platform here: {exc}")
 
 
-def test_the_guide_is_wired_through_the_main_window() -> None:
+def test_the_guide_is_wired_through_the_main_window(tmp_path) -> None:
     _app()
     from orbiter_native.app import MainWindow
 
     win = MainWindow("http://127.0.0.1:9")                    # nothing listens there
+    # The keeper persists what the toolbar sets: not into the operator's own file.
+    win.exposure.path = tmp_path / "exposure.json"
     try:
         win._guide_tick()
         title, action = win.banner.title.text(), win.banner.action.text()
@@ -47,6 +49,14 @@ def test_the_guide_is_wired_through_the_main_window() -> None:
         win._guide_back()
         win._guide_restart()
         assert win.guide.index == 0 and not win.guide.pinned
+        # The exposure keeper is wired: observations arrive, the toolbar follows.
+        win._exposure_tick()
+        assert win._exp_label.text().startswith("  peak")
+        win._exp_auto.setChecked(False)
+        assert win._exp_spin["left"].isEnabled()
+        win._exp_spin["left"].setValue(60)
+        assert win.exposure.eyes["left"].target == 60
+        win._exp_auto.setChecked(True)
         # Off: the flow pairs as usual and nothing of the guide is left drawn.
         win.banner.enabled.setChecked(False)
         assert win.calib.flow.solo is None

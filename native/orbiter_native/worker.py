@@ -41,8 +41,10 @@ from .laser import (
     LaserParams,
     StripePixels,
     board_mask,
+    exposure_of,
     find_laser_line,
     find_stripe_pixels,
+    red_at,
 )
 from .orient import Orientation
 from .source import Frame, MjpegReader
@@ -79,6 +81,12 @@ class EyeStats:
     laser_reason: str | None = None
     #: Stripe points found in scan mode.
     stripe_points: int = 0
+    #: The stripe's brightness in the red channel — its 90th percentile and
+    #: the share of its pixels clipped at the ceiling (`laser.exposure_of`),
+    #: from the scan-mode pixels or the calibration-mode line. NaN without
+    #: a stripe. What the exposure keeper steers by.
+    stripe_peak: float = float("nan")
+    stripe_clipped: float = float("nan")
     #: Decoded and scored on the GPU (`gpu.py`) rather than by OpenCV.
     gpu: bool = False
     #: Server-side age of the last frame at send time, from `X-Age-Ms`.
@@ -429,6 +437,12 @@ class EyeWorker(QObject):
         s.laser_reason = (pixels.reason if pixels.count or pixels.reason != "no data"
                           else laser.reason)
         s.stripe_points = pixels.count
+        if pixels.count and len(pixels.r):
+            s.stripe_peak, s.stripe_clipped = exposure_of(pixels.r)
+        elif laser.ok and frame.bgr is not None:
+            s.stripe_peak, s.stripe_clipped = exposure_of(red_at(frame.bgr, laser.inlier_points))
+        else:
+            s.stripe_peak = s.stripe_clipped = float("nan")
         s.gpu = frame.rgb_gpu is not None
         s.server_age_ms = frame.server_age_ms
         h, w = frame.gray.shape

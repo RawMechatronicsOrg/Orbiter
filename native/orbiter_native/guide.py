@@ -137,13 +137,17 @@ class Guide:
     def update(self, flow, frames: dict[str, tuple[int, int, Orientation]] | None = None,
                laser_on: bool = False, scanning: bool = False,
                veto_px: float | None = None, kept: int = 0, auto: bool = True,
-               offline: set[str] | frozenset[str] = frozenset()) -> Prompt:
+               offline: set[str] | frozenset[str] = frozenset(),
+               saturated: set[str] | frozenset[str] = frozenset(),
+               exposure_auto: bool = False) -> Prompt:
         """The prompt for now. `frames` gives each eye's frame size and the
         orientation it is shown in, for the target and its name; `veto_px`
         and `kept` are the scan's last frame, for the check; `auto` is the
         panel's 'calibrate continuously' switch, without which no stage but
         the check can take anything; `offline` names the eyes whose stream
-        is down — no board instruction helps those."""
+        is down — no board instruction helps those; `saturated` names the
+        eyes whose stripe is clipped at the ceiling, and `exposure_auto`
+        whether the keeper is already lowering their exposure."""
         frames = frames or {}
         if flow.board is None:
             return Prompt(self.stage, "CALIBRATION GUIDE",
@@ -176,10 +180,10 @@ class Guide:
         if stage == "pair":
             return self._pair(flow)
         if stage == "plane":
-            return self._plane(flow, laser_on)
+            return self._plane(flow, laser_on, saturated, exposure_auto)
         if stage == "readout":
             return self._readout(flow)
-        return self._check(flow, laser_on, scanning, veto_px, kept)
+        return self._check(flow, laser_on, scanning, veto_px, kept, saturated, exposure_auto)
 
     # ── done ──────────────────────────────────────────────────────────────
 
@@ -286,7 +290,7 @@ class Guide:
                        f"{'saved' if flow.is_saved('stereo') else 'not saved'}")
         return self._prompt("pair", action, detail, tone, eye="both")
 
-    def _plane(self, flow, laser_on: bool) -> Prompt:
+    def _plane(self, flow, laser_on: bool, saturated=frozenset(), exposure_auto=False) -> Prompt:
         frames, pts = flow.plane.frames, len(flow.plane)
         res = flow.results.get("plane")
         moved = flow.moved("left")
@@ -297,6 +301,8 @@ class Guide:
             action = "SHOW THE BOARD TO THE LEFT CAMERA"
         elif not flow.stripe_ok("left"):
             action = "LASER STRIPE STRAIGHT ACROSS THE BOARD"
+        elif "left" in saturated:
+            action, tone = _saturated(("left",), exposure_auto)
         elif moved is None or moved > 1.0:
             action = "HOLD STILL"
         elif frames >= PLANE_FRAMES and res is None:
@@ -324,12 +330,15 @@ class Guide:
                   "optional — NEXT skips it")
         return self._prompt("readout", action, detail, tone, eye="both")
 
-    def _check(self, flow, laser_on: bool, scanning: bool, veto_px, kept: int) -> Prompt:
+    def _check(self, flow, laser_on: bool, scanning: bool, veto_px, kept: int,
+               saturated=frozenset(), exposure_auto=False) -> Prompt:
         tone, done = "adjust", False
         if not laser_on:
             action, tone = "TICK 'laser line' IN THE TOOLBAR", "stop"
         elif not scanning:
             action, tone = "TICK 'scanning' AND POINT THE STRIPE AT AN OBJECT", "stop"
+        elif saturated:
+            action, tone = _saturated(sorted(saturated), exposure_auto)
         elif veto_px is None:
             action = "WAITING FOR A PAIR WITH THE STRIPE…"
         elif not np.isfinite(veto_px):
@@ -373,6 +382,15 @@ class Guide:
         if seen is None:
             return rect, "TO THE " + place_name(*centre, w, h, o)
         return rect, move_words((seen[0] * w, seen[1] * h), centre, w, h, o)
+
+
+def _saturated(eyes, exposure_auto: bool) -> tuple[str, str]:
+    """The stripe is clipped in these eyes: its centroid is guesswork until
+    the exposure comes down — by itself, or by the operator's hand."""
+    who = " AND ".join(e.upper() for e in eyes)
+    if exposure_auto:
+        return f"STRIPE SATURATED IN THE {who} EYE — EXPOSURE ADJUSTING…", "adjust"
+    return f"STRIPE SATURATED IN THE {who} EYE — LOWER ITS EXPOSURE (TOOLBAR)", "stop"
 
 
 def pair_scale_spread(paired) -> float:

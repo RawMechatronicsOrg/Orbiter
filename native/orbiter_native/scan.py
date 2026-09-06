@@ -138,6 +138,20 @@ class ScanParams:
     #: Locate the stripe on each scanline by a Gaussian fit of its profile
     #: rather than the centroid — see `laser.stripe_centroids`.
     centroid_fit: bool = True
+    #: Refine each point's depth by the RIGHT eye's own stripe centroid
+    #: (`refine_by_right`). The sheet gives depth through one eye across a
+    #: baseline of only the laser's offset — 74 mm on this rig — while the
+    #: pair's baseline is twice that or more; the right centroid is a second,
+    #: independent measurement of the same depth, fused by precision. It is
+    #: only as true as the pair's calibration, so it is off above
+    #: `stereo_refine_max_rms_px` of pair residual, and a right centroid
+    #: farther than `stereo_refine_window_px` from where the sheet put the
+    #: point, or asking for more than `stereo_refine_max_shift_mm`, is
+    #: something else (a glint, the wrong blob) and is not used.
+    stereo_refine: bool = True
+    stereo_refine_max_rms_px: float = 1.0
+    stereo_refine_window_px: float = 6.0
+    stereo_refine_max_shift_mm: float = 10.0
     #: Where a point's colour is read: this many pixels to either side of
     #: the stripe, across it, in the left eye. Under the stripe every
     #: surface is laser-red; beside it, past the halo, it is itself. The
@@ -201,6 +215,14 @@ class ScanFrame:
     #: Points standing off both their neighbours along the stripe.
     n_rejected_jump: int = 0
     n_rejected_volume: int = 0
+    #: The stereo refinement (`refine_by_right`): how many kept points the
+    #: right eye's centroid took part in, the median correction it made,
+    #: mm along the ray, the right eye's mean weight in the fusion, and
+    #: why it did nothing when it did nothing.
+    n_refined: int = 0
+    refine_shift_mm: float = float("nan")
+    refine_share: float = float("nan")
+    refine_note: str | None = None
     #: How far, in px along the scanline, the right eye's stripe sits from
     #: where the left eye's candidates project into its frame. NaN when the
     #: eyes share no scanline. See `_veto_offset`.
@@ -432,6 +454,142 @@ def sample_beside(bgr: np.ndarray, pixels: np.ndarray, along_x: bool,
     return np.clip(np.rint(med), 0, 255).astype(np.uint8)[:, ::-1]
 
 
+#: The stripe centroid's own noise per eye, px, as the calibration panel
+#: measures it live off the line fits on this rig (0.5-0.7 px). It sets how
+#: the two depth measurements are weighed against each other, not whether
+#: a point is kept.
+STRIPE_SIGMA_PX = 0.6
+#: Below this many right-eye pixels per millimetre along the ray the right
+#: eye has no depth to offer: its epipolar lines run along the stripe, as
+#: they do when the pair's baseline is parallel to the sheet. On this rig
+#: the baseline stands across the sheet and a point at 400 mm moves 1.3 px
+#: per mm.
+MIN_DV_PX_PER_MM = 0.05
+
+
+@dataclass
+class Refined:
+    """What `refine_by_right` did to a frame's points."""
+
+    #: The points, camera frame, moved along their rays where refined.
+    xyz: np.ndarray
+    #: Per point: the right eye's centroid took part.
+    used: np.ndarray
+    #: Per point: the correction applied, mm along the ray (0 where not used).
+    shift_mm: np.ndarray
+    #: Per point: the right eye's weight in the fusion (0 where not used).
+    share: np.ndarray
+    #: Why nothing was refined, when nothing was.
+    note: str | None = None
+
+
+def refine_by_right(rig: StereoRig, plane: LaserPlane, xyz_cam: np.ndarray,
+                    pix_left: np.ndarray, left_along_x: bool, right: StripePixels,
+                    params: ScanParams) -> Refined:
+    """Fuse each point's sheet depth with the depth the right eye's stripe
+    centroid implies, along the left ray.
+
+    The sheet fixes a point where the left ray meets it; a left-pixel error
+    across the stripe moves that point along the sheet by Z²/(f·d) per
+    pixel, `d` being the sheet's offset from the left camera. The right eye
+    sees the same stripe; where its centroid sits on the scanline the point
+    projects to is a second reading of the depth, moving the point along
+    the left ray by 1/(∂v/∂h) per right pixel — with `B`, the pair's
+    baseline, in place of `d`. One Newton step from the sheet's point gives
+    the stereo depth.
+
+    The two are not independent: both carry the same left-pixel error, the
+    sheet by Z²/(f·d) of it and the stereo by Z²/(f·B). So the sheet's
+    weight `a` in the average is what minimises the variance of
+    a·sheet + (1−a)·stereo with that shared term in — not the inverse-
+    variance mix of two independent readings, which would keep a third of
+    a sheet error the right eye can see past. With equal centroid noise on
+    both sides and B = 2d the answer is the stereo depth alone; as the
+    pair's residual grows, treated as noise in the right eye, `a` climbs
+    back toward the sheet. `a` is kept in [0, 1]: extrapolating past the
+    stereo depth to cancel more of the left error is what the algebra
+    asks for at wide baselines, and not something a glint should be
+    allowed to do. Sensitivities are found numerically, per point, so
+    distortion and the rig's actual geometry are in them.
+    """
+    n = len(xyz_cam)
+    none = Refined(xyz_cam, np.zeros(n, bool), np.zeros(n), np.zeros(n))
+    if not n:
+        return none
+    if not params.stereo_refine:
+        none.note = "off"
+        return none
+    rms = float(getattr(rig.geom, "rms_px", float("nan")))
+    if not np.isfinite(rms) or rms > params.stereo_refine_max_rms_px:
+        none.note = (f"pair rms {rms:.2f} px over {params.stereo_refine_max_rms_px:g}: "
+                     "sheet depth only")
+        return none
+    if not right.ok:
+        none.note = "no right stripe"
+        return none
+    key_r = right.x if right.along_x else right.y
+    across_r = right.y if right.along_x else right.x
+    scan_r, pos_r, *_ = stripe_centroids(key_r, across_r, right.w, params.blob_width_px,
+                                         fit=params.centroid_fit)
+    if not len(scan_r):
+        none.note = "no right centroids"
+        return none
+    order = np.argsort(scan_r)
+    scan_r, pos_r = scan_r[order], pos_r[order]
+
+    uv = rig.project_right(xyz_cam)
+    fin = np.isfinite(uv).all(axis=1)
+    scan_axis, across_axis = (0, 1) if right.along_x else (1, 0)
+    k = np.full(n, -1, np.int64)
+    k[fin] = np.rint(uv[fin, scan_axis]).astype(np.int64)
+    v_sheet = uv[:, across_axis]
+    j = np.clip(np.searchsorted(scan_r, k), 0, len(scan_r) - 1)
+    found = fin & (scan_r[j] == k)
+    resid = np.where(found, pos_r[j] - v_sheet, np.nan)
+    ok = found & (np.abs(resid) <= params.stereo_refine_window_px)
+
+    # How the right's across-coordinate answers a move of 1 mm along the ray.
+    ray = xyz_cam / np.linalg.norm(xyz_cam, axis=1, keepdims=True)
+    uv_step = rig.project_right(xyz_cam + ray)
+    dv = uv_step[:, across_axis] - v_sheet
+    sensitive = np.isfinite(dv) & (np.abs(dv) >= MIN_DV_PX_PER_MM)
+    ok &= sensitive
+    shift = np.zeros(n)
+    share = np.zeros(n)
+    used = np.zeros(n, bool)
+    if not found.any():
+        note = "no right centroid on the scanlines the points project to"
+    elif not (found & sensitive).any():
+        note = "the right eye's stripe runs along its epipolar lines: no depth in it"
+    elif not ok.any():
+        note = f"no right centroid within {params.stereo_refine_window_px:g} px"
+    else:
+        note = f"every correction over {params.stereo_refine_max_shift_mm:g} mm: not used"
+    if ok.any():
+        idx = np.flatnonzero(ok)
+        dh = resid[idx] / dv[idx]
+        near = np.abs(dh) <= params.stereo_refine_max_shift_mm
+        idx, dh = idx[near], dh[near]
+        if len(idx):
+            # Millimetres of depth per pixel of error: the sheet's, to a left
+            # pixel across the stripe, per point; the stereo's, to a pixel of
+            # either eye, from the same ∂v/∂h.
+            e = np.array([[0.0, 1.0]]) if left_along_x else np.array([[1.0, 0.0]])
+            moved = _on_plane(rig.left_k, plane, np.asarray(pix_left)[idx] + e)
+            s_sheet = np.maximum(np.linalg.norm(moved - xyz_cam[idx], axis=1), 1e-6)
+            s_stereo = 1.0 / np.abs(dv[idx])
+            u = s_sheet / s_stereo
+            var_left = STRIPE_SIGMA_PX ** 2
+            var_right = STRIPE_SIGMA_PX ** 2 + rms ** 2
+            a = (var_right - var_left * (u - 1.0)) / (var_left * (u - 1.0) ** 2 + var_right)
+            part = 1.0 - np.clip(a, 0.0, 1.0)
+            shift[idx] = part * dh
+            share[idx] = part
+            used[idx] = True
+    return Refined(xyz_cam + shift[:, None] * ray, used, shift, share,
+                   None if used.any() else note)
+
+
 def scan_frame(
     rig: StereoRig,
     plane: LaserPlane | None,
@@ -512,6 +670,10 @@ def scan_frame(
     n_jump = int((~smooth).sum())
     xyz_cam, rows, pix = xyz_cam[smooth], rows[smooth], pix[smooth]
 
+    # The right eye's own centroid, fused into the depth along each ray.
+    refined = refine_by_right(rig, plane, xyz_cam, pix, bool(left.along_x), right, params)
+    xyz_cam = refined.xyz
+
     # Into the board's frame: the volume is defined relative to the board, so
     # it stays put when the board moves and "above" keeps meaning above it.
     rs_max = 0.0
@@ -543,6 +705,12 @@ def scan_frame(
         n_rejected_blob=n_blob,
         n_split=n_split,
         n_rejected_range=n_range,
+        n_refined=int(refined.used[inside].sum()) if len(refined.used) else 0,
+        refine_shift_mm=(float(np.median(np.abs(refined.shift_mm[inside & refined.used])))
+                         if (inside & refined.used).any() else float("nan")),
+        refine_share=(float(refined.share[inside & refined.used].mean())
+                      if (inside & refined.used).any() else float("nan")),
+        refine_note=refined.note,
         n_rejected_jump=n_jump,
         n_rejected_volume=int((~inside).sum()),
         veto_px=veto_px,

@@ -240,6 +240,29 @@ def test_the_pair_stage_asks_for_distance_variety(board) -> None:
     assert guide.update(flow).action.startswith("NEW PLACE, TILT OR DISTANCE")
 
 
+def test_a_clipped_stripe_is_called_out_where_the_stripe_counts(board) -> None:
+    flow, guide = _flow(board), Guide()
+    _lens_done(flow, "left")
+    _lens_done(flow, "right")
+    _pair_done(flow)
+    for t in (1.0, 1.033):
+        res = _frame("left", t)
+        res.laser = SimpleNamespace(ok=True)
+        flow.offer(res, auto=False)
+    p = guide.update(flow, laser_on=True, saturated={"left"})
+    assert p.stage == "plane" and p.tone == "stop"
+    assert p.action.startswith("STRIPE SATURATED IN THE LEFT EYE")
+    p = guide.update(flow, laser_on=True, saturated={"left"}, exposure_auto=True)
+    assert p.tone == "adjust" and "ADJUSTING" in p.action
+    assert "SATURATED" not in guide.update(flow, laser_on=True, saturated={"right"}).action
+    _plane_done(flow)
+    _readout_done(flow)
+    p = guide.update(flow, laser_on=True, scanning=True, veto_px=2.0, kept=100,
+                     saturated={"right", "left"})
+    assert p.stage == "check" and "LEFT AND RIGHT EYE" in p.action and p.tone == "stop"
+    assert guide.update(flow, laser_on=True, scanning=True, veto_px=2.0, kept=100).done
+
+
 def test_without_a_board_spec_nothing_else_is_asked(board) -> None:
     flow, guide = CalibrationFlow(), Guide()
     p = guide.update(flow)

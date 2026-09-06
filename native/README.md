@@ -70,6 +70,23 @@ already run on threads of their own, and OpenCV's default of one worker per
 logical core on top of that burns cores for no extra frames — the numbers are
 under *Measured on this machine*.
 
+**Exposure.** The toolbar's **auto exposure** (`exposure.ExposureKeeper`)
+steers each camera's exposure time by the laser stripe alone: the red peak
+under the stripe's pixels is held in the low 200s — bright, with the top of
+the profile still there. A stripe clipped at 255 has a flat profile, its
+centroid wanders by a pixel, and a pixel is more than a millimetre of depth
+on this rig; measured with the scanner on the bench, the left eye's stripe
+core read 255 with green at 190 while the right eye's peaked at 160. The
+steps are asymmetric (×0.7 down the moment the core clips, ×1.2 up when the
+peak drops under 200), never more often than every 1.5 s so the sensor can
+apply one before the next is judged, and only while the laser is on. Off,
+the two times beside the switch are yours. Either way the keeper reads the
+cameras back every 5 s and sets the time, manual mode and the 50 Hz flicker
+filter again whenever camserver reopened a device — it forgets all three
+on every USB hiccup, and a reopen is counted in its status. The times are
+kept in `~/.orbiter-native/exposure.json`; the label after the spin boxes
+shows each eye's live peak, `!` when clipped, and the keeper's last move.
+
 ## Design notes
 
 **Two threads per eye, not one.** The reader thread does nothing but drain the
@@ -283,7 +300,10 @@ delivered a still board within the last couple of frames (its frame comes a
 few milliseconds later); an eye that has lost the board, shakes, or whose
 stream has stopped does not stall the stage, and a view is new for the
 stage's own eye or it is not taken.
-Untick **guide** and the eyes pair as before, with nothing drawn on them.
+In the sheet and check stages a clipped stripe is named before anything
+else (`STRIPE SATURATED IN THE LEFT EYE — EXPOSURE ADJUSTING…`, or `LOWER
+ITS EXPOSURE` when the keeper is off). Untick **guide** and the eyes pair
+as before, with nothing drawn on them.
 
 **When the rig moves.** Re-aiming or moving the cameras or the laser stales
 the pair's geometry and the sheet, not the intrinsics: a lens is what it was.
@@ -384,6 +404,29 @@ Results reach the server through `POST /command/set_stereo_rig`, the same
 command the web tab uses, so the server remains the one owner of this state.
 
 ## Scanning
+
+**The right eye in the depth.** The sheet fixes each point where the left
+ray meets it, across a baseline of only the laser's offset from the left
+camera — 74 mm on this rig — so a pixel of stripe centroid is Z²/(f·d) of
+depth: 1.2 mm at 35 cm, 1.5 mm at 40 cm. The right eye sees the same
+stripe across the pair's baseline, twice that or more, and where its own
+centroid sits on the scanline a point projects to is a second reading of
+the depth (`scan.refine_by_right`, **stereo refine** on the SCAN panel).
+One Newton step along the left ray from the sheet's point reaches it; the
+two are then averaged with the error they share in mind — both carry the
+left pixel's error, the sheet by Z²/(f·d), the stereo by Z²/(f·B) — so the
+sheet's weight is what still helps once the right eye is in: with equal
+centroid noise on both sides and B = 2d that is nothing, and the point is
+the stereo depth; as the pair's residual grows, counted as right-eye noise,
+the weight climbs back toward the sheet. It is only as true as the pair:
+off above **pair ≤** 1.0 px of pair residual (the panel says so, and the
+rig's pair was 2.29 px when this was written — more pairs, at more
+distances, is what brings it down), and a right centroid farther than 6 px
+from where the sheet put the point, or asking for more than 10 mm, is a
+glint or the wrong blob and is left alone. A baseline that runs along the
+stripe has no depth in the right eye at all, and the panel says that too.
+The SCAN panel's `refine` line shows how many kept points it touched, the
+median correction and the right eye's share.
 
 With the pair and the laser plane calibrated and the laser detector on,
 **scanning** turns the stripe into points and accumulates a cloud.
