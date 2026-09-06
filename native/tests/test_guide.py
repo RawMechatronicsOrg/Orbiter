@@ -18,12 +18,14 @@ from orbiter_native.guide import (
     GRID,
     K_CELLS,
     K_VIEWS,
+    PAIR_SCALE_SPREAD,
     PAIR_VIEWS,
     PLANE_FRAMES,
     STAGES,
     VETO_OK_PX,
     Guide,
     move_words,
+    pair_scale_spread,
     place_name,
 )
 from orbiter_native.intrinsics import MIN_TILT_SPREAD, EyeView, PairSample, ViewDescriptor
@@ -44,10 +46,10 @@ def _flow(board) -> CalibrationFlow:
     return flow
 
 
-def _view(cx: float, cy: float, tilt: float = 0.0) -> EyeView:
+def _view(cx: float, cy: float, tilt: float = 0.0, scale: float = 0.3) -> EyeView:
     corners = np.zeros((4, 1, 2), np.float32)
     ids = np.arange(4, dtype=np.int32).reshape(-1, 1)
-    return EyeView(corners, ids, WH, ViewDescriptor(cx, cy, 0.3, tilt, -tilt))
+    return EyeView(corners, ids, WH, ViewDescriptor(cx, cy, scale, tilt, -tilt))
 
 
 def _lens_done(flow: CalibrationFlow, side: str) -> None:
@@ -167,6 +169,68 @@ def test_at_the_view_ceiling_the_answer_is_clear_not_next(board) -> None:
     assert p.tone == "stop" and "Clear" in p.action and str(MAX_VIEWS) in p.action
 
 
+def test_an_offline_eye_is_named_before_any_board_instruction(board) -> None:
+    flow, guide = _flow(board), Guide()
+    p = guide.update(flow, offline={"left"})
+    assert p.tone == "stop" and p.action.startswith("LEFT CAMERA OFFLINE") and p.eye == "left"
+    assert guide.update(flow, offline={"right"}).action.startswith("SHOW THE BOARD")
+    _lens_done(flow, "left")
+    _lens_done(flow, "right")
+    p = guide.update(flow, offline={"left", "right"})
+    assert p.stage == "pair" and p.action.startswith("LEFT AND RIGHT CAMERA OFFLINE")
+    _pair_done(flow)
+    assert guide.update(flow, laser_on=True, offline={"right"}).stage == "plane"
+    assert "OFFLINE" not in guide.update(flow, laser_on=True, offline={"right"}).action
+    assert "OFFLINE" in guide.update(flow, laser_on=True, offline={"left"}).action
+
+
+def test_restart_after_rig_moved_lands_on_the_pair_even_when_pinned(board) -> None:
+    flow, guide = _flow(board), Guide()
+    _lens_done(flow, "left")
+    _lens_done(flow, "right")
+    _pair_done(flow)
+    _plane_done(flow)
+    guide.update(flow)
+    guide.next()                                                # pinned at the check
+    assert guide.stage == "check" and guide.pinned
+    flow.rig_moved()
+    assert guide.update(flow).stage == "check"                  # pinned: never back by itself
+    guide.restart()                                             # what the Rig moved button does
+    assert guide.update(flow).stage == "pair"
+
+
+def test_a_refused_lens_asks_for_stiller_views(board) -> None:
+    flow, guide = _flow(board), Guide()
+    _lens_done(flow, "left")
+    del flow.results["intrinsics:left"]
+    flow.reasons["intrinsics:left"] = "reprojection RMS 1.52 px exceeds 1.5 px"
+    for t in (1.0, 1.033):                     # held still on a view already taken
+        flow.offer(_frame("left", t, 1.5 / GRID, 0.5 / GRID), auto=False)
+    p = guide.update(flow, {"left": (*WH, Orientation())})
+    assert p.action.startswith("LENS REFUSED: REPROJECTION RMS 1.52 PX") and "STILLER" in p.action
+    assert "refused: reprojection RMS 1.52 px" in p.detail
+
+
+def test_the_pair_stage_asks_for_distance_variety(board) -> None:
+    flow, guide = _flow(board), Guide()
+    _lens_done(flow, "left")
+    _lens_done(flow, "right")
+    for i in range(8):                                          # eight pairs, one distance
+        flow.samples.add(PairSample(left=_view(0.3 + i * 0.02, 0.5, tilt=i),
+                                    right=_view(0.6 + i * 0.02, 0.5, tilt=i)))
+    assert pair_scale_spread(flow.samples.paired()) < PAIR_SCALE_SPREAD
+    for t in (1.0, 1.033):                                      # still, seen by both, nothing new
+        flow.offer(_frame("left", t, 0.3, 0.5), auto=False)
+        flow.offer(_frame("right", t + 0.002, 0.6, 0.5), auto=False)
+    p = guide.update(flow)
+    assert p.stage == "pair" and p.action.startswith("CHANGE THE DISTANCE")
+    for i in range(8):                                          # and eight more, near and far
+        flow.samples.add(PairSample(left=_view(0.3 + i * 0.02, 0.4, tilt=i, scale=0.2 + 0.02 * i),
+                                    right=_view(0.6 + i * 0.02, 0.4, tilt=i, scale=0.2 + 0.02 * i)))
+    assert pair_scale_spread(flow.samples.paired()) >= PAIR_SCALE_SPREAD
+    assert guide.update(flow).action.startswith("NEW PLACE, TILT OR DISTANCE")
+
+
 def test_without_a_board_spec_nothing_else_is_asked(board) -> None:
     flow, guide = CalibrationFlow(), Guide()
     p = guide.update(flow)
@@ -211,6 +275,29 @@ def test_a_still_board_in_one_eye_becomes_a_view_in_its_own_stage(board) -> None
         other.offer(_frame("left", 1.0 + i * 0.033, 0.5, 0.5))
     assert len(other.samples) == 0
     assert other.gate()[0] == "board" and "needs both" in other.gate_report()
+
+
+def test_a_jittery_other_eye_does_not_starve_the_solo_eye(board) -> None:
+    """Both eyes see the board; the right one shakes. The left eye's own
+    stage still takes its view, one-eyed. When both are still, the pair wins."""
+    flow = _flow(board)
+    flow.solo = "left"
+    for i in range(3):
+        t = 1.0 + i * 0.033
+        flow.offer(_frame("right", t, 0.5, 0.5, shift=i * STILL_PX * 5))
+        flow.offer(_frame("left", t + 0.002, 0.5, 0.5))
+    assert len(flow.samples) == 1
+    one = flow.samples.samples[0]
+    assert one.left is not None and one.right is None
+    still = _flow(board)
+    still.solo = "left"
+    for i in range(3):
+        t = 1.0 + i * 0.033
+        still.offer(_frame("right", t, 0.5, 0.5))
+        still.offer(_frame("left", t + 0.002, 0.5, 0.5))
+    assert len(still.samples) == 1 and still.samples.samples[0].both
+    # Its gate speaks for the solo eye alone either way.
+    assert flow.gate()[0] in ("dup", "wait")
 
 
 def test_the_solo_gate_only_asks_its_own_eye(board) -> None:

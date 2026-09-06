@@ -332,8 +332,10 @@ class FrameView(QOpenGLWidget):
             finally:
                 p.endNativePainting()
             self._annotate(p, scene)
-            self._draw_target(p)
         self._draw_overlay(p)
+        # After the overlay: the stats box sits over the frame's top-left
+        # cells, and the operator must see the target wherever it is.
+        self._draw_target(p)
         self._draw_highlight(p)
         p.end()
 

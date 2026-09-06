@@ -111,8 +111,11 @@ class MainWindow(QMainWindow):
         self.banner.next_requested.connect(self._guide_next)
         self.banner.toggled.connect(self._guide_toggled)
         self.calib.cleared.connect(self._guide_restart)
+        self.calib.rig_moved.connect(self._guide_restart)
         #: Each eye's newest frame size, for the guide's target rectangle.
         self._wh: dict[str, tuple[int, int] | None] = {"left": None, "right": None}
+        #: Each eye's stream error, for the guide: None while frames arrive.
+        self._offline: dict[str, str | None] = {"left": None, "right": None}
         #: The scan's last frame while scanning, for the guide's check.
         self._scan_frame = None
 
@@ -348,7 +351,8 @@ class MainWindow(QMainWindow):
             self._rows_pushed = rows
 
     def _on_status(self, side: str, error: object) -> None:
-        self.panels[side].on_status(error if isinstance(error, str) else None)
+        self._offline[side] = error if isinstance(error, str) else None
+        self.panels[side].on_status(self._offline[side])
 
     # ── the guide ─────────────────────────────────────────────────────────
 
@@ -363,7 +367,8 @@ class MainWindow(QMainWindow):
             scanning=self.scan.scanning,
             veto_px=None if f is None else float(f.veto_px),
             kept=0 if f is None else int(f.n_kept),
-            auto=self.calib.auto.isChecked())
+            auto=self.calib.auto.isChecked(),
+            offline={side for side, err in self._offline.items() if err})
         self.banner.set_prompt(prompt)
         for side, panel in self.panels.items():
             panel.view.set_target(prompt.target if prompt.eye == side else None)

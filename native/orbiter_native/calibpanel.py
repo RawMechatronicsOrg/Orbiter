@@ -104,6 +104,8 @@ class CalibrationPanel(QFrame):
     laser_requested = Signal(bool)
     #: The operator dropped every set: whoever follows the stages starts over.
     cleared = Signal()
+    #: The operator re-aimed the rig: the pair and the sheet are to be redone.
+    rig_moved = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -456,6 +458,7 @@ class CalibrationPanel(QFrame):
         self._activity = (f"rig moved: {n} pairs kept as single views, the sheet dropped — "
                           "new pairs and stripe frames replace the server's geometry")
         self._refresh()
+        self.rig_moved.emit()
 
     def _persist(self) -> None:
         """Keep the captured views on disk. A failure here must not stop capture."""

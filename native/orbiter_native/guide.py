@@ -57,6 +57,16 @@ PLANE_FRAMES = 8
 #: eye's stripe, px, for the geometry to count as confirmed — twice the
 #: scan's own veto radius, `ScanParams.confirm_px`.
 VETO_OK_PX = 6.0
+#: Standard deviation of the pairs' scale (`ViewDescriptor.scale`: the
+#: board's size over the frame diagonal) below which every pair so far was
+#: taken at one distance. The pair solve is conditioned by depth variety
+#: as much as by tilt; at one range the rotation and the translation trade
+#: off against each other.
+PAIR_SCALE_SPREAD = 0.015
+
+#: Which eyes each stage needs frames from.
+_EYES_NEEDED = {"left": ("left",), "right": ("right",), "pair": ("left", "right"),
+                "plane": ("left",), "readout": ("left", "right"), "check": ("left", "right")}
 
 _TITLES = {
     "left": "LEFT CAMERA — LENS",
@@ -126,12 +136,14 @@ class Guide:
 
     def update(self, flow, frames: dict[str, tuple[int, int, Orientation]] | None = None,
                laser_on: bool = False, scanning: bool = False,
-               veto_px: float | None = None, kept: int = 0, auto: bool = True) -> Prompt:
+               veto_px: float | None = None, kept: int = 0, auto: bool = True,
+               offline: set[str] | frozenset[str] = frozenset()) -> Prompt:
         """The prompt for now. `frames` gives each eye's frame size and the
         orientation it is shown in, for the target and its name; `veto_px`
         and `kept` are the scan's last frame, for the check; `auto` is the
         panel's 'calibrate continuously' switch, without which no stage but
-        the check can take anything."""
+        the check can take anything; `offline` names the eyes whose stream
+        is down — no board instruction helps those."""
         frames = frames or {}
         if flow.board is None:
             flow.solo = None
@@ -146,6 +158,13 @@ class Guide:
             self.index = next((i for i, s in enumerate(STAGES) if not done[s]), len(STAGES) - 1)
         stage = self.stage
         flow.solo = stage if stage in ("left", "right") else None
+        down = [s for s in _EYES_NEEDED[stage] if s in offline]
+        if down:
+            return self._prompt(stage, " AND ".join(s.upper() for s in down)
+                                + " CAMERA OFFLINE — CHECK CAMSERVER",
+                                "no frames from that eye; its panel says why", "stop",
+                                eye=stage if stage in ("left", "right") else "both",
+                                solo=flow.solo)
         if not auto and stage != "check":
             return self._prompt(stage, "TICK 'calibrate continuously' IN THE CALIBRATION PANEL",
                                 "the guide only watches; that switch takes the views", "stop",
@@ -211,7 +230,7 @@ class Guide:
             action, tone = f"GOOD — NEXT: {place}{need_tilt}", "go"
         elif n >= K_VIEWS and cells >= K_CELLS and not tilt_short and res is None:
             reason = flow.reasons.get(key)
-            action = (f"LENS REFUSED: {reason.upper()} — MORE VIEWS" if reason
+            action = (f"LENS REFUSED: {reason.upper()} — MORE VIEWS, HELD STILLER" if reason
                       else "HOLD ON — SOLVING THE LENS…")
             tone = "adjust" if reason else "go"
         elif done:
@@ -222,6 +241,8 @@ class Guide:
             action = f"MOVE THE BOARD {place}{need_tilt}"
         detail = (f"views {n}/{K_VIEWS} · cells {cells}/{K_CELLS} · "
                   f"tilt {tilt:.0f}/{MIN_TILT_SPREAD:.0f}")
+        if res is None and flow.reasons.get(key):
+            detail += f" · refused: {flow.reasons[key]}"
         if res is not None:
             fx = float(res.intrinsics.K[0, 0])
             sig = res.sigma_f_px / fx * 100.0 if fx > 0 and np.isfinite(res.sigma_f_px) else float("nan")
@@ -230,10 +251,12 @@ class Guide:
                             solo=side, done=done)
 
     def _pair(self, flow) -> Prompt:
-        pairs = len(flow.samples.paired())
+        paired = flow.samples.paired()
+        pairs = len(paired)
         res = flow.results.get("stereo")
         gate, _ = flow.gate()
         tone = "adjust"
+        one_range = pairs >= 6 and pair_scale_spread(paired) < PAIR_SCALE_SPREAD
         if gate == "board":
             absent = [s for s in ("left", "right") if flow.where(s) is None]
             action = ("SHOW THE BOARD TO BOTH CAMERAS" if len(absent) == 2
@@ -247,7 +270,8 @@ class Guide:
         elif gate == "ceiling":
             action, tone = f"{MAX_VIEWS} VIEWS HELD — PRESS Clear AND START OVER", "stop"
         elif gate == "ok":
-            action, tone = "GOOD — NOW A NEW PLACE, TILT OR DISTANCE", "go"
+            action, tone = ("GOOD — NOW CLOSER OR FARTHER" if one_range
+                            else "GOOD — NOW A NEW PLACE, TILT OR DISTANCE"), "go"
         elif pairs >= PAIR_VIEWS and res is None:
             reason = flow.reasons.get("stereo")
             action = (f"PAIR REFUSED: {reason.upper()} — MORE PAIRS" if reason
@@ -256,7 +280,8 @@ class Guide:
         elif self._done("pair", flow):
             action, tone = "PAIR DONE — MORE PAIRS ONLY REFINE IT", "done"
         else:
-            action = "NEW PLACE, TILT OR DISTANCE — BOTH CAMERAS ON THE BOARD"
+            action = ("CHANGE THE DISTANCE — EVERY PAIR SO FAR IS AT ONE RANGE" if one_range
+                      else "NEW PLACE, TILT OR DISTANCE — BOTH CAMERAS ON THE BOARD")
         detail = f"pairs {pairs}/{PAIR_VIEWS}"
         if res is not None:
             detail += (f" · rms {res.rms_px:.2f} px · baseline {res.baseline_mm:.0f} mm · "
@@ -360,6 +385,13 @@ class Guide:
         if seen is None:
             return rect, "TO THE " + place_name(*centre, w, h, o)
         return rect, move_words((seen[0] * w, seen[1] * h), centre, w, h, o)
+
+
+def pair_scale_spread(paired) -> float:
+    """Standard deviation of the pairs' scale in the left eye: how much
+    distance variety the pair set has. Zero for fewer than two pairs."""
+    scales = [p.left.descriptor.scale for p in paired if p.left is not None]
+    return float(np.std(scales)) if len(scales) >= 2 else 0.0
 
 
 def move_words(here: tuple[float, float], there: tuple[float, float],

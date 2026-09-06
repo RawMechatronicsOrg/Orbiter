@@ -214,3 +214,23 @@ def test_the_guides_target_and_highlight_are_drawn_where_the_frame_puts_them() -
         assert (plain == img).all()
     finally:
         view.close()
+
+
+def test_the_target_shows_through_the_stats_overlay() -> None:
+    """The stats box covers the frame's top-left; a target there is drawn
+    over the box, or the operator would never see it in that row."""
+    got = _render(_scene(Orientation()), (W, H))
+    if got is None:
+        pytest.skip("no OpenGL context here")
+    _img, view, dpr = got
+    try:
+        view.set_overlay(["overlay text here, wide enough", "and a second line"])
+        boxed = _grab(view)
+        x, y = int(90 * dpr), int(10 * dpr)                    # in the box, above its glyphs
+        dark = boxed[y, x].astype(int)
+        assert dark.max() < 40, dark                           # the box, over the grey frame
+        view.set_target((0.0, 0.0, 120.0, 60.0))
+        tinted = _grab(view)[y, x].astype(int)
+        assert tinted[0] - dark[0] > 25 and tinted[0] - tinted[2] > 25, (dark, tinted)
+    finally:
+        view.close()

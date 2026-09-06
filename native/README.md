@@ -273,8 +273,15 @@ reads the scan itself: with the laser and the scan on, the median
 disagreement between the left eye's triangulation and the right eye's
 stripe must be within 6 px (twice the scan's own veto radius); hundreds of
 pixels means the geometry is off and the cure is the pair and then the
-sheet again, not more scanning. Untick **guide** and the eyes pair as
-before, with nothing drawn on them.
+sheet again, not more scanning. An eye whose stream is down is named
+first (`LEFT CAMERA OFFLINE — CHECK CAMSERVER`), before any board
+instruction; a refused solve shows its reason in the small line and asks
+for stiller views; from six pairs on, pairs all taken at one distance get
+`CHANGE THE DISTANCE` — depth variety conditions the pair solve as much as
+tilt does. In a lens stage the pair is still taken whenever the other eye
+sees the board and holds still (its frame comes a few milliseconds later);
+an eye that is out of the picture or shaking does not stall the stage.
+Untick **guide** and the eyes pair as before, with nothing drawn on them.
 
 **When the rig moves.** Re-aiming or moving the cameras or the laser stales
 the pair's geometry and the sheet, not the intrinsics: a lens is what it was.

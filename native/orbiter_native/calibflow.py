@@ -631,19 +631,28 @@ class CalibrationFlow:
         if self.board is None or len(self.samples) >= MAX_VIEWS:
             return 0
         left, right = self._find_pair()
-        if left is None or right is None:
-            if force:
-                left = left or (self._recent["left"][-1] if self._recent["left"] else None)
-                right = right or (self._recent["right"][-1] if self._recent["right"] else None)
-            elif self.solo is not None and self._recent[self.solo]:
-                # This eye's own stage: its newest frame stands alone. The
-                # stillness and novelty gates below still apply to it.
-                one = self._recent[self.solo][-1]
+        if force:
+            left = left or (self._recent["left"][-1] if self._recent["left"] else None)
+            right = right or (self._recent["right"][-1] if self._recent["right"] else None)
+        elif self.solo is not None:
+            # This eye's own stage. While the other eye sees the board and
+            # holds still, the pair is worth waiting for — its frame comes a
+            # few ms after this one. Otherwise this eye's newest frame stands
+            # alone, so an eye that is out of the picture, or shaking, cannot
+            # starve it. The stillness and novelty gates below still apply.
+            one = self._recent[self.solo][-1] if self._recent[self.solo] else None
+            if one is None:
+                return 0
+            other = "right" if self.solo == "left" else "left"
+            partner = self._last_corners.get(other) is not None and self._still(other)
+            if not partner:
                 left, right = (one, None) if self.solo == "left" else (None, one)
-            else:
+            elif left is None or right is None:
                 return 0
-            if left is None and right is None:
-                return 0
+        elif left is None or right is None:
+            return 0
+        if left is None and right is None:
+            return 0
         views = {"left": None, "right": None}
         for side, r in (("left", left), ("right", right)):
             if (r is None or r.board is None or r.board.corners is None
