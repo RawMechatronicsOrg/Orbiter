@@ -345,9 +345,13 @@ good for and solves in the background as the sets grow:
 
 Every set keeps what was observed — corners, IDs, stripe pixels, capture
 instants — never what was derived from it. Each cycle (no sooner than 4 s
-after the last, and only when a set grew) solves the intrinsics from all
-views, then the pair, the laser plane and the readout from *their* raw sets
-through the intrinsics just solved: the plane's points and the readout's
+after the last, and only when a set grew) solves what grew — a set that
+did not change gives the answer it gave, and re-solving a hundred views and
+three hundred readout frames every four seconds starved the detector
+threads — with a re-solved lens dragging its pair, sheet and readout along
+whatever their sets did, and **Solve now** solving everything: the
+intrinsics from all views, then the pair, the laser plane and the readout
+from *their* raw sets through the intrinsics just solved: the plane's points and the readout's
 poses are recomputed, not accumulated, so they improve with the camera matrix
 that places them. A result replaces what the server holds only when it is
 better — more data at a residual no more than 15% worse, or a lower residual
@@ -418,12 +422,17 @@ few come and go from one frame to the next, and each change moves the pose
 by a fraction of a degree and a millimetre or two with the scanner standing
 perfectly still — every such frame lays the same surface down a little to
 one side, and a still scan grows a fuzz of ghosts. A hand does not move
-like that, so a frame is placed through the MEDIAN of the poses around it
-in time (`posesmooth`, a centred window of 7 frames): a lone jump is
-outvoted, noise averages down, a steady sweep passes through unchanged
-because the median of a straight run is its middle. Frames wait three
-frames — a tenth of a second — for their neighbours; a gap in time ends
-the window. Two poses are not placed at all: one from fewer than 12 board
+like that. So, first, each eye's pose is solved through the corners it
+has had in every one of its last 12 frames — longer than the detector's
+full pass every 10, which is when marginal corners come and go — so the
+same corners give the same pose every frame; and then a frame is placed
+through the MEDIAN of the poses around it in time (`posesmooth`, a centred
+window of 7 frames): a lone jump is outvoted, noise averages down, a steady
+sweep passes through unchanged because the median of a straight run is its
+middle. Frames wait three frames — a tenth of a second — for their
+neighbours; a gap in time ends the window. The eye views draw the cloud
+through a trailing median of the same kind, so the overlay does not jump
+where the points do not. Two poses are not placed at all: one from fewer than 12 board
 corners across both eyes, and one where the two eyes' own poses disagree by
 over 2° or 15 mm — the pair's geometry then describes another rig, and the
 SCAN panel says so rather than scattering points where that rig would put

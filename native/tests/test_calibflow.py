@@ -348,6 +348,7 @@ def test_a_worse_solve_is_kept_off_the_server(board) -> None:
     # same data but a worse residual must not replace it; one with more data
     # and a residual only a little worse may.
     flow.solvers = _fake_solvers(intr_rms=0.5)
+    flow.request()                          # same data would not be re-solved on its own
     out = flow.run(flow.snapshot(now=10.0))
     payload = flow.finish(out, now=11.0)
     assert payload is None or "intrinsics" not in payload.get("left", {})
@@ -390,6 +391,42 @@ def test_a_solve_of_another_rig_replaces_the_servers_whatever_the_counts(board) 
     payload = same.finish(same.run(same.snapshot(100.0)), 100.0) or {}
     assert "_extrinsics" not in payload and "_laser_plane" not in payload
     assert same.last_note is None and same.saved["stereo"].count == 68
+
+
+def test_a_cycle_solves_only_what_grew_and_what_rests_on_it(board) -> None:
+    flow = _flow(board)
+    flow.solvers = _fake_solvers()
+    flow.plane = _Plane()
+    _fill(flow, board)
+    first = flow.run(flow.snapshot(100.0))
+    assert not first.skipped and set(first.timings) == set(first.results)
+    flow.finish(first, 100.0)
+    # Nothing grew: nothing runs, and what was solved stays known.
+    again = flow.run(flow.snapshot(200.0))
+    assert not again.results and again.skipped == set(first.results)
+    flow.finish(again, 200.0)
+    assert set(flow.results) == set(first.results)
+    # More brisk motion for the left eye: its readout alone runs again.
+    t = 300.0
+    for i in range(6):
+        flow.offer(_result(board, "left", (0.2, 0.1, 0.0), (0.0, 0.0, 0.5), t, shift_px=i * 9))
+        t += 0.033
+    out = flow.run(flow.snapshot(t))
+    assert set(out.results) == {"readout:left"}
+    flow.finish(out, t)
+    # A lens re-solved drags its dependants along, grown or not.
+    _fill(flow, board, n_views=MIN_VIEWS + 2, motion=0, seed=5)
+    out = flow.run(flow.snapshot(t + 100.0))
+    assert {"intrinsics:left", "intrinsics:right", "stereo", "plane",
+            "readout:left", "readout:right"} <= set(out.results)
+    flow.finish(out, t + 100.0)
+    # The operator's own request solves everything.
+    flow.request()
+    out = flow.run(flow.snapshot(t + 200.0))
+    assert not out.skipped and out.results
+    # And Clear forgets what ran.
+    flow.clear()
+    assert flow._ran == {}
 
 
 def test_better_judges_more_data_and_lower_residual() -> None:

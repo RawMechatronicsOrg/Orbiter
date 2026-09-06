@@ -287,6 +287,23 @@ def test_what_the_server_holds_counts_until_the_rig_moves(board) -> None:
     assert g2.update(thin).stage == "left"
 
 
+def test_a_readout_the_solver_gave_up_on_is_not_waited_for(board) -> None:
+    flow, guide = _flow(board), Guide()
+    _lens_done(flow, "left")
+    _lens_done(flow, "right")
+    _pair_done(flow)
+    _plane_done(flow)
+    from orbiter_native.rolling import MIN_VIEWS as READOUT_VIEWS
+    flow.results["readout:left"] = SimpleNamespace(views=50, sigma_s=0.0025)
+    flow.motion._views["right"] = [None] * READOUT_VIEWS   # the right eye twisted plenty
+    flow.reasons["readout:right"] = "too little motion: corners moved 1.2 px over a readout"
+    p = guide.update(flow, laser_on=True)
+    assert p.stage == "readout" and p.action.startswith("READOUT REFUSED: RIGHT TOO LITTLE MOTION")
+    assert "NEXT SKIPS IT" in p.action
+    flow.reasons["readout:right"] = "implausible readout 77.09 ms (rms 1.60 px, skew 53.8 px)"
+    assert guide.update(flow, laser_on=True).stage == "check"
+
+
 def test_without_a_board_spec_nothing_else_is_asked(board) -> None:
     flow, guide = CalibrationFlow(), Guide()
     p = guide.update(flow)

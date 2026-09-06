@@ -101,6 +101,15 @@ POSE_GAP_MAX_MM = 15.0
 #: points by: at the working distance a pose from a handful of corners
 #: wanders by millimetres from frame to frame.
 MIN_POSE_CORNERS = 12
+#: An eye's pose is taken from the corners it has had in EVERY one of its
+#: last `STEADY_FRAMES` frames, when that leaves `MIN_STEADY_CORNERS` or
+#: more. The detector's full ChArUco pass, every `detect.redetect_every`
+#: (10) frames, is when marginal corners come and go, and a pose solved
+#: through a changing set moves although nothing did; the same corners
+#: every frame give the same pose every frame. Longer than the pass
+#: period, so a set survives one.
+STEADY_FRAMES = 12
+MIN_STEADY_CORNERS = 12
 
 
 def _still(a: tuple[np.ndarray, np.ndarray], b: tuple[np.ndarray, np.ndarray]) -> bool:
@@ -306,6 +315,9 @@ class ScanWorker:
         #: Frames wait here for their neighbours in time, and are placed
         #: through the median pose of the window — see `posesmooth`.
         self._smooth = PoseSmoother()
+        #: Per eye, the corner ids of its last frames, for `_steady`.
+        self._ids_seen: dict[str, deque] = {"left": deque(maxlen=STEADY_FRAMES),
+                                            "right": deque(maxlen=STEADY_FRAMES)}
 
         self.cloud = PointCloud()
         self.overlay = CloudOverlay()
@@ -382,6 +394,8 @@ class ScanWorker:
                     q.clear()
                 self._prev = None
                 self._last_right = None
+                for q in self._ids_seen.values():
+                    q.clear()
                 # Frames still waiting for neighbours are placed with what
                 # they have: the session is over, no neighbour is coming.
                 for (f, m, own_t), r_s, t_s in self._smooth.flush():
@@ -556,6 +570,9 @@ class ScanWorker:
                         board_t=pose[1] if pose is not None else b.board_t)
         elif aligned.stripe is not b.stripe:
             b = replace(b, stripe=aligned.stripe)
+        if board is not None:
+            a = self._steady("left", a, rig.left_k, board)
+            b = self._steady("right", b, rig.right_k, board)
         fix = fuse_pose(a, b, rig, board)
         if fix is None:
             self._prev = None
@@ -605,6 +622,29 @@ class ScanWorker:
         if snap is not None:
             self.overlay.publish(*snap)
         self._publish(placed if placed is not None else frame, None)
+
+    def _steady(self, side: str, x: ScanInput, k, board) -> ScanInput:
+        """This eye's input with its pose re-solved through the corners it
+        has had in every one of its last `STEADY_FRAMES` frames — the same
+        corners every frame, so the pose does not move when a marginal one
+        comes or goes. The input as it was when the steady set is too
+        small, or when nothing was dropped anyway."""
+        seen = self._ids_seen[side]
+        if x.corners is None or x.ids is None or not len(x.ids):
+            return x
+        ids = np.asarray(x.ids).ravel()
+        seen.append(set(int(i) for i in ids))
+        if len(seen) < 2:
+            return x
+        steady = set.intersection(*seen)
+        if len(steady) < MIN_STEADY_CORNERS or len(steady) == len(ids):
+            return x
+        keep = np.isin(ids, list(steady))
+        pose = estimate_pose(x.corners[keep], x.ids[keep], board, k, x.board_R)
+        if pose is None:
+            return x
+        return replace(x, corners=x.corners[keep], ids=x.ids[keep],
+                       board_R=pose[0], board_t=pose[1])
 
     @staticmethod
     def _place(frame: ScanFrame, motion: Motion | None, own_t: np.ndarray,

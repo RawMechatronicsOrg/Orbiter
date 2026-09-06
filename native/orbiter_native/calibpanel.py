@@ -408,7 +408,12 @@ class CalibrationPanel(QFrame):
         else:
             solved = ", ".join(k for k in out.results)
             note, self.flow.last_note = self.flow.last_note, None
+            slow = ", ".join(f"{k} {t:.0f} s" for k, t in
+                             sorted(out.timings.items(), key=lambda kv: -kv[1]) if t >= 1.0)
             self._activity = (f"cycle {out.seconds:.1f} s: {solved or 'nothing solved'}"
+                              + (f" ({slow})" if slow else "")
+                              + (f" · unchanged: {', '.join(sorted(out.skipped))}"
+                                 if out.skipped else "")
                               + (" — saving" if payload and self.autosave.isChecked() else "")
                               + (f" · {note}" if note else ""))
         if payload and self.autosave.isChecked():

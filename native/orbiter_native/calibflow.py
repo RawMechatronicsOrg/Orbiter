@@ -187,6 +187,12 @@ class Job:
     motion: dict[str, list[MotionView]]
     known_k: dict[str, Any]
     laser_active: bool
+    #: Solves whose inputs have not changed since they last ran — the same
+    #: data gives the same answer, and a cycle that re-solves a hundred
+    #: views and three hundred readout frames every four seconds starves
+    #: the detector threads. Dependants of a lens that is re-solved this
+    #: cycle are never skipped: they must be re-fitted through it.
+    skip: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -196,6 +202,9 @@ class Outcome:
     results: dict[str, Any] = field(default_factory=dict)
     reasons: dict[str, str] = field(default_factory=dict)
     seconds: float = 0.0
+    #: Seconds per solve that ran, and the solves that did not.
+    timings: dict[str, float] = field(default_factory=dict)
+    skipped: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -317,6 +326,10 @@ class CalibrationFlow:
         self._running = False
         self._last_cycle_end = -1e9
         self._seen = self._counts()
+        #: Per solve, the data count it last ran on; a solve runs again only
+        #: when its count moved, its lens was re-solved, or the operator asked.
+        self._ran: dict[str, int] = {}
+        self._force = False
 
     # ── configuration ─────────────────────────────────────────────────────
 
@@ -366,6 +379,7 @@ class CalibrationFlow:
         self.motion.clear()
         self.results.clear()
         self.reasons.clear()
+        self._ran.clear()
         for q in self._recent.values():
             q.clear()
         self._last_corners.clear()
@@ -771,8 +785,10 @@ class CalibrationFlow:
         return self._running
 
     def request(self) -> None:
-        """Make the next `due` true regardless of pacing: the operator asked."""
+        """Make the next `due` true regardless of pacing, and have it solve
+        everything: the operator asked."""
         self._seen = {}
+        self._force = True
         self._last_cycle_end = -1e9
 
     def payload_current(self) -> dict[str, Any] | None:
@@ -807,8 +823,10 @@ class CalibrationFlow:
 
     def snapshot(self, now: float, wh: tuple[int, int] | None = None) -> Job:
         """Copy the inputs for a cycle and mark it running."""
-        self._seen = self._counts()
+        counts = self._counts()
+        self._seen = counts
         self._running = True
+        skip = self._unchanged(counts)
         views = {s: list(self.samples.views(s)) for s in ("left", "right")}
         if wh is None:
             for s in ("left", "right"):
@@ -821,29 +839,60 @@ class CalibrationFlow:
             pairs=list(self.samples.paired()), plane_frames=self.plane.frames,
             plane=self.plane.copy(),
             motion={s: list(self.motion.views(s)) for s in ("left", "right")},
-            known_k=dict(self.known_k), laser_active=self.laser_active,
+            known_k=dict(self.known_k), laser_active=self.laser_active, skip=skip,
         )
+
+    def _unchanged(self, counts: dict[str, int]) -> set[str]:
+        """The solves this cycle may skip, and the bookkeeping that says
+        which counts the ones that run are running on."""
+        by_key = {"intrinsics:left": counts["left"], "intrinsics:right": counts["right"],
+                  "stereo": counts["pairs"], "plane": counts["plane"],
+                  "readout:left": counts["motion:left"],
+                  "readout:right": counts["motion:right"]}
+        force, self._force = self._force, False
+        same = {key: (not force and self._ran.get(key) == n) for key, n in by_key.items()}
+        lens = {s: not same[f"intrinsics:{s}"] for s in ("left", "right")}
+        skip = {key for key in ("intrinsics:left", "intrinsics:right") if same[key]}
+        if same["stereo"] and not (lens["left"] or lens["right"]):
+            skip.add("stereo")
+        if same["plane"] and not lens["left"]:
+            skip.add("plane")
+        for s in ("left", "right"):
+            if same[f"readout:{s}"] and not lens[s]:
+                skip.add(f"readout:{s}")
+        for key, n in by_key.items():
+            if key not in skip:
+                self._ran[key] = n
+        return skip
 
     def run(self, job: Job) -> Outcome:
         """The solves, in dependency order, on the job's copies only."""
         t0 = time.perf_counter()
-        out = Outcome()
+        out = Outcome(skipped=set(job.skip))
         k = dict(job.known_k)
         for side in ("left", "right"):
             key = f"intrinsics:{side}"
+            if key in job.skip:
+                continue
             views = job.views[side]
             if len(views) < MIN_VIEWS:
                 out.reasons[key] = f"{len(views)} views, need {MIN_VIEWS}"
                 continue
+            t1 = time.perf_counter()
             res, why = self.solvers["intrinsics"](views, job.board, tilt_spread=job.tilt[side])
+            out.timings[key] = time.perf_counter() - t1
             if res is None:
                 out.reasons[key] = why
                 continue
             out.results[key] = res
             k[side] = res.intrinsics
-        if "left" in k and "right" in k and job.pairs:
+        if "stereo" in job.skip:
+            pass
+        elif "left" in k and "right" in k and job.pairs:
+            t1 = time.perf_counter()
             res, why = self.solvers["stereo"](job.pairs, job.board, k["left"], k["right"],
                                               job.pairs[0].left.wh)
+            out.timings["stereo"] = time.perf_counter() - t1
             if res is None:
                 out.reasons["stereo"] = why
             else:
@@ -852,8 +901,12 @@ class CalibrationFlow:
             out.reasons["stereo"] = "no views where both eyes saw the board at once"
         else:
             out.reasons["stereo"] = "needs intrinsics for both eyes"
-        if "left" in k and job.plane_frames:
+        if "plane" in job.skip:
+            pass
+        elif "left" in k and job.plane_frames:
+            t1 = time.perf_counter()
             plane, why = job.plane.refit(job.board, k["left"], job.wh)
+            out.timings["plane"] = time.perf_counter() - t1
             if plane is None:
                 out.reasons["plane"] = why
             else:
@@ -865,6 +918,8 @@ class CalibrationFlow:
             out.reasons["plane"] = "needs left-eye intrinsics"
         for side in ("left", "right"):
             key = f"readout:{side}"
+            if key in job.skip:
+                continue
             views = job.motion[side]
             if side not in k:
                 out.reasons[key] = "needs intrinsics"
@@ -872,7 +927,9 @@ class CalibrationFlow:
             if not views:
                 out.reasons[key] = "no brisk motion seen yet"
                 continue
+            t1 = time.perf_counter()
             r, why = self.solvers["readout"](views, job.board, k[side])
+            out.timings[key] = time.perf_counter() - t1
             if r is None:
                 out.reasons[key] = why
             else:

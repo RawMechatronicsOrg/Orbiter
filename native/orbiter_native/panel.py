@@ -93,8 +93,9 @@ class EyePanel(QFrame):
         self._scanning = on
 
     def on_result(self, res: EyeResult, pose=None) -> None:
-        """`pose` is a (R, t) to draw the cloud through when the result has
-        none of its own — the right eye's, composed from the left's."""
+        """`pose` is a (R, t) to draw the cloud through: the window's
+        steadied version of this eye's own, or, when the eye has none,
+        the other eye's composed across the pair."""
         self.view.set_scene(self._scene(res, pose))
         self.view.set_overlay(self._overlay_lines(res))
 
@@ -119,9 +120,9 @@ class EyePanel(QFrame):
             laser=laser,
             hull=None if res.hull is None else res.hull.reshape(-1, 2),
             cloud=cloud,
-            R=(pose[0] if pose is not None and (board is None or board.R is None)
+            R=(pose[0] if pose is not None
                else None if board is None else board.R),
-            t=(pose[1] if pose is not None and (board is None or board.t is None)
+            t=(pose[1] if pose is not None
                else None if board is None else board.t),
             K=None if k is None else k.K,
             D=None if k is None else k.D,

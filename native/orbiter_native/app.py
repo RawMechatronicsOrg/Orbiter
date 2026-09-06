@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
@@ -43,6 +44,7 @@ from .guide import Guide
 from .guidepanel import GuideBanner
 from .laser import LaserParams
 from .panel import EyePanel
+from .posesmooth import median_pose
 from .scanpanel import ScanPanel
 from .scanworker import POSE_RECENT_S, ScanWorker
 from .screens import adapter_of_window, same_gpu
@@ -118,6 +120,11 @@ class MainWindow(QMainWindow):
         self._wh: dict[str, tuple[int, int] | None] = {"left": None, "right": None}
         #: Each eye's stream error, for the guide: None while frames arrive.
         self._offline: dict[str, str | None] = {"left": None, "right": None}
+        #: Each eye's last own poses, for drawing the cloud through their
+        #: median rather than through whatever this frame's corners gave:
+        #: the scan places points through a steadied pose (`posesmooth`),
+        #: and the overlay must not jump where the points do not.
+        self._pose_hist: dict[str, deque] = {"left": deque(maxlen=7), "right": deque(maxlen=7)}
         #: The scan's last frame while scanning, for the guide's check.
         self._scan_frame = None
 
@@ -372,7 +379,15 @@ class MainWindow(QMainWindow):
             if res is None:
                 continue
             pose = None
-            if res.board is None or res.board.R is None:
+            if res.board is not None and res.board.R is not None:
+                hist = self._pose_hist[side]
+                hist.append((res.board.R, res.board.t))
+                if len(hist) >= 3:
+                    pose = median_pose(list(hist), len(hist) - 1)
+            else:
+                # The board is out of this eye's sight: a pose from before
+                # it left is no neighbour of the one it comes back with.
+                self._pose_hist[side].clear()
                 # No pose of its own this frame: for drawing, the other eye's
                 # recent one carried across through the pair.
                 other = self._poses["right" if side == "left" else "left"]

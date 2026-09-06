@@ -80,3 +80,37 @@ def test_the_worker_places_a_frame_through_the_smoothed_pose() -> None:
     assert frame.n_kept == 2 and frame.n_rejected_volume == 1           # 900 mm out: under the board
     assert np.allclose(frame.points_board, [[0.0, 0.0, 102.0], [10.0, 0.0, 102.0]])
     assert len(frame.pixels_left) == 2 and len(frame.weights) == 2 and len(frame.scanlines) == 2
+
+
+def test_the_pose_comes_from_the_corners_seen_in_every_recent_frame(monkeypatch) -> None:
+    """A corner that blinks in on a full detection pass must not move the
+    pose: the eye is solved through the corners it has had all along."""
+    from orbiter_native import scanworker
+    from orbiter_native.scanworker import ScanInput, ScanWorker
+
+    calls = []
+
+    def fake_estimate(corners, ids, board, k, R_prev=None):
+        calls.append(sorted(int(i) for i in np.asarray(ids).ravel()))
+        return np.eye(3), np.array([0.0, 0.0, 500.0]), 0.0
+
+    monkeypatch.setattr(scanworker, "estimate_pose", fake_estimate)
+    w = ScanWorker()
+
+    def inp(ids):
+        ids = np.array(ids, np.int32).reshape(-1, 1)
+        return ScanInput(1.0, None, np.eye(3), np.array([1.0, 2.0, 3.0]), (64, 48),
+                         corners=np.zeros((len(ids), 1, 2), np.float32), ids=ids)
+
+    base = list(range(20))
+    first = w._steady("left", inp(base), None, object())
+    assert first.board_t.tolist() == [1.0, 2.0, 3.0] and not calls       # nothing to compare with
+    out = w._steady("left", inp(base + [99]), None, object())             # one blinks in
+    assert calls[-1] == base and len(out.ids) == 20 and out.board_t[2] == 500.0
+    n = len(calls)
+    same = w._steady("left", inp(base), None, object())                   # nothing dropped
+    assert len(calls) == n and same.board_t.tolist() == [1.0, 2.0, 3.0]
+    few = w._steady("left", inp(base[:5]), None, object())                # too few in common
+    assert len(calls) == n and len(few.ids) == 5
+    # The eyes keep their own histories.
+    assert w._steady("right", inp(base + [7, 8]), None, object()).board_t.tolist() == [1.0, 2.0, 3.0]

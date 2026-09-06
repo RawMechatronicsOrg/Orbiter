@@ -210,7 +210,11 @@ class Guide:
             return bool((flow.plane.frames >= PLANE_FRAMES and "plane" in flow.results)
                         or held("plane", PLANE_FRAMES))
         if stage == "readout":
+            # Optional: a readout the solver has given up on, with the data
+            # there, is not waited for either.
             return all(f"readout:{s}" in flow.results or held(f"readout:{s}", READOUT_VIEWS)
+                       or (flow.motion.count(s) >= READOUT_VIEWS
+                           and _given_up(flow.reasons.get(f"readout:{s}")))
                        for s in ("left", "right"))
         return False   # the check is where the guide ends; it is never skipped
 
@@ -335,11 +339,17 @@ class Guide:
 
     def _readout(self, flow) -> Prompt:
         c = {s: flow.motion.count(s) for s in ("left", "right")}
-        missing = [s for s in ("left", "right") if f"readout:{s}" not in flow.results]
+        missing = [s for s in ("left", "right")
+                   if f"readout:{s}" not in flow.results and not flow.held(f"readout:{s}")]
         which = "BOTH CAMERAS" if len(missing) == 2 else f"THE {missing[0].upper()} CAMERA"
         action = f"TWIST AND TILT THE BOARD BRISKLY IN FRONT OF {which}"
         tone = "adjust"
-        if all(c[s] >= READOUT_VIEWS for s in missing):
+        refused = {s: flow.reasons[f"readout:{s}"] for s in missing
+                   if c[s] >= READOUT_VIEWS and flow.reasons.get(f"readout:{s}")}
+        if refused:
+            action = ("READOUT REFUSED: " + "; ".join(f"{s.upper()} {why}" for s, why in refused.items())
+                      + " — TWIST MORE BRISKLY, OR NEXT SKIPS IT").upper()
+        elif all(c[s] >= READOUT_VIEWS for s in missing):
             action, tone = "HOLD ON — SOLVING THE READOUT…", "go"
         detail = (f"L {c['left']}/{READOUT_VIEWS} · R {c['right']}/{READOUT_VIEWS} frames · "
                   "optional — NEXT skips it")
@@ -397,6 +407,11 @@ class Guide:
         if seen is None:
             return rect, "TO THE " + place_name(*centre, w, h, o)
         return rect, move_words((seen[0] * w, seen[1] * h), centre, w, h, o)
+
+
+def _given_up(reason: str | None) -> bool:
+    """A readout refusal that more twisting will not change."""
+    return bool(reason) and reason.startswith(("implausible", "solve failed"))
 
 
 def _saturated(eyes, exposure_auto: bool) -> tuple[str, str]:
