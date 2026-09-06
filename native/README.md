@@ -475,6 +475,21 @@ for `gl_PointCoord`, and `GL_POINT_SPRITE` enabled — without either every
 fragment reads (0, 0), falls outside the circle and is discarded, with a
 clean shader log. `test_cloudview.py` renders and reads back.
 
+**Colour.** Each scanned point carries the colour of the surface next to its
+stripe pixel: under the stripe every surface is laser-red, so the left eye's
+image is read 8 px to either side, across the stripe, three pixels along it
+each, and the median per channel is the point's colour (`scan.sample_beside`,
+`ScanParams.colour_offset_px`). The still-frame average and the voxel grid
+average colours the way they average positions, the PLY carries them as
+`red/green/blue`, and the live view draws them: **colour** picks the points'
+own colour, the height shading, or whichever is there. Until the laser is
+strobed (BACKLOG) this is the room's light on the surface beside the stripe,
+not under it, so a white next to a red stripe comes out slightly warm.
+**spin** turns the cloud on its own; **PNG** saves the view as drawn; **Full
+screen** (F11, Esc back) gives the cloud the whole screen in a second view fed
+the same arrays; the view is multisampled, so points and the board's lines
+stop crawling as it turns.
+
 ## Measured on this machine
 
 Live 1280×720 frames from the pair, isolated:

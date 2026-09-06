@@ -24,12 +24,23 @@ import math
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QPointF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QMatrix4x4, QOpenGLFunctions, QPainter, QVector3D
+from PySide6.QtCore import QPointF, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QKeySequence,
+    QMatrix4x4,
+    QOpenGLFunctions,
+    QPainter,
+    QShortcut,
+    QSurfaceFormat,
+    QVector3D,
+)
 from PySide6.QtOpenGL import QOpenGLBuffer, QOpenGLShader, QOpenGLShaderProgram
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -37,6 +48,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSpinBox,
     QVBoxLayout,
+    QWidget,
 )
 
 from .scan import ScanVolume, read_ply
@@ -58,6 +70,7 @@ _GL_PROGRAM_POINT_SIZE = 0x8642
 #: point sprites enabled; without it every fragment read (0, 0), fell outside
 #: the circle and was discarded — a blank view with a clean shader log.
 _GL_POINT_SPRITE = 0x8861
+_GL_MULTISAMPLE = 0x809D
 
 # GLSL 1.20 on purpose: `gl_PointCoord` is undefined before it — on this
 # driver it read as zero, every fragment fell outside the circle, and nothing
@@ -134,6 +147,19 @@ class CloudView(QOpenGLWidget):
         self._lines = QOpenGLBuffer(QOpenGLBuffer.Type.VertexBuffer)
         self._uploaded = None
         self._caption = "no cloud yet"
+        #: "auto" draws the points' own colour when they have one and height
+        #: otherwise; "rgb" and "height" ask for one of them outright.
+        self.colour_mode = "auto"
+        # Four samples per pixel: point edges and the board's lines stop
+        # crawling as the cloud turns. Asked for here, before the widget is
+        # shown — the one moment a QOpenGLWidget takes a format.
+        fmt = QSurfaceFormat.defaultFormat()
+        fmt.setSamples(4)
+        self.setFormat(fmt)
+        # A slow turntable, for looking at a scan without holding the mouse.
+        self._spin = QTimer(self)
+        self._spin.setInterval(33)
+        self._spin.timeout.connect(self._spin_tick)
 
     # ── content ───────────────────────────────────────────────────────────
 
@@ -263,6 +289,46 @@ class CloudView(QOpenGLWidget):
         self._target = self._target - s * dx_px * per_px + u * dy_px * per_px
         self.update()
 
+    def set_spinning(self, on: bool) -> None:
+        """Turn the cloud on its own, 15 degrees a second, until told not to."""
+        if on:
+            self._spin.start()
+        else:
+            self._spin.stop()
+
+    def _spin_tick(self) -> None:
+        self._yaw = (self._yaw + math.radians(0.5)) % (2.0 * math.pi)
+        self.update()
+
+    # ── the look ──────────────────────────────────────────────────────────
+
+    def set_colour_mode(self, mode: str) -> None:
+        """`auto`, `rgb` or `height` — see `colour_mode`."""
+        self.colour_mode = mode
+        self.update()
+
+    def use_rgb(self) -> bool:
+        """Draw the points in their own colour? Only when they have one and
+        the mode does not ask for height; `rgb` without colours is height."""
+        return self._colors is not None and self.colour_mode != "height"
+
+    def save_png(self, path: str) -> bool:
+        """The view as drawn, at its pixel size."""
+        return bool(self.grabFramebuffer().save(path, "PNG"))
+
+    def copy_state_from(self, other: "CloudView") -> None:
+        """The same cloud, the same orbit and the same look as `other` — for
+        a second view of one cloud, such as the full-screen one. Arrays are
+        shared, not copied; neither view writes to them."""
+        self._src, self._points, self._colors, self._n = (
+            other._src, other._points, other._colors, other._n)
+        self._z_range, self._caption = other._z_range, other._caption
+        self._target, self._dist = other._target.copy(), other._dist
+        self._yaw, self._pitch = other._yaw, other._pitch
+        self.point_px, self.colour_mode = other.point_px, other.colour_mode
+        self._uploaded = None
+        self.update()
+
     # ── GL ────────────────────────────────────────────────────────────────
 
     def initializeGL(self) -> None:  # noqa: N802 - Qt naming
@@ -299,6 +365,7 @@ class CloudView(QOpenGLWidget):
         gl.glEnable(_GL_DEPTH_TEST)
         gl.glEnable(_GL_PROGRAM_POINT_SIZE)
         gl.glEnable(_GL_POINT_SPRITE)
+        gl.glEnable(_GL_MULTISAMPLE)
         mvp = _qmat4(self.view_projection())
 
         # The board's disc and axes.
@@ -342,7 +409,7 @@ class CloudView(QOpenGLWidget):
         prog.setUniformValue1f("size", float(self.point_px))
         prog.setUniformValue1f("z_lo", float(self._z_range[0]))
         prog.setUniformValue1f("z_hi", float(self._z_range[1]))
-        prog.setUniformValue1f("use_rgb", 1.0 if self._colors is not None else 0.0)
+        prog.setUniformValue1f("use_rgb", 1.0 if self.use_rgb() else 0.0)
         self._vbo.bind()
         prog.enableAttributeArray("xyz")
         prog.setAttributeBuffer("xyz", _GL_FLOAT, 0, 3, 0)
@@ -383,8 +450,46 @@ def _qmat4(m: np.ndarray) -> QMatrix4x4:
     return QMatrix4x4(*[float(v) for v in np.asarray(m, np.float64).ravel()])
 
 
+class _FullscreenCloud(QWidget):
+    """The cloud alone on the whole screen.
+
+    A second CloudView fed the same arrays, not the panel's view moved out: a
+    QOpenGLWidget reparented into another top-level window loses its GL
+    context and rebuilds it, and the dance around that is worse than one more
+    context that lives only while the screen is taken. Esc or F11 gives the
+    screen back.
+    """
+
+    def __init__(self, panel: "CloudPanel") -> None:
+        super().__init__(None, Qt.WindowType.Window)
+        self._panel = panel
+        self.setWindowTitle("Orbiter — cloud")
+        self.setStyleSheet("background:#0d1013;")
+        self.view = CloudView(self)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self.view, 1)
+        hint = QLabel("Esc or F11 to come back · drag to turn · wheel to zoom · "
+                      "right-drag to pan · double-click to fit")
+        hint.setStyleSheet(
+            "color:#8b9aac; font-family:Consolas; font-size:10px; padding:2px 8px;")
+        root.addWidget(hint)
+
+    def keyPressEvent(self, e) -> None:  # noqa: N802 - Qt naming
+        if e.key() in (Qt.Key.Key_Escape, Qt.Key.Key_F11):
+            self.close()
+        else:
+            super().keyPressEvent(e)
+
+    def closeEvent(self, e) -> None:  # noqa: N802 - Qt naming
+        self._panel._fullscreen_closed(self)
+        super().closeEvent(e)
+
+
 class CloudPanel(QFrame):
-    """The view with its few controls: live or a file, and the point size."""
+    """The view with its controls: live or a file, the point size, the
+    colour, a turntable, a PNG of the view, and the whole screen."""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -392,6 +497,7 @@ class CloudPanel(QFrame):
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.view = CloudView()
         self._file: tuple[np.ndarray, np.ndarray | None, str] | None = None
+        self._big: _FullscreenCloud | None = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 6, 8, 8)
@@ -422,26 +528,94 @@ class CloudPanel(QFrame):
         row.addWidget(self.size)
         row.addStretch(1)
         root.addLayout(row)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("colour"))
+        self.colour = QComboBox()
+        self.colour.addItems(["auto", "rgb", "height"])
+        self.colour.setToolTip("auto: the points' own colour when the scan has one, "
+                               "height shading otherwise.")
+        self.colour.currentTextChanged.connect(self._set_colour_mode)
+        row2.addWidget(self.colour)
+        self.spin = QCheckBox("spin")
+        self.spin.setToolTip("Turn the cloud slowly on its own, like a turntable.")
+        self.spin.toggled.connect(self._set_spinning)
+        row2.addWidget(self.spin)
+        self.btn_png = QPushButton("PNG")
+        self.btn_png.setToolTip("Save the view as drawn to a PNG.")
+        self.btn_png.clicked.connect(self._save_png)
+        row2.addWidget(self.btn_png)
+        self.btn_full = QPushButton("Full screen")
+        self.btn_full.setToolTip("The cloud alone on the whole screen (F11); Esc comes back.")
+        self.btn_full.clicked.connect(self.expand)
+        row2.addWidget(self.btn_full)
+        row2.addStretch(1)
+        root.addLayout(row2)
+        QShortcut(QKeySequence(Qt.Key.Key_F11), self, activated=self.expand)
         root.addWidget(self.view, 1)
 
         self.hint = QLabel("drag to turn · wheel to zoom · right-drag to pan · double-click to fit")
         self.hint.setStyleSheet("color:#8b9aac; font-family:Consolas; font-size:10px;")
         root.addWidget(self.hint)
 
-    def set_live_points(self, points: np.ndarray, n_total: int) -> None:
-        """The scan's current snapshot; drawn while `live` is on."""
+    def _views(self) -> list[CloudView]:
+        """The panel's view and, while the screen is taken, the big one."""
+        return [self.view] + ([self._big.view] if self._big is not None else [])
+
+    def _feed(self, points, colors, caption: str, fit: bool) -> None:
+        for v in self._views():
+            v.set_cloud(points, colors, caption=caption, fit=fit)
+
+    def set_live_points(self, points: np.ndarray, n_total: int,
+                        colors: np.ndarray | None = None) -> None:
+        """The scan's current snapshot, with its colours when the scan has
+        them; drawn while `live` is on."""
         if self.live.isChecked():
-            self.view.set_cloud(points, caption=f"live · {n_total} points"
-                                + (f" ({len(points)} shown)" if len(points) < n_total else ""))
+            self._feed(points, colors, f"live · {n_total} points"
+                       + (f" ({len(points)} shown)" if len(points) < n_total else ""), False)
 
     def _resize_points(self, value: int) -> None:
-        self.view.point_px = float(value)
-        self.view.update()
+        for v in self._views():
+            v.point_px = float(value)
+            v.update()
+
+    def _set_colour_mode(self, mode: str) -> None:
+        for v in self._views():
+            v.set_colour_mode(mode)
+
+    def _set_spinning(self, on: bool) -> None:
+        for v in self._views():
+            v.set_spinning(on)
+
+    def _save_png(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "Save the view", "cloud.png", "PNG (*.png)")
+        if not path:
+            return
+        ok = self.view.save_png(path)
+        self.hint.setText(f"saved {Path(path).name}" if ok else f"could not write {path}")
+
+    def expand(self) -> None:
+        """The cloud on the whole screen — or back, if it already is."""
+        if self._big is not None:
+            self._big.close()
+            return
+        big = _FullscreenCloud(self)
+        big.view.copy_state_from(self.view)
+        big.view.set_spinning(self.spin.isChecked())
+        screen = self.screen()
+        if screen is not None:
+            big.move(screen.geometry().topLeft())       # the screen this panel is on
+        self._big = big
+        big.showFullScreen()
+
+    def _fullscreen_closed(self, big: "_FullscreenCloud") -> None:
+        if self._big is big:
+            self._big = None
 
     def _show(self) -> None:
         if not self.live.isChecked() and self._file is not None:
             pts, rgb, name = self._file
-            self.view.set_cloud(pts, rgb, caption=f"{name} · {len(pts)} points", fit=True)
+            self._feed(pts, rgb, f"{name} · {len(pts)} points", True)
 
     def _open(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Open point cloud", "", "PLY (*.ply)")

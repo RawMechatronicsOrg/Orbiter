@@ -56,6 +56,22 @@ def _app():
     return QApplication.instance() or QApplication([])
 
 
+def test_colour_mode_falls_back_to_height_without_colours() -> None:
+    _app()
+    v = CloudView()
+    v.set_cloud(np.zeros((3, 3)))
+    assert v.use_rgb() is False
+    v.set_cloud(np.ones((3, 3)), np.full((3, 3), 90, np.uint8))
+    assert v.use_rgb() is True
+    v.set_colour_mode("height")
+    assert v.use_rgb() is False
+    v.set_colour_mode("rgb")
+    assert v.use_rgb() is True
+    other = CloudView()
+    other.copy_state_from(v)
+    assert other.use_rgb() is True and other._n == 3 and other.colour_mode == "rgb"
+
+
 def test_the_target_is_in_the_middle_and_z_is_up() -> None:
     _app()
     view = CloudView()
