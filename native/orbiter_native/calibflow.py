@@ -37,7 +37,6 @@ and it wants tests.
 from __future__ import annotations
 
 import logging
-import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -78,6 +77,13 @@ PAIR_MOVE_PX = 0.3
 #: ...and never further apart than half a frame interval, past which the
 #: nearest frame in the other eye is a different moment, not this one.
 PAIR_MAX_GAP_S = 0.016
+
+#: In a lens stage (`CalibrationFlow.solo`), how much older than this eye's
+#: newest frame the other eye's newest board frame may be for the two to
+#: count as a pair in the making: two frames at 30 fps. Beyond it the other
+#: eye's stream has stopped, or it lost the board, and this eye takes its
+#: views alone rather than wait for a pair that cannot form.
+PARTNER_FRESH_S = 4 * PAIR_MAX_GAP_S
 
 #: Recent results kept per eye while looking for a partner frame. Detection
 #: takes 5-20 ms and the two threads drift independently; measured over 269
@@ -294,7 +300,6 @@ class CalibrationFlow:
         self._running = False
         self._last_cycle_end = -1e9
         self._seen = self._counts()
-        self.lock = threading.Lock()
 
     # ── configuration ─────────────────────────────────────────────────────
 
@@ -537,23 +542,35 @@ class CalibrationFlow:
         m = self._moved.get(side)
         return m is not None and m <= STILL_PX
 
-    def gate(self) -> tuple[str, str]:
+    def gate(self, solo: str | None = "") -> tuple[str, str]:
         """Why the automatic capture is not taking a view right now: the first
         gate the current frames fail, in the order `_capture` applies them,
         as `(key, why)`. The key is one word for the guide to act on, the
-        text is for the panel.
+        text is for the panel. `solo` overrides `self.solo` for the asking,
+        so the guide can read a stage's gate before it has switched to it.
 
         From the outside every gate looks the same — the view count does not
         move — and an operator waving the board sees nothing to correct. Which
         eye, and by how many pixels, is the difference between "hold still"
         and knowing that the right eye has never seen the board at all.
         """
+        if solo == "":
+            solo = self.solo
         if self.board is None:
             return "spec", "no board spec from the server"
         if len(self.samples) >= MAX_VIEWS:
             return "ceiling", f"{MAX_VIEWS} views held, the ceiling"
-        if self.solo is not None:
-            return self._solo_gate(self.solo)
+        if solo is not None:
+            own = self._solo_gate(solo)
+            one = self._recent[solo][-1] if self._recent[solo] else None
+            if own[0] != "ok" or one is None or not self._partner(solo, one):
+                return own
+            # A still partner in the picture: the pair's gates decide, as
+            # `_capture` waits for the pair in that case.
+        return self._pair_gate(solo)
+
+    def _pair_gate(self, solo: str | None) -> tuple[str, str]:
+        """The pair path's gates; with `solo`, novelty is that eye's own."""
         absent = [s for s in ("left", "right") if self._last_corners.get(s) is None]
         if absent:
             return "board", ("no board in either eye" if len(absent) == 2
@@ -575,9 +592,26 @@ class CalibrationFlow:
         if drift > PAIR_MOVE_PX:
             return "drift", (f"board slides {drift:.2f} px between the eyes' exposures, "
                              f"over {PAIR_MOVE_PX:g}: hold stiller")
-        if not self.samples.is_new(a.descriptor, b.descriptor):
+        if solo is not None:
+            d = (a if solo == "left" else b).descriptor
+            if self.samples.novelty(solo, d) < self.samples.novelty_threshold:
+                return "dup", (f"still, nothing new for the {solo} eye: a new place in the "
+                               "frame or a new tilt")
+        elif not self.samples.is_new(a.descriptor, b.descriptor):
             return "dup", "still and paired, nothing new: a new place in the frame or a new tilt"
         return "ok", "taking a view"
+
+    def _partner(self, solo: str, one) -> bool:
+        """Whether the other eye is in the pair right now: it delivered a
+        board within `PARTNER_FRESH_S` of this eye's newest frame `one`, and
+        holds still. Read from the eyes' newest frames, not from the pair
+        history — that is cleared at every capture, and an eye whose stream
+        has stopped leaves no frame to say so."""
+        other = "right" if solo == "left" else "left"
+        last = self._last_corners.get(other)
+        if last is None or last[2] is None or one.capture_mono is None:
+            return False
+        return abs(one.capture_mono - last[2]) <= PARTNER_FRESH_S and self._still(other)
 
     def _solo_gate(self, side: str) -> tuple[str, str]:
         """`gate` for one eye's own stage: the other eye is not asked."""
@@ -592,7 +626,8 @@ class CalibrationFlow:
             return "wait", f"waiting for the next {side} frame"
         d = self._recent[side][-1].descriptor
         if self.samples.novelty(side, d) < self.samples.novelty_threshold:
-            return "dup", "still, nothing new: a new place in the frame or a new tilt"
+            return "dup", (f"still, nothing new for the {side} eye: a new place in the frame "
+                           "or a new tilt")
         return "ok", "taking a view"
 
     def gate_report(self) -> str:
@@ -635,17 +670,16 @@ class CalibrationFlow:
             left = left or (self._recent["left"][-1] if self._recent["left"] else None)
             right = right or (self._recent["right"][-1] if self._recent["right"] else None)
         elif self.solo is not None:
-            # This eye's own stage. While the other eye sees the board and
-            # holds still, the pair is worth waiting for — its frame comes a
-            # few ms after this one. Otherwise this eye's newest frame stands
-            # alone, so an eye that is out of the picture, or shaking, cannot
-            # starve it. The stillness and novelty gates below still apply.
+            # This eye's own stage. While the other eye delivered a still
+            # board within the last couple of frames, the pair is worth
+            # waiting for — its frame comes a few ms after this one.
+            # Otherwise this eye's newest frame stands alone, so an eye that
+            # is out of the picture, shaking, or whose stream has stopped
+            # cannot starve it. The stillness and novelty gates below apply.
             one = self._recent[self.solo][-1] if self._recent[self.solo] else None
             if one is None:
                 return 0
-            other = "right" if self.solo == "left" else "left"
-            partner = self._last_corners.get(other) is not None and self._still(other)
-            if not partner:
+            if not self._partner(self.solo, one):
                 left, right = (one, None) if self.solo == "left" else (None, one)
             elif left is None or right is None:
                 return 0
@@ -664,7 +698,13 @@ class CalibrationFlow:
                                   r.descriptor, capture_mono=r.capture_mono)
         if views["left"] is None and views["right"] is None:
             return 0
-        if not force and not self.samples.is_new(
+        own = views.get(self.solo) if self.solo is not None else None
+        if not force and own is not None:
+            # A lens stage: new for THIS eye, or it is a duplicate for the
+            # solve the stage is for, whatever the other eye is seeing.
+            if self.samples.novelty(self.solo, own.descriptor) < self.samples.novelty_threshold:
+                return 0
+        elif not force and not self.samples.is_new(
                 views["left"].descriptor if views["left"] else None,
                 views["right"].descriptor if views["right"] else None):
             return 0

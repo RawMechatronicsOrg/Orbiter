@@ -511,7 +511,6 @@ class FrameView(QOpenGLWidget):
         pen.setStyle(Qt.PenStyle.DashLine)
         p.setPen(pen)
         p.drawPolygon(poly)
-        p.setBrush(Qt.BrushStyle.NoBrush)
         font = QFont("Segoe UI")
         font.setPixelSize(22)
         font.setBold(True)

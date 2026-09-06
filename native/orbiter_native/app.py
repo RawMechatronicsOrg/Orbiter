@@ -369,6 +369,8 @@ class MainWindow(QMainWindow):
             kept=0 if f is None else int(f.n_kept),
             auto=self.calib.auto.isChecked(),
             offline={side for side, err in self._offline.items() if err})
+        # The guide reads the flow; this is where its stage reaches it.
+        self.calib.flow.solo = prompt.solo
         self.banner.set_prompt(prompt)
         for side, panel in self.panels.items():
             panel.view.set_target(prompt.target if prompt.eye == side else None)

@@ -21,8 +21,8 @@ the order the solves depend on each other:
 
 Nothing here decides anything about the calibration. `CalibrationFlow`
 takes the views and solves; the guide reads its counts and its gate and
-says what to do. The one thing it sets is `flow.solo`, the eye whose own
-stage is running.
+says what to do. It writes nothing: the window copies `Prompt.solo` — the
+eye whose own stage is running — into `flow.solo`.
 """
 
 from __future__ import annotations
@@ -146,8 +146,7 @@ class Guide:
         is down — no board instruction helps those."""
         frames = frames or {}
         if flow.board is None:
-            flow.solo = None
-            return Prompt(self.stage, self.index + 1, "CALIBRATION",
+            return Prompt(self.stage, self.index + 1, "CALIBRATION GUIDE",
                           "NO BOARD SPEC FROM THE SERVER — SET THE BOARD IN THE WEB UI",
                           "", "stop")
         done = {s: self._done(s, flow) for s in STAGES}
@@ -155,21 +154,23 @@ class Guide:
             if done[self.stage] and self.index < len(STAGES) - 1:
                 self.index += 1
         else:
-            self.index = next((i for i, s in enumerate(STAGES) if not done[s]), len(STAGES) - 1)
+            self.index = next(i for i, s in enumerate(STAGES) if not done[s])   # check never is
         stage = self.stage
-        flow.solo = stage if stage in ("left", "right") else None
+        solo = stage if stage in ("left", "right") else None
+        eye = solo or "both"
         down = [s for s in _EYES_NEEDED[stage] if s in offline]
         if down:
             return self._prompt(stage, " AND ".join(s.upper() for s in down)
                                 + " CAMERA OFFLINE — CHECK CAMSERVER",
                                 "no frames from that eye; its panel says why", "stop",
-                                eye=stage if stage in ("left", "right") else "both",
-                                solo=flow.solo)
-        if not auto and stage != "check":
+                                eye=eye, solo=solo)
+        # The switch matters only where views are taken; at the ceiling the
+        # stage's own prompt says what to do, and the switch would not help.
+        taking = stage != "check" and len(flow.samples) < MAX_VIEWS
+        if not auto and taking:
             return self._prompt(stage, "TICK 'calibrate continuously' IN THE CALIBRATION PANEL",
                                 "the guide only watches; that switch takes the views", "stop",
-                                eye=stage if stage in ("left", "right") else "both",
-                                solo=flow.solo)
+                                eye=eye, solo=solo)
         if stage in ("left", "right"):
             return self._lens(flow, stage, frames.get(stage))
         if stage == "pair":
@@ -213,7 +214,7 @@ class Guide:
         tilt = s.tilt_spread(side)
         res = flow.results.get(key)
         cam = f"{side.upper()} CAMERA"
-        gate, _ = flow.gate()
+        gate, _ = flow.gate(solo=side)
         tilt_short = tilt < MIN_TILT_SPREAD and n >= 2
         need_tilt = ", TILTED" if tilt_short else ""
         target, place = self._target(flow, side, frame, skip_current=gate == "dup")
@@ -223,7 +224,10 @@ class Guide:
         elif gate in ("settling", "wait"):
             action = "HOLD STILL…"
         elif gate == "moving":
-            action = f"HOLD STILL ({flow.moved(side):.0f} px)"
+            moved = flow.moved(side)
+            action = f"HOLD STILL ({moved:.0f} px)" if moved is not None else "HOLD STILL"
+        elif gate in ("gap", "drift"):
+            action = "HOLD STILLER — THE EYES ARE OUT OF STEP"
         elif gate == "ceiling":
             action, tone = f"{MAX_VIEWS} VIEWS HELD — PRESS Clear AND START OVER", "stop"
         elif gate == "ok":
@@ -254,7 +258,7 @@ class Guide:
         paired = flow.samples.paired()
         pairs = len(paired)
         res = flow.results.get("stereo")
-        gate, _ = flow.gate()
+        gate, _ = flow.gate(solo=None)
         tone = "adjust"
         one_range = pairs >= 6 and pair_scale_spread(paired) < PAIR_SCALE_SPREAD
         if gate == "board":
@@ -363,12 +367,7 @@ class Guide:
         words). `skip_current` leaves out the cell the board is in: it is
         there and the view was not new.
         """
-        counts = np.zeros((GRID, GRID), int)
-        for v in flow.samples.views(side):
-            d = v.descriptor
-            gx, gy = min(int(d.cx * GRID), GRID - 1), min(int(d.cy * GRID), GRID - 1)
-            if gx >= 0 and gy >= 0:
-                counts[gy, gx] += 1
+        counts = flow.samples.coverage(side, GRID, counts=True)
         here = flow.where(side) or (0.5, 0.5)
         hx, hy = here[0] * GRID - 0.5, here[1] * GRID - 0.5
         if skip_current:

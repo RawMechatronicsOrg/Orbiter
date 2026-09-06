@@ -102,14 +102,14 @@ def _frame(side: str, t: float, cx: float | None = 0.5, cy: float = 0.5, shift: 
 def test_the_stage_is_the_first_one_not_done(board) -> None:
     flow, guide = _flow(board), Guide()
     p = guide.update(flow)
-    assert (p.stage, p.step, p.solo, flow.solo) == ("left", 1, "left", "left")
+    assert (p.stage, p.step, p.solo, flow.solo) == ("left", 1, "left", None)   # the window copies it
     assert "LEFT CAMERA" in p.title and p.eye == "left"
     _lens_done(flow, "left")
     p = guide.update(flow)
-    assert (p.stage, p.solo, flow.solo) == ("right", "right", "right")
+    assert (p.stage, p.solo) == ("right", "right")
     _lens_done(flow, "right")
     p = guide.update(flow)
-    assert (p.stage, p.solo, flow.solo, p.eye) == ("pair", None, None, "both")
+    assert (p.stage, p.solo, p.eye) == ("pair", None, "both")
     _pair_done(flow)
     assert guide.update(flow).stage == "plane"
     _plane_done(flow)
@@ -153,10 +153,17 @@ def test_without_the_switch_every_stage_but_the_check_asks_for_it(board) -> None
     flow, guide = _flow(board), Guide()
     p = guide.update(flow, auto=False)
     assert p.tone == "stop" and "calibrate continuously" in p.action
-    assert (p.stage, p.eye, p.solo, flow.solo) == ("left", "left", "left", "left")
+    assert (p.stage, p.eye, p.solo) == ("left", "left", "left")
     guide.index = STAGES.index("check")
     guide.pinned = True
     assert "calibrate continuously" not in guide.update(flow, auto=False).action
+    # At the ceiling the switch would not help: Clear is the answer, switch or no switch.
+    from orbiter_native.calibflow import MAX_VIEWS
+    full = _flow(board)
+    for i in range(MAX_VIEWS):
+        full.samples.add(PairSample(left=_view(0.5, 0.5, tilt=float(i % 7))))
+    full.offer(_frame("left", 1.0), auto=False)
+    assert "Clear" in Guide().update(full, auto=False).action
 
 
 def test_at_the_view_ceiling_the_answer_is_clear_not_next(board) -> None:
@@ -259,7 +266,7 @@ def test_the_lens_cues_follow_the_gate(board) -> None:
 def test_a_still_board_in_one_eye_becomes_a_view_in_its_own_stage(board) -> None:
     flow, guide = _flow(board), Guide()
     frames = {"left": (*WH, Orientation())}
-    guide.update(flow, frames)                                          # flow.solo = "left"
+    flow.solo = guide.update(flow, frames).solo                         # as the window does
     for i in range(3):
         flow.offer(_frame("left", 1.0 + i * 0.033, 0.5, 0.5))
     assert len(flow.samples.views("left")) == 1 and len(flow.samples.views("right")) == 0
@@ -298,6 +305,54 @@ def test_a_jittery_other_eye_does_not_starve_the_solo_eye(board) -> None:
     assert len(still.samples) == 1 and still.samples.samples[0].both
     # Its gate speaks for the solo eye alone either way.
     assert flow.gate()[0] in ("dup", "wait")
+
+
+def test_a_partner_whose_stream_stopped_does_not_stall_the_solo_eye(board) -> None:
+    """The right eye's last frame held a still board — then nothing more.
+    The left eye's stage must go on one-eyed after a couple of frames."""
+    flow = _flow(board)
+    flow.solo = "left"
+    for t in (1.0, 1.033):                                       # a still right board, then silence
+        flow.offer(_frame("right", t, 0.5, 0.5))
+    n = 0
+    for i in range(12):                                          # six places, two frames each
+        t = 1.2 + i * 0.033
+        flow.offer(_frame("left", t, 0.15 + 0.12 * (i // 2), 0.5))
+        n = len(flow.samples)
+    assert n == 6
+    assert all(s.right is None for s in flow.samples.samples)
+    assert flow.gate()[0] in ("dup", "wait")                    # and the gate says so, not "ok"
+
+
+def test_the_solo_stage_never_banks_duplicates_of_its_own_eye(board) -> None:
+    """Left board motionless, right eye visiting new places: pairs would be
+    new for the right eye, but the stage is the left lens."""
+    flow = _flow(board)
+    flow.solo = "left"
+    for i in range(8):
+        t = 1.0 + i * 0.033
+        flow.offer(_frame("right", t, 0.2 + 0.1 * (i // 2), 0.5))
+        flow.offer(_frame("left", t + 0.002, 0.5, 0.5))
+    assert len(flow.samples.views("left")) == 1
+    assert flow.samples.novelty("left", ViewDescriptor(0.5, 0.5, 0.3, 0.0, 0.0)) == 0.0
+    assert flow.gate()[0] == "dup" and "left eye" in flow.gate_report()
+
+
+def test_the_solo_gate_waits_with_a_live_partner_instead_of_saying_ok(board) -> None:
+    flow = _flow(board)
+    flow.solo = "left"
+    for t in (1.0, 1.033, 1.066):
+        flow.offer(_frame("right", t, 0.5, 0.5), auto=False)
+        if t < 1.05:
+            flow.offer(_frame("left", t + 0.002, 0.5, 0.5), auto=False)
+    assert flow.gate()[0] == "ok"                                # pair formable, new for the left
+    flow.capture()                                               # history cleared, partner fresh
+    flow.offer(_frame("left", 1.068, 0.3, 0.5), auto=False)      # off to a new place…
+    assert flow.gate()[0] == "moving"
+    flow.offer(_frame("left", 1.101, 0.3, 0.5), auto=False)      # …and still there, 35 ms after the right
+    assert flow.gate()[0] == "wait"                              # the pair's frame is coming
+    flow.offer(_frame("left", 1.3, 0.3, 0.5), auto=False)        # the right eye went quiet
+    assert flow.gate()[0] == "ok"                                # so the view is this eye's alone
 
 
 def test_the_solo_gate_only_asks_its_own_eye(board) -> None:

@@ -354,20 +354,21 @@ class SampleSet:
         self.samples = loaded
         return len(loaded)
 
-    def coverage(self, side: str, grid: int = 6) -> np.ndarray:
+    def coverage(self, side: str, grid: int = 6, counts: bool = False) -> np.ndarray:
         """Which cells of a `grid`x`grid` split of the frame the board has
-        visited, as a boolean map.
+        visited, as a boolean map — or, with `counts`, how many views each
+        cell holds.
 
         Distortion is only measurable where the board actually went, so the
         empty cells are the instruction: put the board there next.
         """
-        out = np.zeros((grid, grid), bool)
+        out = np.zeros((grid, grid), int)
         for v in self.views(side):
             gx = min(int(v.descriptor.cx * grid), grid - 1)
             gy = min(int(v.descriptor.cy * grid), grid - 1)
             if gx >= 0 and gy >= 0:
-                out[gy, gx] = True
-        return out
+                out[gy, gx] += 1
+        return out if counts else out > 0
 
     def tilt_spread(self, side: str) -> float:
         """How much tilt variety the set has.

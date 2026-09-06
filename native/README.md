@@ -278,9 +278,11 @@ first (`LEFT CAMERA OFFLINE — CHECK CAMSERVER`), before any board
 instruction; a refused solve shows its reason in the small line and asks
 for stiller views; from six pairs on, pairs all taken at one distance get
 `CHANGE THE DISTANCE` — depth variety conditions the pair solve as much as
-tilt does. In a lens stage the pair is still taken whenever the other eye
-sees the board and holds still (its frame comes a few milliseconds later);
-an eye that is out of the picture or shaking does not stall the stage.
+tilt does. In a lens stage the pair is still taken while the other eye
+delivered a still board within the last couple of frames (its frame comes a
+few milliseconds later); an eye that has lost the board, shakes, or whose
+stream has stopped does not stall the stage, and a view is new for the
+stage's own eye or it is not taken.
 Untick **guide** and the eyes pair as before, with nothing drawn on them.
 
 **When the rig moves.** Re-aiming or moving the cameras or the laser stales
