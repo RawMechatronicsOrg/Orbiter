@@ -191,6 +191,13 @@ class ScanFrame:
     #: eyes share no scanline. See `_veto_offset`.
     veto_px: float = float("nan")
     reason: str | None = None
+    #: Which eyes the board pose came from — "left+right", "left" or
+    #: "right" — and, with both, how far their independent poses stood apart
+    #: (a live check on the pair's calibration) and the joint fit's error.
+    pose_source: str = ""
+    pose_gap_deg: float = float("nan")
+    pose_gap_mm: float = float("nan")
+    pose_rms_px: float = float("nan")
     #: Rolling shutter: the largest shift the per-row poses made to a kept
     #: point, the board's speed the twist implied, or why none was applied.
     rs_max_mm: float = 0.0

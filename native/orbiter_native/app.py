@@ -40,9 +40,9 @@ from .config import ConfigClient, RigConfig
 from .laser import LaserParams
 from .panel import EyePanel
 from .scanpanel import ScanPanel
-from .scanworker import LEFT_POSE_RECENT_S, ScanWorker
+from .scanworker import POSE_RECENT_S, ScanWorker
 from .screens import adapter_of_window, same_gpu
-from .stereo import compose_right_pose, result_from_config
+from .stereo import compose_left_pose, compose_right_pose, result_from_config
 from .worker import EyeWorker, Latest
 
 log = logging.getLogger("orbiter_native.app")
@@ -64,7 +64,9 @@ class MainWindow(QMainWindow):
 
         self._client = ConfigClient(server)
         self._config: RigConfig | None = None
-        self._left_pose: tuple | None = None
+        #: Each eye's latest own board pose (R, t, when, frame size), for
+        #: drawing the other eye's cloud when that eye has none of its own.
+        self._poses: dict[str, tuple | None] = {"left": None, "right": None}
         self._extrinsics_raw: dict | None = None
         self._extrinsics_at: tuple = (None, None)
         self._extrinsics = None
@@ -83,7 +85,7 @@ class MainWindow(QMainWindow):
             w.add_sink(self._inbox[side].put)
             w.add_sink(self.scanner.offer)
             if side == "right":
-                w.set_scan_gate(self.scanner.left_pose_recent)
+                w.set_scan_gate(self.scanner.pose_recent)
             panel.set_overlay(self.scanner.overlay)
             self.workers[side] = w
 
@@ -279,26 +281,28 @@ class MainWindow(QMainWindow):
     def _paint(self) -> None:
         """Show whatever is newest. Anything older was skipped, not queued."""
         fresh = {side: box.take(0.0) for side, box in self._inbox.items()}
-        left = fresh["left"]
         now = time.monotonic()
-        if left is not None and left.board is not None and left.board.R is not None:
-            self._left_pose = (left.board.R, left.board.t, now, left.wh)
-        elif self._left_pose is not None and now - self._left_pose[2] > LEFT_POSE_RECENT_S:
-            # A pose the left eye has not had for a while is not one to draw
-            # the right eye's cloud through: the two overlays disagreeing is
-            # a diagnostic, and a stale pose would fake agreement.
-            self._left_pose = None
+        for side, res in fresh.items():
+            if res is not None and res.board is not None and res.board.R is not None:
+                self._poses[side] = (res.board.R, res.board.t, now, res.wh)
+        for side, held in self._poses.items():
+            if held is not None and now - held[2] > POSE_RECENT_S:
+                # A pose an eye has not had for a while is not one to draw the
+                # other eye's cloud through: the two overlays disagreeing is
+                # a diagnostic, and a stale pose would fake agreement.
+                self._poses[side] = None
         for side, res in fresh.items():
             if res is None:
                 continue
             pose = None
-            geom = (self._extrinsics_for(self._left_pose[3])
-                    if self._left_pose is not None else None)
-            if (side == "right" and (res.board is None or res.board.R is None)
-                    and geom is not None):
-                # The right eye skipped ChArUco while scanning: its board
-                # pose for drawing follows from the left's.
-                pose = compose_right_pose(self._left_pose[0], self._left_pose[1], geom)
+            if res.board is None or res.board.R is None:
+                # No pose of its own this frame: for drawing, the other eye's
+                # recent one carried across through the pair.
+                other = self._poses["right" if side == "left" else "left"]
+                geom = self._extrinsics_for(other[3]) if other is not None else None
+                if geom is not None:
+                    carry = compose_right_pose if side == "right" else compose_left_pose
+                    pose = carry(other[0], other[1], geom)
             self.panels[side].on_result(res, pose)
             self.calib.on_result(res)
         status = self.scanner.status.take(0.0)

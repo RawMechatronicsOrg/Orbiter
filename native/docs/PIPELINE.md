@@ -57,14 +57,14 @@ flowchart TD
     subgraph DET["поток left-detect"]
         direction TB
         H --> I["intrinsics = eye.intrinsics_for wh<br/>чужое разрешение отвергается"]
-        I --> J["board_wanted для левого глаза = True,<br/>ChArUco в скане считается"]
+        I --> J["ChArUco считается в обоих глазах —<br/>поза пары берётся с любого"]
         J --> K{"BoardDetector.detect:<br/>_since_detect + 1 &gt;= redetect_every = 10?"}
         K -->|нет, есть трек| L["_follow: KLT на кропе<br/>win 21, levels 3, margin 64<br/>cornerSubPix half 5<br/>гомография RANSAC 2.0 px<br/>чтение 3 маркеров через неё"]
         K -->|да| M["charuco_detect — полный проход<br/>calibration.detect_board"]
         L -->|трек не удержался| M
         L --> N["estimate_pose:<br/>&gt;= 6 углов, IPPE + приор _last_R,<br/>перевод в центрированный face-out кадр"]
         M --> N
-        N --> O{"stripe_wanted left:<br/>board.R is not None?"}
+        N --> O{"stripe_wanted:<br/>своя поза или свежая поза любого глаза?"}
         O -->|нет| P["StripePixels reason=<br/>no board pose — nothing to place"]
         O -->|да| Q{"rgb_gpu?"}
         Q -->|да| R1["gpu.stripe_pixels<br/>в полосе строк stripe_rows"]
@@ -157,10 +157,14 @@ RANSAC-гомография с плоскости доски (`homography_tol_px
 
 ## 3. Правый глаз и встреча двух глаз
 
-Правый глаз в режиме скана **не считает ChArUco вовсе**
-(`worker.board_wanted("right", scan_mode=True) → False`): его поза доски нужна
-только для рисования, и окно выводит её из левой через экстринсики
-(`stereo.compose_right_pose`). Освободившийся кадр тратится на полосу.
+Оба глаза считают ChArUco и в скане. Поза доски для пары берётся с того глаза,
+который её видит; когда видят оба — одна поза подгоняется сразу к углам обеих
+картинок (`cvcore.refine_pose_pair`, `scanworker.fuse_pose`), а расхождение их
+независимых поз выводится в панели скана как живая проверка калибровки пары.
+Поэтому стенд можно поворачивать как угодно вокруг предмета: скан идёт, пока
+доску видит хотя бы одна камера. Глазу без своей позы окно переносит для
+отрисовки позу соседа через экстринсики (`stereo.compose_right_pose` /
+`compose_left_pose`).
 
 ```mermaid
 sequenceDiagram
@@ -171,11 +175,11 @@ sequenceDiagram
     participant GUI as GUI-поток
 
     LD->>SW: offer(EyeResult) — stripe, board_R/t,<br/>pose_row = средняя строка углов
-    Note over SW: очередь left пополнена, _offered_left += 1<br/>_left_pose_at = monotonic, если поза есть
-    RD->>SW: left_pose_recent()? (scan_gate)
-    SW-->>RD: True, если левая поза была<br/>не позже LEFT_POSE_RECENT_S = 0.5 с
-    Note over RD: ChArUco пропущен,<br/>считается только полоса в своей полосе строк
-    RD->>SW: offer(EyeResult) — stripe, board_R/t = None
+    Note over SW: очередь left пополнена, _offered_left += 1<br/>_pose_at = monotonic, если поза есть (у любого глаза)
+    RD->>SW: pose_recent()? (scan_gate)
+    SW-->>RD: True, если поза любого глаза была<br/>не позже POSE_RECENT_S = 0.5 с
+    Note over RD: ChArUco считается и здесь;<br/>полоса — в своей полосе строк
+    RD->>SW: offer(EyeResult) — stripe, board_R/t, углы
     Note over SW: очередь right пополнена
 
     SW->>SW: _take_pair(): старейший левый,<br/>у которого есть партнёр в пределах<br/>PAIR_WINDOW_S = 20 мс по capture_mono
@@ -365,7 +369,7 @@ flowchart TD
 | `ceil(N/2)` | `average_still` | — | сканлайн, увиденный менее чем в половине кадров батча |
 | усечение крайних | `average_still` | при `counts >= 4` | минимум и максимум по каждой оси |
 | `PointCloud.voxel_mm` | `scan.py` | `0.5` | слияние: одна точка на воксель |
-| `LEFT_POSE_RECENT_S` | `scanworker.py` | `0.5` | правый глаз перестаёт считать полосу, если левый так долго без позы |
+| `POSE_RECENT_S` | `scanworker.py` | `0.5` | глаз без своей позы перестаёт считать полосу, если ни один глаз так долго не видел доску |
 | `OVERLAY_MAX` | `scanworker.py` | `40000` | прореживание облака для отрисовки поверх глаз |
 
 ### Детекция доски (`detect.TrackParams`)

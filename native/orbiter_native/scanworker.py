@@ -40,8 +40,10 @@ from .scan import (
     scan_frame,
     stripe_rows,
 )
-from .stereo import StereoRig, result_from_config
+from .stereo import StereoRig, compose_left_pose, result_from_config
 from .worker import EyeResult, Latest
+from .cvcore import build_board, refine_pose_pair
+from scipy.spatial.transform import Rotation
 
 log = logging.getLogger("orbiter_native.scanworker")
 
@@ -79,7 +81,7 @@ STILL_BATCH = 5
 #: The right eye keeps scoring the stripe for this long after the left eye
 #: last had a board pose — a moment's loss of the board is not a reason to
 #: miss the stripe the scan will want on the next frame.
-LEFT_POSE_RECENT_S = 0.5
+POSE_RECENT_S = 0.5
 
 
 def _still(a: tuple[np.ndarray, np.ndarray], b: tuple[np.ndarray, np.ndarray]) -> bool:
@@ -154,6 +156,59 @@ class ScanInput:
     #: copy — kept for the left eye only, so each kept point can be given
     #: the colour beside its stripe pixel.
     bgr: np.ndarray | None = None
+    #: The board corners this pose came from, as the detector handed them
+    #: over — what a pose fitted to both eyes at once is fitted through.
+    corners: np.ndarray | None = None
+    ids: np.ndarray | None = None
+
+
+@dataclass
+class PoseFix:
+    """The board's pose for one pair, in the LEFT camera's frame, and where
+    it came from."""
+
+    R: np.ndarray
+    t: np.ndarray
+    #: "left+right" (both eyes, fitted jointly), "left" or "right".
+    source: str
+    #: With both eyes: how far their independent poses stood apart. A live
+    #: check on the pair's calibration — the veto is the other one.
+    gap_deg: float = float("nan")
+    gap_mm: float = float("nan")
+    #: The joint fit's reprojection error over both images, px.
+    rms_px: float = float("nan")
+
+
+def fuse_pose(a: ScanInput, b: ScanInput, rig: StereoRig, board=None) -> PoseFix | None:
+    """One board pose from the two eyes' results: the left's, the right's
+    carried into the left frame through the pair, or — when both saw the
+    board — one pose fitted to both images' corners at once (the mean of the
+    two when the corners are not there to fit through). None when neither
+    eye saw the board. This is what lets the rig be turned any way round the
+    subject: the scan carries on while either camera sees the board."""
+    have_l = a.board_R is not None and a.board_t is not None
+    have_r = b.board_R is not None and b.board_t is not None
+    if not have_l and not have_r:
+        return None
+    if have_r:
+        R_r, t_r = compose_left_pose(b.board_R, b.board_t, rig.geom)
+    if not have_l:
+        return PoseFix(R_r, t_r, "right")
+    R_l, t_l = np.asarray(a.board_R, float), np.asarray(a.board_t, float).ravel()
+    if not have_r:
+        return PoseFix(R_l, t_l, "left")
+    cos = (np.trace(R_l.T @ R_r) - 1.0) / 2.0
+    gap_deg = float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
+    gap_mm = float(np.linalg.norm(t_l - t_r))
+    fit = None
+    if board is not None:
+        fit = refine_pose_pair(board, rig.geom, rig.left_k, rig.right_k,
+                               (a.corners, a.ids), (b.corners, b.ids), R_l, t_l)
+    if fit is None:
+        R = Rotation.from_matrix(np.stack([R_l, R_r])).mean().as_matrix()
+        return PoseFix(R, (t_l + t_r) / 2.0, "left+right", gap_deg, gap_mm)
+    R, t, rms = fit
+    return PoseFix(R, t, "left+right", gap_deg, gap_mm, rms)
 
 
 @dataclass
@@ -196,16 +251,16 @@ class ScanWorker:
         # Projection geometry, rebuilt only when the calibration or the frame
         # size changes. Touched by the scan thread alone.
         self._geom_key = None
-        self._geom: tuple[StereoRig | None, LaserPlane | None, Readout | None] = (
-            None, None, None)
+        self._geom: tuple = (None, None, None, None)      # rig, plane, readout, board
         #: Per eye, the rows the sheet can appear in for the current reach, or
         #: None for the whole frame; the window pushes them to the workers.
         self.stripe_rows: dict[str, tuple[int, int] | None] = {"left": None, "right": None}
-        # The previous left result that carried a pose: with the current one
-        # it gives the board's twist, which is what slides the pose to each
-        # stripe row's instant.
-        self._prev_left: ScanInput | None = None
-        self._left_pose_at = -1e9
+        # The previous pair's pose, with its capture instant and the left
+        # corners' mean row: with the current one it gives the board's twist,
+        # which is what slides the pose to each stripe row's instant.
+        self._prev: tuple[PoseFix, float, float] | None = None
+        #: When either eye last offered a board pose.
+        self._pose_at = -1e9
         # Consecutive frames of a still board, averaged before they join the
         # cloud; the pose they are still against is the first one's.
         self._batch: list[ScanFrame] = []
@@ -234,7 +289,7 @@ class ScanWorker:
             if not on:
                 for q in self._hist.values():
                     q.clear()
-                self._prev_left = None
+                self._prev = None
                 # The next session starts its own batch: kept, this pose
                 # would be what the first frame of that session is judged
                 # still against.
@@ -278,21 +333,23 @@ class ScanWorker:
         item = ScanInput(res.capture_mono, res.stripe,
                          None if board is None else board.R,
                          None if board is None else board.t, res.wh, pose_row=row,
-                         bgr=res.bgr if res.side == "left" else None)
+                         bgr=res.bgr if res.side == "left" else None,
+                         corners=None if board is None else board.corners,
+                         ids=None if board is None else board.ids)
         with self._lock:
             if not self._active:
                 return
             self._hist[res.side].append(item)
             if res.side == "left":
                 self._offered_left += 1
-                if item.board_R is not None:
-                    self._left_pose_at = time.monotonic()
+            if item.board_R is not None:
+                self._pose_at = time.monotonic()
         self._wake.set()
 
-    def left_pose_recent(self) -> bool:
+    def pose_recent(self) -> bool:
         """For the right eye's worker: has the left eye had a board pose
         within `LEFT_POSE_RECENT_S`? Lock-free on purpose — a float read."""
-        return time.monotonic() - self._left_pose_at <= LEFT_POSE_RECENT_S
+        return time.monotonic() - self._pose_at <= POSE_RECENT_S
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
@@ -357,7 +414,7 @@ class ScanWorker:
 
     def _process(self, a: ScanInput, b: ScanInput, cfg: RigConfig | None,
                  params: ScanParams) -> None:
-        rig, plane, readout = self._geometry(cfg, a.wh, b.wh)
+        rig, plane, readout, board = self._geometry(cfg, a.wh, b.wh)
         if rig is None:
             self._publish(None, "no pair calibration for this frame size — "
                                 "solve intrinsics and the stereo pair first")
@@ -365,21 +422,25 @@ class ScanWorker:
         if a.stripe is None or b.stripe is None:
             self._publish(None, "laser detector is off")
             return
-        if a.board_R is None or a.board_t is None:
-            self._prev_left = None
-            self._publish(None, "board not visible — it is what defines the scan volume")
+        fix = fuse_pose(a, b, rig, board)
+        if fix is None:
+            self._prev = None
+            self._publish(None, "board not visible to either eye — it is what defines "
+                                "the scan volume")
             return
-        motion, note = self._motion(a, readout)
-        self._prev_left = a
-        frame = scan_frame(rig, plane, a.stripe, b.stripe, a.board_R, a.board_t, params,
+        motion, note = self._motion(a, fix, readout)
+        self._prev = (fix, a.capture_mono, a.pose_row)
+        frame = scan_frame(rig, plane, a.stripe, b.stripe, fix.R, fix.t, params,
                            motion=motion, rs_note=note)
+        frame.pose_source, frame.pose_rms_px = fix.source, fix.rms_px
+        frame.pose_gap_deg, frame.pose_gap_mm = fix.gap_deg, fix.gap_mm
         if frame.n_kept and a.bgr is not None:
             frame.colours = sample_beside(a.bgr, frame.pixels_left, frame.along_x,
                                           params.colour_offset_px, a.wh)
         snap = None
         with self._lock:
             self._pairs += 1
-            spilled = self._bank(frame, a.board_R, a.board_t)
+            spilled = self._bank(frame, fix.R, fix.t)
         # Deliberately outside that lock: `offer` takes it on both detector
         # threads, and a voxel merge under it stalls both eyes every pair.
         if self._merge(spilled):
@@ -433,21 +494,24 @@ class ScanWorker:
             self.cloud.add(pts, rgb)
         return True
 
-    def _motion(self, a: ScanInput, readout: Readout | None):
-        """The board's twist into this frame from the previous left pose, or
-        why there is none. Touched by the scan thread alone."""
+    def _motion(self, a: ScanInput, fix: PoseFix, readout: Readout | None):
+        """The board's twist into this frame from the previous pair's pose, or
+        why there is none. The instant a pose holds for is the left corners'
+        mean row — the readout is the left eye's — so a pose the left eye did
+        not see the board for is not slid. Touched by the scan thread alone."""
         if readout is None:
             return None, "no readout time for this frame size — measure it in CALIBRATION"
-        prev = self._prev_left
-        if prev is None or prev.board_R is None or not np.isfinite(prev.pose_row):
+        prev = self._prev
+        if prev is None or not np.isfinite(prev[2]):
             return None, "waiting for a second board pose"
-        gap = a.capture_mono - prev.capture_mono
+        prev_fix, prev_capture, prev_row = prev
+        gap = a.capture_mono - prev_capture
         if not 0 < gap <= MAX_TWIST_GAP_S:
             return None, f"previous pose {gap * 1000:.0f} ms ago — too long to infer the motion"
         if not np.isfinite(a.pose_row):
-            return None, "no corners to time the pose by"
-        motion = Motion.between(prev.board_R, prev.board_t, prev.capture_mono, prev.pose_row,
-                                a.board_R, a.board_t, a.capture_mono, a.pose_row, readout)
+            return None, "the left eye has no corners to time the pose by"
+        motion = Motion.between(prev_fix.R, prev_fix.t, prev_capture, prev_row,
+                                fix.R, fix.t, a.capture_mono, a.pose_row, readout)
         return motion, None if motion is not None else "poses out of order"
 
     def _geometry(self, cfg: RigConfig | None, wh: tuple[int, int],
@@ -459,7 +523,7 @@ class ScanWorker:
         in it, and an object id can be reused after the old one is freed.
         """
         if cfg is None:
-            return None, None, None
+            return None, None, None, None
         right_wh = wh if right_wh is None else right_wh
         with self._lock:
             reach = tuple(self._params.range_mm)
@@ -467,7 +531,7 @@ class ScanWorker:
                cfg.left.intrinsics_raw if cfg.left else None,
                cfg.right.intrinsics_raw if cfg.right else None,
                cfg.extrinsics_raw, cfg.laser_plane_raw,
-               cfg.left.readout_raw if cfg.left else None, reach)
+               cfg.left.readout_raw if cfg.left else None, reach, cfg.board)
         if key != self._geom_key:
             # The key goes in last: a raise below would otherwise leave a
             # half-built cache marked as current for this calibration.
@@ -479,8 +543,10 @@ class ScanWorker:
                 if kl is not None and kr is not None and geom is not None:
                     rig = StereoRig(kl, kr, geom)
             plane = plane_from_config(cfg.laser_plane_raw, wh)
+            board = build_board(cfg.board) if cfg.board is not None else None
             self._geom = (rig, plane,
-                          Readout.from_config(cfg.left.readout_raw if cfg.left else None, wh))
+                          Readout.from_config(cfg.left.readout_raw if cfg.left else None, wh),
+                          board)
             self.stripe_rows = {
                 side: (stripe_rows(plane, rig, reach, size, side)
                        if rig is not None and plane is not None else None)

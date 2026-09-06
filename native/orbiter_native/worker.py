@@ -355,10 +355,10 @@ class EyeWorker(QObject):
         # Resolved against THIS frame's size: intrinsics solved at another
         # resolution are refused rather than silently misapplied.
         intrinsics = eye.intrinsics_for((w, h)) if eye else None
-        # While scanning, the right eye's board pose is only ever drawn — and
-        # the window draws it from the left's through the extrinsics — so
-        # the right eye skips ChArUco and spends its frame on the stripe.
-        if detector.ready and board_wanted(self.side, scan_mode):
+        # Both eyes detect the board while scanning: the scan takes its pose
+        # from whichever eye sees it and refines it through both when both
+        # do — so the rig can be turned any way round the subject.
+        if detector.ready:
             board = detector.detect(frame.gray, intrinsics)
         else:
             detector.forget()
@@ -445,22 +445,16 @@ class EyeWorker(QObject):
 # ── helpers ───────────────────────────────────────────────────────────────
 
 
-def board_wanted(side: str, scan_mode: bool) -> bool:
-    """Whether this eye runs ChArUco on the frame. While scanning, the right
-    eye's board pose is only drawn, and the window draws it from the left's
-    through the extrinsics — so the right eye spends its frame on the stripe."""
-    return not (scan_mode and side == "right")
-
-
-def stripe_wanted(side: str, has_pose: bool, left_recent: bool) -> bool:
+def stripe_wanted(side: str, has_pose: bool, pose_recent: bool) -> bool:
     """Whether the stripe is worth scoring on this frame while scanning.
 
-    The scan places points through the LEFT eye's board pose, so a left
-    frame without one has nothing to place and the right eye's stripe is
-    only wanted while the left has had a pose lately — the right eye does
-    not detect the board while scanning, so it asks the scan worker.
+    The scan places points through the board's pose, which comes from
+    whichever eye sees the board: this eye's own pose on this frame, or a
+    pose either eye had lately (`pose_recent`, asked of the scan worker).
+    Neither, and there is nothing to place the stripe against.
     """
-    return has_pose if side == "left" else left_recent
+    del side
+    return has_pose or pose_recent
 
 
 def _rate(times: "deque[float]") -> float:

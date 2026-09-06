@@ -422,6 +422,18 @@ dropped, and a batch ends where the stripe's axis flips. Noise falls by about th
 of the batch; motion flushes it at once. The SCAN
 panel shows `still ×N` while a batch is held.
 
+**The board pose comes from whichever eye sees the board.** Points are placed
+in the board's frame through one pose per pair: the left eye's, the right
+eye's carried across through the pair's geometry, or — when both see the
+board — one pose fitted to both images' corners at once
+(`cvcore.refine_pose_pair`, `scanworker.fuse_pose`). Two views 146 mm apart
+pin down what one planar view leaves loose, the tilt about the baseline and
+the depth, and the flipped branch of the planar ambiguity fits one image and
+not the other. It also means the rig can be turned any way round the
+subject: the scan carries on while either camera sees the board. The panel
+shows which eyes gave the pose and, with both, how far their independent
+poses stood apart — a live check on the pair's calibration, like the veto.
+
 **The cloud is a voxel grid.** `PointCloud` merges points on 0.5 mm voxels,
 each holding the running mean of what fell in it: a surface swept ten times
 is one point, ten times less noisy, the cloud stops growing with the number

@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 import pytest
 
-from orbiter_native.cvcore import BoardSpec, Intrinsics, build_board
+from orbiter_native.cvcore import BoardSpec, Intrinsics, _facing, build_board, refine_pose_pair
 from orbiter_native.intrinsics import EyeView, PairSample, describe
 from orbiter_native.laser import StripePixels
 from orbiter_native.laserplane import from_config as plane_from_config
@@ -420,6 +420,77 @@ def test_scan_worker_pairs_oldest_first_by_capture_clock() -> None:
     sw.set_active(False)
     sw.offer(_eye_result("left", 0.2))
     assert sw._take_pair() is None                     # inactive: nothing kept
+
+
+def test_compose_left_pose_undoes_compose_right_pose() -> None:
+    from orbiter_native.stereo import compose_left_pose, compose_right_pose
+    rig = _rig()
+    R = cv2.Rodrigues(np.array([0.3, -0.2, 0.1]))[0]
+    t = np.array([10.0, -20.0, 400.0])
+    Rr, tr = compose_right_pose(R, t, rig.geom)
+    Rl, tl = compose_left_pose(Rr, tr, rig.geom)
+    assert np.allclose(Rl, R) and np.allclose(tl, t)
+
+
+def _board_in_both_eyes(board):
+    """A board pose seen by both eyes: the corners each eye detects (as the
+    detector hands them over) and the truth in the app's frame."""
+    Rcv = cv2.Rodrigues(np.array([0.2, -0.15, 0.1]))[0]
+    tcv = np.array([-150.0, -100.0, 600.0])
+    obj_mm = board.getChessboardCorners().astype(np.float64) * 1000.0
+    ids = np.arange(len(obj_mm), dtype=np.int32).reshape(-1, 1)
+    in_left = obj_mm @ Rcv.T + tcv
+    li = _project(KL, np.eye(3), np.zeros(3), in_left).astype(np.float32).reshape(-1, 1, 2)
+    ri = _project(KR, R_TRUE, T_TRUE, in_left).astype(np.float32).reshape(-1, 1, 2)
+    R_true, t_true = _facing(board, Rcv, tcv)
+    return li, ri, ids, R_true, t_true
+
+
+def test_refine_pose_pair_recovers_the_pose_from_both_eyes(board) -> None:
+    rig = _rig()
+    li, ri, ids, R_true, t_true = _board_in_both_eyes(board)
+    # Start two degrees and a few millimetres off.
+    R0 = cv2.Rodrigues(np.array([0.0, np.radians(2.0), 0.0]))[0] @ R_true
+    t0 = t_true + [3.0, -4.0, 5.0]
+    R, t, rms = refine_pose_pair(board, rig.geom, KL, KR, (li, ids), (ri, ids), R0, t0)
+    assert rms < 1e-3
+    assert np.allclose(R, R_true, atol=1e-6) and np.allclose(t, t_true, atol=1e-3)
+    # One eye alone is a plain PnP refinement; no eye at all is nothing.
+    R1, t1, _ = refine_pose_pair(board, rig.geom, KL, KR, None, (ri, ids), R0, t0)
+    assert np.allclose(R1, R_true, atol=1e-5) and np.allclose(t1, t_true, atol=1e-2)
+    assert refine_pose_pair(board, rig.geom, KL, KR, None, None, R0, t0) is None
+
+
+def test_fuse_pose_takes_whichever_eye_saw_the_board(board) -> None:
+    from orbiter_native.scanworker import ScanInput, fuse_pose
+    from orbiter_native.stereo import compose_right_pose
+    rig = _rig()
+    li, ri, ids, R_true, t_true = _board_in_both_eyes(board)
+    R_r, t_r = compose_right_pose(R_true, t_true, rig.geom)
+    left = ScanInput(1.0, None, R_true, t_true, WH, corners=li, ids=ids)
+    right = ScanInput(1.0, None, R_r, t_r, WH, corners=ri, ids=ids)
+    blind = ScanInput(1.0, None, None, None, WH)
+    assert fuse_pose(blind, blind, rig, board) is None
+    only_l = fuse_pose(left, blind, rig, board)
+    assert only_l.source == "left" and np.allclose(only_l.t, t_true)
+    only_r = fuse_pose(blind, right, rig, board)
+    assert only_r.source == "right"
+    assert np.allclose(only_r.R, R_true) and np.allclose(only_r.t, t_true)
+    both = fuse_pose(left, right, rig, board)
+    assert both.source == "left+right" and both.gap_deg < 1e-6 and both.gap_mm < 1e-6
+    assert both.rms_px < 1e-3 and np.allclose(both.t, t_true, atol=1e-3)
+    # The right eye's own pose two degrees off: the gap says so, and the
+    # joint fit through both images' corners still lands on the truth.
+    R_off = cv2.Rodrigues(np.array([0.0, np.radians(2.0), 0.0]))[0] @ R_r
+    off = ScanInput(1.0, None, R_off, t_r, WH, corners=ri, ids=ids)
+    fixed = fuse_pose(left, off, rig, board)
+    assert abs(fixed.gap_deg - 2.0) < 1e-6
+    assert np.allclose(fixed.R, R_true, atol=1e-6) and np.allclose(fixed.t, t_true, atol=1e-3)
+    # Without corners the two are averaged, and the gap is still reported.
+    mean = fuse_pose(ScanInput(1.0, None, R_true, t_true, WH),
+                     ScanInput(1.0, None, R_off, t_r, WH), rig, board)
+    assert mean.source == "left+right" and abs(mean.gap_deg - 2.0) < 1e-6
+    assert mean.rms_px != mean.rms_px                        # NaN: nothing was fitted
 
 
 def test_board_pose_frame_is_centred_with_z_toward_the_camera() -> None:

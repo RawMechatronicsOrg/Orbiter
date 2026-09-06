@@ -187,6 +187,13 @@ class ScanPanel(QFrame):
         elif f is not None:
             lines.append(f"frame   {f.n_kept}/{f.n_scanlines} scanlines kept")
             lines.append(f"pixels  {f.n_confirmed}/{f.n_pixels} confirmed by the right eye")
+            if f.pose_gap_deg == f.pose_gap_deg:              # both eyes: not NaN
+                fit = (f"joint fit {f.pose_rms_px:.2f} px" if f.pose_rms_px == f.pose_rms_px
+                       else "mean of the two")
+                lines.append(f"pose    both eyes · their poses differ by {f.pose_gap_deg:.2f}° / "
+                             f"{f.pose_gap_mm:.1f} mm · {fit}")
+            elif f.pose_source:
+                lines.append(f"pose    {f.pose_source} eye only")
             if f.veto_px == f.veto_px:            # not NaN
                 lines.append(f"veto    the eyes disagree by {f.veto_px:+.1f} px "
                              f"about where the stripe is")

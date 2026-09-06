@@ -11,7 +11,7 @@ from orbiter_native.laser import find_stripe_pixels
 from orbiter_native.scan import PointCloud, ScanFrame, stripe_rows
 from orbiter_native.scanworker import STILL_BATCH, ScanWorker, _still, average_still
 from orbiter_native.stereo import compose_right_pose
-from orbiter_native.worker import EyeWorker, board_wanted, stripe_wanted
+from orbiter_native.worker import EyeWorker, stripe_wanted
 
 from test_pure import _stripe_frame
 from test_stereo_scan import KL, _plane, _rig
@@ -210,16 +210,13 @@ def test_composed_right_pose_projects_like_the_rig() -> None:
 
 # ── the stripe gate ──────────────────────────────────────────────────────
 
-def test_the_right_eye_skips_the_board_only_while_scanning() -> None:
-    assert board_wanted("left", True) and board_wanted("left", False)
-    assert board_wanted("right", False) and not board_wanted("right", True)
-
-
 def test_stripe_is_wanted_only_where_it_can_be_placed() -> None:
-    assert stripe_wanted("left", True, False)
-    assert not stripe_wanted("left", False, True)
-    assert stripe_wanted("right", False, True)
-    assert not stripe_wanted("right", True, False)
+    # Either eye's pose places the stripe: this frame's own, or one either
+    # eye had lately. Neither, and there is nothing to place it against.
+    for side in ("left", "right"):
+        assert stripe_wanted(side, True, False)
+        assert stripe_wanted(side, False, True)
+        assert not stripe_wanted(side, False, False)
 
 
 def test_a_glint_in_one_frame_of_five_does_not_move_the_average() -> None:
