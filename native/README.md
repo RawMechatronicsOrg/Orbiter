@@ -434,6 +434,27 @@ subject: the scan carries on while either camera sees the board. The panel
 shows which eyes gave the pose and, with both, how far their independent
 poses stood apart — a live check on the pair's calibration, like the veto.
 
+**Near passes override far ones.** A ray meeting the sheet moves along it by
+about Z²/(f·d) per pixel of stripe error, so a point's variance grows as the
+fourth power of the depth it was seen at. Every point carries the inverse,
+`scan.precision_weights` = (300 mm / Z)⁴, and the voxel grid keeps a weighted
+mean: a point seen at 150 mm outweighs one seen at 450 mm eighty-one to one,
+so a close pass over a surface overrides what a far pass left there, and the
+far pass still stands wherever nothing closer came.
+
+**What is shown is the confident cloud.** `scan.confident` takes the grid and
+drops what is not the subject: a voxel with fewer than three other voxels
+within the 3×3×3 block of 2 mm cells around it is *lonely* (a glint, a hand);
+a voxel seen once where its neighbours were seen three times or more is a
+*flicker* the later passes never confirmed. What survives is merged on cells
+of the size set beside **clean** in the SCAN panel (1 mm by default; 2 mm is
+quieter and loses detail), each voxel weighted by its precision, so the
+two-or-three-voxel fuzz the 0.5 mm grid keeps reads back as one point placed
+where the close passes put it. The panel says how many points are confident
+and how many went; export writes the same cloud. Switch **clean** off to see
+every voxel. On a 252k-voxel scan from this bench: 142k confident at 1 mm,
+55k at 2 mm, 2071 lonely dropped.
+
 **The cloud is a voxel grid.** `PointCloud` merges points on 0.5 mm voxels,
 each holding the running mean of what fell in it: a surface swept ten times
 is one point, ten times less noisy, the cloud stops growing with the number
@@ -501,6 +522,18 @@ not under it, so a white next to a red stripe comes out slightly warm.
 screen** (F11, Esc back) gives the cloud the whole screen in a second view fed
 the same arrays; the view is multisampled, so points and the board's lines
 stop crawling as it turns.
+
+**shade** draws every point as a small lit sphere: the fragment shader gives
+each sprite fragment the depth of the sphere's surface there (`gl_FragDepth`),
+so neighbouring points intersect and occlude like beads rather than
+overlapping discs, and a normal to light by. The pass renders offscreen with
+the view depth in the alpha channel, and a second pass applies eye-dome
+lighting — a pixel whose neighbours are nearer the eye sits in their shadow —
+which is what makes creases and edges read. Kept gentle (`edl_strength` 40):
+in a scan's fuzz every pixel has a slightly nearer neighbour, and a strong
+setting darkens the whole cloud instead of its creases. Off, the soft discs
+come back; where the shaders or the framebuffers cannot be had they come back
+on their own, with a line in the log.
 
 ## Measured on this machine
 

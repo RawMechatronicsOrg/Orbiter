@@ -126,3 +126,37 @@ def test_points_are_drawn_where_the_camera_says() -> None:
         assert (lit != ~(np.abs(_render(view).astype(int) - background) <= 2).all(axis=2)).mean() > 0.01
     finally:
         view.close()
+
+
+def test_shaded_and_flat_both_draw_the_cloud() -> None:
+    app = _app()
+    view = CloudView()
+    view.resize(400, 300)
+    view.show()
+    app.processEvents()
+    if not view.isValid():
+        view.close()
+        pytest.skip("no OpenGL context here")
+    try:
+        rng = np.random.default_rng(1)
+        pts = np.column_stack([rng.uniform(-60, 60, 400), rng.uniform(-60, 60, 400),
+                               rng.uniform(0, 80, 400)])
+        view.point_px = 6.0
+        view.set_cloud(pts, np.full((400, 3), 200, np.uint8), fit=True)
+        background = np.array([8, 10, 13])
+        lit = {}
+        for shading in (True, False):
+            view.set_shading(shading)
+            img = _render(view)
+            lit[shading] = (~(np.abs(img.astype(int) - background) <= 2).all(axis=2)).sum()
+            # 400 points at 6 px is thousands of pixels; the board's lines
+            # alone are a few hundred, and must not pass for a cloud.
+            assert lit[shading] > 3000, (shading, lit[shading])
+        # The two looks are different pictures, not the same one twice.
+        view.set_shading(True)
+        a = _render(view).astype(int)
+        view.set_shading(False)
+        b = _render(view).astype(int)
+        assert (np.abs(a - b).max(axis=2) > 8).mean() > 0.005
+    finally:
+        view.close()
