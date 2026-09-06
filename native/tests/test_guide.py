@@ -263,6 +263,30 @@ def test_a_clipped_stripe_is_called_out_where_the_stripe_counts(board) -> None:
     assert guide.update(flow, laser_on=True, scanning=True, veto_px=2.0, kept=100).done
 
 
+def test_what_the_server_holds_counts_until_the_rig_moves(board) -> None:
+    """A restart with a calibrated rig starts at the check, not at the lens;
+    Rig moved sends it back to the pair, the lenses still standing."""
+    flow, guide = _flow(board), Guide()
+    flow.set_stored("intrinsics:left", 95, 1.4)
+    flow.set_stored("intrinsics:right", 77, 1.4)
+    flow.set_stored("stereo", 68, 2.3)
+    flow.set_stored("plane", 21, 0.31)
+    flow.set_stored("readout:left", 114, 0.0014)
+    flow.set_stored("readout:right", 95, 0.0022)
+    assert guide.update(flow, laser_on=True).stage == "check"
+    flow.rig_moved()
+    p = guide.update(flow)
+    assert p.stage == "pair" and "server holds" not in p.detail        # stale: not offered
+    guide.back()
+    guide.back()
+    p = guide.update(flow)
+    assert p.stage == "left" and "server holds one from 95 views" in p.detail
+    # A thin lens on the server is no lens.
+    thin, g2 = _flow(board), Guide()
+    thin.set_stored("intrinsics:left", 15, 6.0)
+    assert g2.update(thin).stage == "left"
+
+
 def test_without_a_board_spec_nothing_else_is_asked(board) -> None:
     flow, guide = CalibrationFlow(), Guide()
     p = guide.update(flow)

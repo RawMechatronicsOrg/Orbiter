@@ -660,6 +660,16 @@ class CalibrationFlow:
         res = self.results.get(key)
         return res is not None and self._is_saved(key, res)
 
+    def held(self, key: str, at_least: int = 1) -> int:
+        """How much data the solve the server holds was made from, when it
+        holds one from at least `at_least` and the rig has not moved since
+        — else 0. A lens solved last week is a lens; a pair from before the
+        cameras were re-aimed is not."""
+        saved = self.saved.get(key)
+        if saved is None or saved.count < at_least or self._stale(key):
+            return 0
+        return int(saved.count)
+
     def capture(self) -> int:
         """Manual capture: whatever is there, still or not. Returns the count."""
         return self._capture(force=True)

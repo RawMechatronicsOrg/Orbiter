@@ -155,7 +155,7 @@ class Guide:
                           "", "stop")
         done = {s: self._done(s, flow) for s in STAGES}
         if self.pinned:
-            while done[self.stage] and self.index < len(STAGES) - 1:
+            while self._done(self.stage, flow, own=True) and self.index < len(STAGES) - 1:
                 self.index += 1
         else:
             self.index = next(i for i, s in enumerate(STAGES) if not done[s])   # check never is
@@ -188,19 +188,30 @@ class Guide:
     # ── done ──────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _done(stage: str, flow) -> bool:
+    def _done(stage: str, flow, own: bool = False) -> bool:
+        """Done by this session's own sets and solve — or, unless `own`, by
+        what the server already holds from enough data (`flow.held`): a
+        lens calibrated last week is not asked for again after a restart,
+        and after 'Rig moved' the server's pair and sheet no longer count.
+        A pinned stage moves on by its own criteria only, so Back onto a
+        stage the server holds stays there — that is what Back is for."""
+        held = (lambda key, n: False) if own else flow.held
         if stage in ("left", "right"):
             s = flow.samples
-            return (len(s.views(stage)) >= K_VIEWS
-                    and int(s.coverage(stage, GRID).sum()) >= K_CELLS
-                    and s.tilt_spread(stage) >= MIN_TILT_SPREAD
-                    and f"intrinsics:{stage}" in flow.results)
+            return bool((len(s.views(stage)) >= K_VIEWS
+                         and int(s.coverage(stage, GRID).sum()) >= K_CELLS
+                         and s.tilt_spread(stage) >= MIN_TILT_SPREAD
+                         and f"intrinsics:{stage}" in flow.results)
+                        or held(f"intrinsics:{stage}", K_VIEWS))
         if stage == "pair":
-            return len(flow.samples.paired()) >= PAIR_VIEWS and "stereo" in flow.results
+            return bool((len(flow.samples.paired()) >= PAIR_VIEWS and "stereo" in flow.results)
+                        or held("stereo", PAIR_VIEWS))
         if stage == "plane":
-            return flow.plane.frames >= PLANE_FRAMES and "plane" in flow.results
+            return bool((flow.plane.frames >= PLANE_FRAMES and "plane" in flow.results)
+                        or held("plane", PLANE_FRAMES))
         if stage == "readout":
-            return all(f"readout:{s}" in flow.results for s in ("left", "right"))
+            return all(f"readout:{s}" in flow.results or held(f"readout:{s}", READOUT_VIEWS)
+                       for s in ("left", "right"))
         return False   # the check is where the guide ends; it is never skipped
 
     # ── the stages ────────────────────────────────────────────────────────
@@ -248,6 +259,8 @@ class Guide:
                   f"tilt {tilt:.0f}/{MIN_TILT_SPREAD:.0f}")
         if res is None and flow.reasons.get(key):
             detail += f" · refused: {flow.reasons[key]}"
+        if res is None and flow.held(key):
+            detail += f" · server holds one from {flow.held(key)} views"
         if res is not None:
             fx = float(res.intrinsics.K[0, 0])
             sig = res.sigma_f_px / fx * 100.0 if fx > 0 and np.isfinite(res.sigma_f_px) else float("nan")
@@ -285,6 +298,8 @@ class Guide:
             action = ("CHANGE THE DISTANCE — EVERY PAIR SO FAR IS AT ONE RANGE" if one_range
                       else "NEW PLACE, TILT OR DISTANCE — BOTH CAMERAS ON THE BOARD")
         detail = f"pairs {pairs}/{PAIR_VIEWS}"
+        if res is None and flow.held("stereo"):
+            detail += f" · server holds one from {flow.held('stereo')} pairs"
         if res is not None:
             detail += (f" · rms {res.rms_px:.2f} px · baseline {res.baseline_mm:.0f} mm · "
                        f"{'saved' if flow.is_saved('stereo') else 'not saved'}")
