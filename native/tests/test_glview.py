@@ -174,3 +174,43 @@ def test_a_half_size_texture_still_maps_geometry_in_frame_coordinates() -> None:
             assert _near(img, map_points(pt.reshape(1, 2), W, H, o)[0], dpr, (255, 150, 0), reach=2)
     finally:
         view.close()
+
+
+def _grab(view) -> np.ndarray:
+    from PySide6.QtGui import QImage
+    _app().processEvents()
+    img = view.grabFramebuffer().convertToFormat(QImage.Format.Format_RGB888)
+    w, h = img.width(), img.height()
+    arr = np.frombuffer(img.constBits(), np.uint8, count=img.sizeInBytes())
+    return arr.reshape(h, img.bytesPerLine())[:, : w * 3].reshape(h, w, 3).copy()
+
+
+def test_the_guides_target_and_highlight_are_drawn_where_the_frame_puts_them() -> None:
+    """The target rectangle is given in original pixels and lands through the
+    orientation, tinted over the frame; the highlight frames the widget."""
+    o = Orientation(1)
+    got = _render(_scene(o), (H, W))          # oriented frame is 200×320, scale 1
+    if got is None:
+        pytest.skip("no OpenGL context here")
+    img, view, dpr = got
+    try:
+        view.set_target((0.0, 0.0, 80.0, 60.0))   # the original frame's top-left cell
+        view.set_highlight(True)
+        tinted = _grab(view)
+        inside = map_points(np.array([[40.0, 30.0]]), W, H, o)[0]
+        outside = map_points(np.array([[200.0, 150.0]]), W, H, o)[0]
+        x, y = ((inside + 0.5) * dpr).astype(int)
+        r, g, b = (int(v) for v in tinted[y, x])
+        assert r > 55 and g > 50 and b < 30, tinted[y, x]      # yellow over the grey frame
+        x, y = ((outside + 0.5) * dpr).astype(int)
+        assert tuple(tinted[y, x]) == (30, 30, 30), tinted[y, x]
+        assert tuple(img[int((inside[1] + 0.5) * dpr), int((inside[0] + 0.5) * dpr)]) == (30, 30, 30)
+        # The highlight: a blue frame a few pixels in from the widget's edge.
+        edge = tinted[int(160 * dpr), int(4 * dpr)]
+        assert edge[2] > 200 and edge[0] < 160, edge
+        view.set_target(None)
+        view.set_highlight(False)
+        plain = _grab(view)
+        assert (plain == img).all()
+    finally:
+        view.close()

@@ -260,6 +260,13 @@ class CalibrationFlow:
         #: Best intrinsics known per eye: the server's, then each better solve.
         self.known_k: dict[str, Any] = {}
         self.laser_active = False
+        #: The eye whose lens is being calibrated on its own — "left",
+        #: "right" or None. The guide sets it for its per-eye stages: a
+        #: still board that only this eye sees becomes a view, where the pair
+        #: rule would wait for the other eye. A lens is measured at the
+        #: frame's own corners and edges, and the other eye does not see
+        #: those places at all.
+        self.solo: str | None = None
         #: Latest result and latest refusal per solve, for the scoreboard.
         self.results: dict[str, Any] = {}
         self.reasons: dict[str, str] = {}
@@ -278,6 +285,10 @@ class CalibrationFlow:
                                           "right": deque(maxlen=PAIR_HISTORY)}
         self._last_corners: dict[str, tuple[np.ndarray, np.ndarray, float | None] | None] = {}
         self._moved: dict[str, float | None] = {"left": None, "right": None}
+        #: What each eye's newest frame showed, for the guide: the board's
+        #: place in the frame and whether the stripe fit across it.
+        self._last_desc: dict[str, Any] = {"left": None, "right": None}
+        self._last_stripe_ok: dict[str, bool] = {"left": False, "right": False}
         #: Corner speed per eye, px/s, for what a pair's gap costs.
         self._speed: dict[str, float | None] = {"left": None, "right": None}
         self._running = False
@@ -381,6 +392,9 @@ class CalibrationFlow:
         moved = self._movement(res)
         board = res.board
         has_board = board is not None and board.corners is not None
+        self._last_desc[res.side] = getattr(res, "descriptor", None) if has_board else None
+        line = getattr(res, "laser", None)
+        self._last_stripe_ok[res.side] = bool(line is not None and line.ok)
         notes = []
         if has_board:
             self._recent[res.side].append(res)
@@ -406,6 +420,7 @@ class CalibrationFlow:
         if board is None or board.corners is None or board.ids is None:
             self._last_corners[res.side] = None
             self._moved[res.side] = self._speed[res.side] = None
+            self._last_desc[res.side] = None
             return None
         cur = board.corners.reshape(-1, 2)
         cur_ids = board.ids.ravel()
@@ -522,9 +537,11 @@ class CalibrationFlow:
         m = self._moved.get(side)
         return m is not None and m <= STILL_PX
 
-    def gate_report(self) -> str:
+    def gate(self) -> tuple[str, str]:
         """Why the automatic capture is not taking a view right now: the first
-        gate the current frames fail, in the order `_capture` applies them.
+        gate the current frames fail, in the order `_capture` applies them,
+        as `(key, why)`. The key is one word for the guide to act on, the
+        text is for the panel.
 
         From the outside every gate looks the same — the view count does not
         move — and an operator waving the board sees nothing to correct. Which
@@ -532,33 +549,79 @@ class CalibrationFlow:
         and knowing that the right eye has never seen the board at all.
         """
         if self.board is None:
-            return "no board spec from the server"
+            return "spec", "no board spec from the server"
         if len(self.samples) >= MAX_VIEWS:
-            return f"{MAX_VIEWS} views held, the ceiling"
+            return "ceiling", f"{MAX_VIEWS} views held, the ceiling"
+        if self.solo is not None:
+            return self._solo_gate(self.solo)
         absent = [s for s in ("left", "right") if self._last_corners.get(s) is None]
         if absent:
-            return ("no board in either eye" if len(absent) == 2
-                    else f"no board in the {absent[0]} eye: a view needs both")
+            return "board", ("no board in either eye" if len(absent) == 2
+                             else f"no board in the {absent[0]} eye: a view needs both")
         if any(self._moved.get(s) is None for s in ("left", "right")):
-            return "settling: stillness is measured over two frames"
+            return "settling", "settling: stillness is measured over two frames"
         moving = [s for s in ("left", "right") if not self._still(s)]
         if moving:
-            return ("moving " + ", ".join(f"{s} {self._moved[s]:.1f} px" for s in moving)
-                    + f": hold still, under {STILL_PX:g} px per frame")
+            return "moving", ("moving " + ", ".join(f"{s} {self._moved[s]:.1f} px" for s in moving)
+                              + f": hold still, under {STILL_PX:g} px per frame")
         best = self._best_pair()
         if best is None:
-            return "waiting for the next frame of both eyes"
+            return "wait", "waiting for the next frame of both eyes"
         gap, a, b = best
         if gap > PAIR_MAX_GAP_S:
-            return (f"eyes {gap * 1000:.0f} ms apart, over {PAIR_MAX_GAP_S * 1000:.0f}: "
-                    "waiting for a closer pair")
+            return "gap", (f"eyes {gap * 1000:.0f} ms apart, over {PAIR_MAX_GAP_S * 1000:.0f}: "
+                           "waiting for a closer pair")
         drift = self._drift_px(gap)
         if drift > PAIR_MOVE_PX:
-            return (f"board slides {drift:.2f} px between the eyes' exposures, "
-                    f"over {PAIR_MOVE_PX:g}: hold stiller")
+            return "drift", (f"board slides {drift:.2f} px between the eyes' exposures, "
+                             f"over {PAIR_MOVE_PX:g}: hold stiller")
         if not self.samples.is_new(a.descriptor, b.descriptor):
-            return "still and paired, nothing new: a new place in the frame or a new tilt"
-        return "taking a view"
+            return "dup", "still and paired, nothing new: a new place in the frame or a new tilt"
+        return "ok", "taking a view"
+
+    def _solo_gate(self, side: str) -> tuple[str, str]:
+        """`gate` for one eye's own stage: the other eye is not asked."""
+        if self._last_corners.get(side) is None:
+            return "board", f"no board in the {side} eye"
+        if self._moved.get(side) is None:
+            return "settling", "settling: stillness is measured over two frames"
+        if not self._still(side):
+            return "moving", (f"moving {side} {self._moved[side]:.1f} px: hold still, "
+                              f"under {STILL_PX:g} px per frame")
+        if not self._recent[side]:
+            return "wait", f"waiting for the next {side} frame"
+        d = self._recent[side][-1].descriptor
+        if self.samples.novelty(side, d) < self.samples.novelty_threshold:
+            return "dup", "still, nothing new: a new place in the frame or a new tilt"
+        return "ok", "taking a view"
+
+    def gate_report(self) -> str:
+        """`gate`'s text alone."""
+        return self.gate()[1]
+
+    # ── what the eyes see now, for the guide ────────────────────────────
+
+    def where(self, side: str) -> tuple[float, float] | None:
+        """The board's place in this eye's newest frame — its corners'
+        centroid as fractions of the frame, (x, y) in 0..1 — or None when
+        the eye does not see it."""
+        d = self._last_desc.get(side)
+        return None if d is None else (float(d.cx), float(d.cy))
+
+    def moved(self, side: str) -> float | None:
+        """How far this eye's board moved since its previous frame, px, or
+        None before a second frame."""
+        return self._moved.get(side)
+
+    def stripe_ok(self, side: str) -> bool:
+        """Whether the laser line fitted across the board in this eye's
+        newest frame."""
+        return bool(self._last_stripe_ok.get(side))
+
+    def is_saved(self, key: str) -> bool:
+        """Whether the server holds this solve's current result."""
+        res = self.results.get(key)
+        return res is not None and self._is_saved(key, res)
 
     def capture(self) -> int:
         """Manual capture: whatever is there, still or not. Returns the count."""
@@ -569,10 +632,16 @@ class CalibrationFlow:
             return 0
         left, right = self._find_pair()
         if left is None or right is None:
-            if not force:
+            if force:
+                left = left or (self._recent["left"][-1] if self._recent["left"] else None)
+                right = right or (self._recent["right"][-1] if self._recent["right"] else None)
+            elif self.solo is not None and self._recent[self.solo]:
+                # This eye's own stage: its newest frame stands alone. The
+                # stillness and novelty gates below still apply to it.
+                one = self._recent[self.solo][-1]
+                left, right = (one, None) if self.solo == "left" else (None, one)
+            else:
                 return 0
-            left = left or (self._recent["left"][-1] if self._recent["left"] else None)
-            right = right or (self._recent["right"][-1] if self._recent["right"] else None)
             if left is None and right is None:
                 return 0
         views = {"left": None, "right": None}

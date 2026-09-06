@@ -46,6 +46,7 @@ from PySide6.QtGui import (
     QMatrix3x3,
     QOpenGLFunctions,
     QPainter,
+    QPen,
     QPolygonF,
     QVector2D,
     QVector3D,
@@ -82,6 +83,11 @@ _OUTLIER = (235 / 255, 60 / 255, 60 / 255, 1.0)
 _CORNER = QColor(120, 235, 0)
 _LINE = QColor(60, 235, 235)
 _HULL = QColor(255, 190, 0)
+#: The guide's target — where to bring the board — and the frame around the
+#: eye the guide is talking about. Loud on purpose: read from across the bench.
+_TARGET_FILL = QColor(255, 214, 0, 48)
+_TARGET_EDGE = QColor(255, 214, 0, 235)
+_HIGHLIGHT = QColor(124, 196, 255)
 
 _IMAGE_VS = """
 attribute vec2 pos;
@@ -201,6 +207,10 @@ class FrameView(QOpenGLWidget):
         self._scene: Scene | None = None
         self._overlay: list[str] = []
         self._placeholder = "waiting for frames…"
+        #: The guide's target as (x0, y0, x1, y1) in ORIGINAL pixels, and
+        #: whether this eye is the one the guide is talking about.
+        self._target: tuple[float, float, float, float] | None = None
+        self._highlight = False
         self.renderer: str | None = None
         self.setMinimumSize(320, 180)
         # GL resources, made in initializeGL.
@@ -229,6 +239,19 @@ class FrameView(QOpenGLWidget):
     def set_overlay(self, lines: list[str]) -> None:
         self._overlay = lines
         self.update()
+
+    def set_target(self, rect: tuple[float, float, float, float] | None) -> None:
+        """Where the guide wants the board: a rectangle in ORIGINAL pixels,
+        drawn over the frame wherever the orientation puts it. None clears."""
+        if rect != self._target:
+            self._target = rect
+            self.update()
+
+    def set_highlight(self, on: bool) -> None:
+        """Frame this eye as the one the guide's instruction is about."""
+        if on != self._highlight:
+            self._highlight = on
+            self.update()
 
     def clear_frame(self, message: str) -> None:
         self._scene = None
@@ -309,7 +332,9 @@ class FrameView(QOpenGLWidget):
             finally:
                 p.endNativePainting()
             self._annotate(p, scene)
+            self._draw_target(p)
         self._draw_overlay(p)
+        self._draw_highlight(p)
         p.end()
 
     def _draw_scene(self, scene: Scene) -> None:
@@ -468,6 +493,37 @@ class FrameView(QOpenGLWidget):
                 p.drawRect(int(round(x)) - 3, int(round(y)) - 3, 6, 6)
                 if ids is not None and i < len(ids):
                     p.drawText(int(round(x)) + 5, int(round(y)) - 4, str(int(ids[i])))
+
+    def _draw_target(self, p: QPainter) -> None:
+        if self._target is None:
+            return
+        x0, y0, x1, y1 = self._target
+        # Corners as pixel indices: `to_widget` adds the half-pixel itself.
+        pts = self.to_widget(np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]]) - 0.5)
+        if not len(pts):
+            return
+        poly = QPolygonF([QPointF(float(x), float(y)) for x, y in pts])
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setBrush(_TARGET_FILL)
+        pen = QPen(_TARGET_EDGE, 4)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        p.setPen(pen)
+        p.drawPolygon(poly)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        font = QFont("Segoe UI")
+        font.setPixelSize(22)
+        font.setBold(True)
+        p.setFont(font)
+        rect = poly.boundingRect()
+        p.setPen(_TARGET_EDGE)
+        p.drawText(rect, Qt.AlignmentFlag.AlignCenter, "HERE")
+
+    def _draw_highlight(self, p: QPainter) -> None:
+        if not self._highlight:
+            return
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(_HIGHLIGHT, 6))
+        p.drawRect(self.rect().adjusted(3, 3, -3, -3))
 
     def _draw_placeholder(self, p: QPainter) -> None:
         p.setPen(QColor(120, 134, 150))

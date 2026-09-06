@@ -102,6 +102,8 @@ class CalibrationPanel(QFrame):
     save_requested = Signal(dict)
     #: Calibrating wants the stripe detected; the window owns that switch.
     laser_requested = Signal(bool)
+    #: The operator dropped every set: whoever follows the stages starts over.
+    cleared = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -446,6 +448,7 @@ class CalibrationPanel(QFrame):
         self._persist()
         self._activity = "cleared"
         self._refresh()
+        self.cleared.emit()
 
     def _rig_moved(self) -> None:
         n = self.flow.rig_moved()

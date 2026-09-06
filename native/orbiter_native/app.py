@@ -23,12 +23,12 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QCheckBox,
-    QHBoxLayout,
     QLabel,
     QMainWindow,
     QSpinBox,
     QSplitter,
     QStatusBar,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -37,6 +37,8 @@ import httpx
 from .calibpanel import CalibrationPanel
 from .cloudview import CloudPanel
 from .config import ConfigClient, RigConfig
+from .guide import Guide
+from .guidepanel import GuideBanner
 from .laser import LaserParams
 from .panel import EyePanel
 from .scanpanel import ScanPanel
@@ -54,6 +56,9 @@ _CONFIG_POLL_MS = 2000
 #: How often the window looks for newer results. Faster than the cameras is
 #: pointless; slower would show frames late.
 _PAINT_MS = 33
+#: The guide's prompt is re-read this often: quick enough that "hold still"
+#: follows the hand, slow enough that the big type does not flicker.
+_GUIDE_MS = 250
 
 
 class MainWindow(QMainWindow):
@@ -99,6 +104,18 @@ class MainWindow(QMainWindow):
         self.scan.active_changed.connect(self._on_scan_toggled)
         self.cloud = CloudPanel()
 
+        # The guide: which stage, what to do, where to bring the board.
+        self.guide = Guide()
+        self.banner = GuideBanner()
+        self.banner.back_requested.connect(self._guide_back)
+        self.banner.next_requested.connect(self._guide_next)
+        self.banner.toggled.connect(self._guide_toggled)
+        self.calib.cleared.connect(self._guide_restart)
+        #: Each eye's newest frame size, for the guide's target rectangle.
+        self._wh: dict[str, tuple[int, int] | None] = {"left": None, "right": None}
+        #: The scan's last frame while scanning, for the guide's check.
+        self._scan_frame = None
+
         split = QSplitter(Qt.Orientation.Horizontal)
         split.addWidget(self.panels["left"])
         split.addWidget(self.panels["right"])
@@ -111,9 +128,11 @@ class MainWindow(QMainWindow):
         split.setSizes([560, 560, 380])
 
         root = QWidget()
-        outer = QHBoxLayout(root)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(split)
+        outer = QVBoxLayout(root)
+        outer.setContentsMargins(4, 4, 4, 0)
+        outer.setSpacing(4)
+        outer.addWidget(self.banner)
+        outer.addWidget(split, 1)
         self.setCentralWidget(root)
 
         self._build_toolbar()
@@ -139,6 +158,10 @@ class MainWindow(QMainWindow):
         self._paint_timer = QTimer(self)
         self._paint_timer.timeout.connect(self._paint)
         self._paint_timer.start(_PAINT_MS)
+
+        self._guide_timer = QTimer(self)
+        self._guide_timer.timeout.connect(self._guide_tick)
+        self._guide_timer.start(_GUIDE_MS)
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll_config)
@@ -261,6 +284,8 @@ class MainWindow(QMainWindow):
             w.set_scan_mode(on)
         for panel in self.panels.values():
             panel.set_scanning(on)
+        if not on:
+            self._scan_frame = None
 
     def _extrinsics_for(self, wh: tuple[int, int] | None):
         """The pair geometry at the left eye's live frame size, or None.
@@ -283,6 +308,8 @@ class MainWindow(QMainWindow):
         fresh = {side: box.take(0.0) for side, box in self._inbox.items()}
         now = time.monotonic()
         for side, res in fresh.items():
+            if res is not None:
+                self._wh[side] = res.wh
             if res is not None and res.board is not None and res.board.R is not None:
                 self._poses[side] = (res.board.R, res.board.t, now, res.wh)
         for side, held in self._poses.items():
@@ -308,6 +335,8 @@ class MainWindow(QMainWindow):
         status = self.scanner.status.take(0.0)
         if status is not None:
             self.scan.on_status(status)
+            if status.frame is not None:
+                self._scan_frame = status.frame
         # The same decimated snapshot the eyes draw; the view uploads it
         # only when the scan thread published a new one.
         self.cloud.set_live_points(self.scanner.overlay.points(), len(self.scanner.cloud),
@@ -320,6 +349,47 @@ class MainWindow(QMainWindow):
 
     def _on_status(self, side: str, error: object) -> None:
         self.panels[side].on_status(error if isinstance(error, str) else None)
+
+    # ── the guide ─────────────────────────────────────────────────────────
+
+    def _guide_tick(self) -> None:
+        if not self.banner.enabled.isChecked():
+            return
+        frames = {side: (wh[0], wh[1], self.panels[side].orientation)
+                  for side, wh in self._wh.items() if wh is not None}
+        f = self._scan_frame if self.scan.scanning else None
+        prompt = self.guide.update(
+            self.calib.flow, frames, laser_on=self._laser.isChecked(),
+            scanning=self.scan.scanning,
+            veto_px=None if f is None else float(f.veto_px),
+            kept=0 if f is None else int(f.n_kept),
+            auto=self.calib.auto.isChecked())
+        self.banner.set_prompt(prompt)
+        for side, panel in self.panels.items():
+            panel.view.set_target(prompt.target if prompt.eye == side else None)
+            panel.view.set_highlight(prompt.eye in (side, "both"))
+
+    def _guide_back(self) -> None:
+        self.guide.back()
+        self._guide_tick()
+
+    def _guide_next(self) -> None:
+        self.guide.next()
+        self._guide_tick()
+
+    def _guide_restart(self) -> None:
+        self.guide.restart()
+        self._guide_tick()
+
+    def _guide_toggled(self, on: bool) -> None:
+        if on:
+            self._guide_tick()
+            return
+        # Off: the eyes pair as usual, and nothing of the guide stays drawn.
+        self.calib.flow.solo = None
+        for panel in self.panels.values():
+            panel.view.set_target(None)
+            panel.view.set_highlight(False)
 
     # ── which GPU draws this window ─────────────────────────────────────
 

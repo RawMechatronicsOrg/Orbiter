@@ -243,6 +243,39 @@ Which needs intrinsics — see the known limits above.
 
 ## Calibration
 
+**The guide.** The banner across the top of the window (`guide.Guide`,
+`guidepanel.GuideBanner`) walks the calibration one stage at a time, in type
+sized for an operator holding the scanner and reading the monitor from the
+bench: **1 LEFT** lens, **2 RIGHT** lens, **3 PAIR**, **4 LASER** sheet,
+**5 READOUT** (optional — Next skips it), **6 CHECK**. Each stage shows one
+instruction — `MOVE THE BOARD A LITTLE UP-LEFT`, `HOLD STILL (6 px)`, `TILT
+THE BOARD MORE`, `THE RIGHT CAMERA MUST SEE IT TOO`, `TICK 'laser line'` —
+and the counts behind it (`views 12/30 · cells 9/24 · tilt 5/8 · f ±0.53 %
+· not saved`). Colour first, words second: green — keep doing that; amber —
+change something; red — a switch or a re-do is in the way; blue — done. In
+the lens stages the eye in question is framed blue and a yellow `HERE`
+rectangle on its video is the cell of the coverage grid to bring the board
+to: the least-visited cell nearest to where the board is, so the sweep is a
+path across the frame rather than a jump to its far corner each time, named
+as the monitor shows it whatever way the eye is turned. The stage is the
+first one not done, found afresh every quarter second — the pair after
+**Rig moved**, a lens whose re-solve was refused, take the guide back to
+them; **Back** and **Next** pin a stage the operator chose, which then only
+moves forward. **Clear** starts the guide over.
+
+A lens stage is done at 30 views over 24 of the 36 cells with tilt variety
+and a solve: on this rig 15–20 views gave the focal length to ±0.5–1.1 % and
+the scan's veto sat in the hundreds of pixels, 56 views gave ±0.25 %. Lens
+stages take **one-eyed views** (`CalibrationFlow.solo`): the pair rule keeps
+the board where both eyes see it, and the frame's corners and edges — where
+distortion is measured — are outside the other eye's field. The check stage
+reads the scan itself: with the laser and the scan on, the median
+disagreement between the left eye's triangulation and the right eye's
+stripe must be within 6 px (twice the scan's own veto radius); hundreds of
+pixels means the geometry is off and the cure is the pair and then the
+sheet again, not more scanning. Untick **guide** and the eyes pair as
+before, with nothing drawn on them.
+
 **When the rig moves.** Re-aiming or moving the cameras or the laser stales
 the pair's geometry and the sheet, not the intrinsics: a lens is what it was.
 Press **Rig moved** in the CALIBRATION panel: it keeps every eye's views for

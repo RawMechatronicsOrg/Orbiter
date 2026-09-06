@@ -15,6 +15,7 @@ from PySide6.QtWidgets import QFrame, QLabel, QVBoxLayout
 
 from .config import Eye
 from .glview import FrameView, Scene
+from .orient import Orientation
 from .scan import CloudOverlay
 from .worker import EyeResult, EyeStats
 
@@ -77,6 +78,12 @@ class EyePanel(QFrame):
         self.subtitle.setText(" · ".join(bits))
 
     # ── live updates ──────────────────────────────────────────────────────
+
+    @property
+    def orientation(self) -> Orientation:
+        """How this eye's frames are turned for display — what the guide
+        needs to say TOP-LEFT and mean the monitor's top-left."""
+        return self._eye.orientation if self._eye is not None else Orientation()
 
     def set_overlay(self, overlay: CloudOverlay | None) -> None:
         """The scanned cloud, drawn over the frame while scanning."""
