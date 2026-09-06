@@ -39,7 +39,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from PySide6.QtCore import QLineF, QPointF, Qt
+from PySide6.QtCore import QLineF, QPointF, Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -72,6 +72,7 @@ _GL_COLOR_BUFFER_BIT = 0x4000
 _GL_DEPTH_TEST = 0x0B71
 _GL_BLEND = 0x0BE2
 _GL_PROGRAM_POINT_SIZE = 0x8642
+_GL_RENDERER = 0x1F01
 
 # Colours as the CPU overlay had them (BGR there), as RGB here.
 _STRIPE = (80 / 255, 235 / 255, 80 / 255, 1.0)
@@ -191,11 +192,16 @@ def orientation_matrix(w: int, h: int, o: Orientation) -> np.ndarray:
 class FrameView(QOpenGLWidget):
     """Displays one eye's `Scene`, plus a text overlay drawn over it."""
 
+    #: GL_RENDERER, once the context exists: which GPU draws this widget.
+    #: `app.MainWindow` holds it against the GPU driving the monitor.
+    gl_ready = Signal(str)
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._scene: Scene | None = None
         self._overlay: list[str] = []
         self._placeholder = "waiting for frames…"
+        self.renderer: str | None = None
         self.setMinimumSize(320, 180)
         # GL resources, made in initializeGL.
         self._gl: QOpenGLFunctions | None = None
@@ -270,6 +276,8 @@ class FrameView(QOpenGLWidget):
 
     def initializeGL(self) -> None:  # noqa: N802 - Qt naming
         self._gl = self.context().functions()
+        self.renderer = str(self._gl.glGetString(_GL_RENDERER) or "")
+        self.gl_ready.emit(self.renderer)
         self._image_prog = self._program(_IMAGE_VS, _IMAGE_FS)
         self._pt2_prog = self._program(_POINTS2D_VS, _POINT_FS)
         self._pt3_prog = self._program(_POINTS3D_VS, _POINT_FS)

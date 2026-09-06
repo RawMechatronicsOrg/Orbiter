@@ -45,6 +45,18 @@ log says which (`frames: GPU: …` or `frames: CPU (OpenCV): …`), the eye over
 shows `gpu` on its first line, and `--no-gpu` forces the CPU path for a
 comparison.
 
+**Two GPUs, two monitors.** Windows gives a process one OpenGL implementation:
+the primary display adapter's. Put this window on a monitor that another GPU
+drives and it is still drawn by the primary GPU, then copied across for every
+frame by the desktop itself. On the lab PC — AMD iGPU on the primary monitor,
+the window on the GTX 1650 SUPER's — that copy alone held 40% of the 1650's 3D
+engine at 30 frames/s, and a maximised window with the cloud being turned
+saturated the GPU that composes that monitor and stalled the desktop. The
+status bar warns when the GPU drawing the window is not the GPU driving its
+monitor (`orbiter_native/screens.py`); the fix is on the desktop, not in here:
+make the monitor you work on the primary display, or drive it from the GPU
+that also runs CUDA.
+
 ## Run
 
 ```bash

@@ -41,6 +41,7 @@ from .laser import LaserParams
 from .panel import EyePanel
 from .scanpanel import ScanPanel
 from .scanworker import LEFT_POSE_RECENT_S, ScanWorker
+from .screens import adapter_of_window, same_gpu
 from .stereo import compose_right_pose, result_from_config
 from .worker import EyeWorker, Latest
 
@@ -118,6 +119,16 @@ class MainWindow(QMainWindow):
         self._server_label = QLabel(f"server {server}")
         self._server_label.setStyleSheet("color:#8b9aac; font-family:Consolas;")
         self.statusBar().addPermanentWidget(self._server_label)
+        # Which GPU draws the window against which GPU drives its monitor:
+        # known once the first GL context exists, checked again whenever the
+        # window changes screens (screens.py has the why).
+        self._gl_renderer: str | None = None
+        self._screen_watched = False
+        self._gpu_label = QLabel()
+        self._gpu_label.setStyleSheet("color:#fbbf24; font-family:Consolas;")
+        self._gpu_label.hide()
+        self.statusBar().addPermanentWidget(self._gpu_label)
+        self.panels["left"].view.gl_ready.connect(self._on_gl_ready)
 
         self.scanner.start()
         for w in self.workers.values():
@@ -304,6 +315,36 @@ class MainWindow(QMainWindow):
 
     def _on_status(self, side: str, error: object) -> None:
         self.panels[side].on_status(error if isinstance(error, str) else None)
+
+    # ── which GPU draws this window ─────────────────────────────────────
+
+    def _on_gl_ready(self, renderer: str) -> None:
+        self._gl_renderer = renderer
+        handle = self.windowHandle()
+        if handle is not None and not self._screen_watched:
+            handle.screenChanged.connect(lambda _screen: self._check_gpu_topology())
+            self._screen_watched = True
+        self._check_gpu_topology()
+
+    def _check_gpu_topology(self) -> None:
+        """Warn when the GPU drawing the window is not the GPU driving its
+        monitor. The desktop then copies every frame between the two - on
+        the lab PC 40% of a GPU at 30 frames/s, and a stalled desktop with
+        the window maximised. The remedy is on the desktop (which monitor is
+        primary, which GPU drives it), so this says so rather than guessing
+        at a rate cap that only moves the cliff."""
+        renderer = self._gl_renderer
+        adapter = adapter_of_window(int(self.winId())) if renderer else None
+        if not renderer or adapter is None or same_gpu(renderer, adapter):
+            self._gpu_label.hide()
+            return
+        text = (f"OpenGL draws on {renderer}, this monitor is on {adapter}: every "
+                f"frame is copied between the two GPUs. Move the window to a "
+                f"{renderer} monitor, or make this monitor the primary display.")
+        if self._gpu_label.text() != "⚠ " + text:
+            log.warning(text)
+        self._gpu_label.setText("⚠ " + text)
+        self._gpu_label.show()
 
     # ── shutdown ──────────────────────────────────────────────────────────
 
