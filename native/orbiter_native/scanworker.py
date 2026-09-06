@@ -30,6 +30,7 @@ import numpy as np
 from .config import RigConfig
 from .laser import StripePixels
 from .laserplane import LaserPlane, from_config as plane_from_config
+from .posesmooth import PoseSmoother
 from .rolling import Motion, Readout
 from .scan import (
     CloudOverlay,
@@ -87,6 +88,19 @@ STILL_BATCH = 5
 #: last had a board pose — a moment's loss of the board is not a reason to
 #: miss the stripe the scan will want on the next frame.
 POSE_RECENT_S = 0.5
+
+#: The two eyes' own board poses may differ by this much and still be one
+#: pose seen twice — five times what the pair's residual accounts for at
+#: the working distance. Past it the pair's geometry describes another rig
+#: (the cameras were re-aimed and the pair not redone), every point would
+#: land where that other rig would have put it, and the frame is not
+#: scanned; the panel says why.
+POSE_GAP_MAX_DEG = 2.0
+POSE_GAP_MAX_MM = 15.0
+#: Board corners across both eyes below which a pose is too loose to place
+#: points by: at the working distance a pose from a handful of corners
+#: wanders by millimetres from frame to frame.
+MIN_POSE_CORNERS = 12
 
 
 def _still(a: tuple[np.ndarray, np.ndarray], b: tuple[np.ndarray, np.ndarray]) -> bool:
@@ -289,6 +303,9 @@ class ScanWorker:
         # cloud; the pose they are still against is the first one's.
         self._batch: list[ScanFrame] = []
         self._batch_pose: tuple[np.ndarray, np.ndarray] | None = None
+        #: Frames wait here for their neighbours in time, and are placed
+        #: through the median pose of the window — see `posesmooth`.
+        self._smooth = PoseSmoother()
 
         self.cloud = PointCloud()
         self.overlay = CloudOverlay()
@@ -365,11 +382,16 @@ class ScanWorker:
                     q.clear()
                 self._prev = None
                 self._last_right = None
+                # Frames still waiting for neighbours are placed with what
+                # they have: the session is over, no neighbour is coming.
+                for (f, m, own_t), r_s, t_s in self._smooth.flush():
+                    self._place(f, m, own_t, r_s, t_s, self._params)
+                    spilled += self._bank(f, r_s, t_s)
+                spilled += self._take_batch()
                 # The next session starts its own batch: kept, this pose
                 # would be what the first frame of that session is judged
                 # still against.
                 self._batch_pose = None
-                spilled = self._take_batch()
         if self._merge(spilled):
             snap = self._snapshot(self._params)
         if snap is not None:
@@ -382,6 +404,7 @@ class ScanWorker:
         with self._lock:
             self._batch.clear()
             self._batch_pose = None
+            self._smooth.flush()
             self._pairs = 0
             self._offered_left = 0
         with self._cloud_lock:
@@ -539,6 +562,18 @@ class ScanWorker:
             self._publish(None, "board not visible to either eye — it is what defines "
                                 "the scan volume")
             return
+        if fix.gap_deg == fix.gap_deg and (fix.gap_deg > POSE_GAP_MAX_DEG
+                                           or fix.gap_mm > POSE_GAP_MAX_MM):
+            self._prev = None
+            self._publish(None, (f"the eyes' board poses differ by {fix.gap_deg:.1f}° / "
+                                 f"{fix.gap_mm:.0f} mm: the pair does not describe this rig — "
+                                 "Rig moved, then the PAIR and LASER stages"))
+            return
+        corners = sum(len(x.corners) for x in (a, b) if x.corners is not None)
+        if corners < MIN_POSE_CORNERS:
+            self._publish(None, (f"{corners} board corners across both eyes: too few for a "
+                                 f"steady pose, {MIN_POSE_CORNERS} needed"))
+            return
         motion, note = self._motion(a, fix, readout)
         self._prev = (fix, a.capture_mono, a.pose_row)
         frame = scan_frame(rig, plane, a.stripe, b.stripe, fix.R, fix.t, params,
@@ -550,16 +585,51 @@ class ScanWorker:
             frame.colours = sample_beside(a.bgr, frame.pixels_left, frame.along_x,
                                           params.colour_offset_px, a.wh)
         snap = None
+        placed = None
         with self._lock:
             self._pairs += 1
-            spilled = self._bank(frame, fix.R, fix.t)
+            # The frame waits for its neighbours in time; what comes back is
+            # the frame from the middle of the window, with the median pose
+            # of the window to place its points through.
+            spilled = []
+            for (f, m, own_t), r_s, t_s in self._smooth.push(
+                    (frame, motion, np.asarray(fix.t, float).ravel()),
+                    fix.R, fix.t, a.capture_mono):
+                self._place(f, m, own_t, r_s, t_s, params)
+                spilled += self._bank(f, r_s, t_s)
+                placed = f
         # Deliberately outside that lock: `offer` takes it on both detector
         # threads, and a voxel merge under it stalls both eyes every pair.
         if self._merge(spilled):
             snap = self._snapshot(params)
         if snap is not None:
             self.overlay.publish(*snap)
-        self._publish(frame, None)
+        self._publish(placed if placed is not None else frame, None)
+
+    @staticmethod
+    def _place(frame: ScanFrame, motion: Motion | None, own_t: np.ndarray,
+               R: np.ndarray, t: np.ndarray, params: ScanParams) -> None:
+        """Put a frame's points into the board frame through a pose other
+        than its own — the smoothed one — and keep what the volume holds.
+        The rolling-shutter twist, when the frame had one, is applied on
+        top of the new pose the same way it was on the old."""
+        frame.pose_smooth_mm = float(np.linalg.norm(np.asarray(t, float).ravel() - own_t))
+        if not frame.n_kept:
+            return
+        xyz_cam = frame.points_camera
+        if motion is not None:
+            xyz = motion.to_board(xyz_cam, frame.pixels_left[:, 1], R, t)
+        else:
+            xyz = (np.asarray(R, float).T @ (xyz_cam.T - np.asarray(t, float).reshape(3, 1))).T
+        inside = params.volume.contains(xyz)
+        frame.points_board = xyz[inside]
+        frame.points_camera = xyz_cam[inside]
+        frame.pixels_left = frame.pixels_left[inside]
+        frame.weights = frame.weights[inside]
+        frame.scanlines = frame.scanlines[inside]
+        if frame.colours is not None:
+            frame.colours = frame.colours[inside]
+        frame.n_rejected_volume += int((~inside).sum())
 
     # ── still batches (under the lock) ────────────────────────────────────
 

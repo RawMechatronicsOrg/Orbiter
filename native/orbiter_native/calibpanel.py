@@ -288,6 +288,7 @@ class CalibrationPanel(QFrame):
         if "R" in x:
             flow.set_stored("stereo", int(x.get("views", 0) or 0),
                             float(x.get("rms_px", float("nan")) or float("nan")))
+            flow.set_stored_pair(x)
         p = cfg.laser_plane_raw or {}
         if "n" in p:
             flow.set_stored("plane", int(p.get("frames", 0) or 0),
@@ -406,8 +407,10 @@ class CalibrationPanel(QFrame):
             self._activity = f"solve failed: {out.reasons['cycle']}"
         else:
             solved = ", ".join(k for k in out.results)
+            note, self.flow.last_note = self.flow.last_note, None
             self._activity = (f"cycle {out.seconds:.1f} s: {solved or 'nothing solved'}"
-                              + (" — saving" if payload and self.autosave.isChecked() else ""))
+                              + (" — saving" if payload and self.autosave.isChecked() else "")
+                              + (f" · {note}" if note else ""))
         if payload and self.autosave.isChecked():
             self.save_requested.emit(payload)
         self._refresh()

@@ -316,7 +316,12 @@ exactly wrong once it has moved, and without the button the stale solve would
 win on views forever. The scoreboard says the server's geometry is stale until
 the new one lands; until then the scan's veto and the pose gap on the SCAN
 panel show the disagreement. Then: pairs where both eyes see the board, the
-stripe across it, and `orbiter-rigcheck`.
+stripe across it, and `orbiter-rigcheck`. Forgotten, the button is not
+fatal: a new pair or sheet from enough data that sits farther from the
+server's than calibration noise allows — 1° or 5 mm for the pair, 1° or
+3 mm for the sheet — replaces it whatever the counts, since the geometry
+itself says the rig moved; the panel's cycle line says which and by how
+much.
 
 One switch — **calibrate continuously**, on by default — and the board does
 the rest. Move it about in front of the pair: hold it still in new places, at
@@ -405,6 +410,24 @@ Results reach the server through `POST /command/set_stereo_rig`, the same
 command the web tab uses, so the server remains the one owner of this state.
 
 ## Scanning
+
+**The pose a frame is placed through.** Every frame's points go into the
+board's frame through a board pose, and a pose comes from whichever corners
+the detector found: at the frame's edge, in a glint, behind the stripe, a
+few come and go from one frame to the next, and each change moves the pose
+by a fraction of a degree and a millimetre or two with the scanner standing
+perfectly still — every such frame lays the same surface down a little to
+one side, and a still scan grows a fuzz of ghosts. A hand does not move
+like that, so a frame is placed through the MEDIAN of the poses around it
+in time (`posesmooth`, a centred window of 7 frames): a lone jump is
+outvoted, noise averages down, a steady sweep passes through unchanged
+because the median of a straight run is its middle. Frames wait three
+frames — a tenth of a second — for their neighbours; a gap in time ends
+the window. Two poses are not placed at all: one from fewer than 12 board
+corners across both eyes, and one where the two eyes' own poses disagree by
+over 2° or 15 mm — the pair's geometry then describes another rig, and the
+SCAN panel says so rather than scattering points where that rig would put
+them.
 
 **The right eye in the depth.** The sheet fixes each point where the left
 ray meets it, across a baseline of only the laser's offset from the left

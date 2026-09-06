@@ -249,6 +249,9 @@ class ScanPanel(QFrame):
                              f"{f.pose_gap_mm:.1f} mm · {fit}")
             elif f.pose_source:
                 lines.append(f"pose    {f.pose_source} eye only")
+            if f.pose_smooth_mm == f.pose_smooth_mm:      # placed: not NaN
+                lines.append(f"placed  through the median pose of the frames around it, "
+                             f"{f.pose_smooth_mm:.2f} mm from its own")
             if f.sync_note:
                 lines.append(f"sync    {f.sync_note}")
             if f.veto_px == f.veto_px:            # not NaN

@@ -355,6 +355,43 @@ def test_a_worse_solve_is_kept_off_the_server(board) -> None:
     assert not any(line.startswith("K L") and "saved" in line for line in flow.scoreboard())
 
 
+def test_a_solve_of_another_rig_replaces_the_servers_whatever_the_counts(board) -> None:
+    """The stored pair is from many views — of a rig whose right camera
+    stood 40 mm elsewhere. Twelve pairs of this rig replace it; the same
+    twelve of a pair that agrees with the stored one are refused as thin."""
+    from orbiter_native.laserplane import LaserPlane
+
+    def rig():
+        flow = _flow(board)
+        flow.solvers = _fake_solvers()
+        flow.plane = _Plane()
+        for side in ("left", "right"):          # lenses the server holds well: not re-solved
+            flow.set_known_intrinsics(side, K, {"views": 100, "sigma_f": 0.5})
+        flow.set_stored("stereo", 68, 2.3)
+        flow.set_stored("plane", 21, 0.31)
+        return flow
+
+    moved = rig()
+    moved.set_stored_pair({"R": np.eye(3).tolist(), "T": [-144.0, 40.0, 0.0]})
+    moved.stored_plane = LaserPlane(np.array([0.0, 1.0, 0.0]), 84.0, 0.3, 1000, 21, WH)
+    _fill(moved, board, n_views=12)
+    moved.plane._frames = 8
+    payload = moved.finish(moved.run(moved.snapshot(100.0)), 100.0) or {}
+    assert "_extrinsics" in payload and "_laser_plane" in payload
+    assert moved.saved["stereo"].count == 12 and moved.saved["plane"].count == 8
+    assert "moved" in moved.last_note
+    assert np.allclose(moved.stored_pair[1], [-144.0, 0.0, 0.0])      # the server now holds this one
+
+    same = rig()
+    same.set_stored_pair({"R": np.eye(3).tolist(), "T": [-144.0, 0.0, 0.0]})
+    same.stored_plane = LaserPlane(np.array([0.0, 1.0, 0.0]), 74.0, 0.3, 1000, 21, WH)
+    _fill(same, board, n_views=12)
+    same.plane._frames = 8
+    payload = same.finish(same.run(same.snapshot(100.0)), 100.0) or {}
+    assert "_extrinsics" not in payload and "_laser_plane" not in payload
+    assert same.last_note is None and same.saved["stereo"].count == 68
+
+
 def test_better_judges_more_data_and_lower_residual() -> None:
     assert _better(10, 0.5, None)
     assert _better(10, 0.4, Saved.first(10, 0.5))         # lower residual

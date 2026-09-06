@@ -245,6 +245,10 @@ class ScanFrame:
     speed_mm_s: float = 0.0
     spin_deg_s: float = 0.0
     rs_note: str | None = None
+    #: How far the pose the points were finally placed through — the median
+    #: of the poses around this frame in time (`posesmooth`) — sat from the
+    #: frame's own, mm. NaN until the frame was placed.
+    pose_smooth_mm: float = float("nan")
 
     @property
     def n_kept(self) -> int:

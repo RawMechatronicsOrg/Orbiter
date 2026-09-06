@@ -115,6 +115,20 @@ CYCLE_MIN_S = 4.0
 #: more than this much worse, or a lower residual outright.
 WORSE_TOLERANCE = 1.15
 
+#: A new pair or sheet that differs from the server's by more than this is
+#: not a worse solve of the same rig, it is a solve of another rig — the
+#: cameras were re-aimed, the laser was moved — and it replaces the stored
+#: one whatever the counts, the way 'Rig moved' would have let it. The
+#: pair's residual accounts for ~0.3° / 2 mm at the working distance; a
+#: re-aim is degrees. Below `MOVED_MIN_*` of data the new solve is too thin
+#: to be believed over the old on its own word.
+PAIR_MOVED_DEG = 1.0
+PAIR_MOVED_MM = 5.0
+PLANE_MOVED_DEG = 1.0
+PLANE_MOVED_MM = 3.0
+MOVED_MIN_VIEWS = 10
+MOVED_MIN_FRAMES = 6
+
 SOLVES = ("intrinsics:left", "intrinsics:right", "stereo", "plane",
           "readout:left", "readout:right")
 
@@ -280,6 +294,11 @@ class CalibrationFlow:
         self.sigma_f: dict[str, float] = {}
         #: The plane the server holds, until a solve here is accepted.
         self.stored_plane: LaserPlane | None = None
+        #: The pair the server holds, (R, T), for the same comparison.
+        self.stored_pair: tuple[np.ndarray, np.ndarray] | None = None
+        #: What the last cycle had to say beyond its solves — a rig move
+        #: told by the geometry — for the panel; read once and cleared.
+        self.last_note: str | None = None
         #: The best sheet solved here, the counterpart of `known_k`.
         self.solved_plane: LaserPlane | None = None
         self.solvers = solvers or {
@@ -334,6 +353,12 @@ class CalibrationFlow:
     def set_stored(self, key: str, count: int, residual: float) -> None:
         """A stereo / plane / readout figure the server holds."""
         self.saved.setdefault(key, Saved.first(count, residual))
+
+    def set_stored_pair(self, raw: dict | None) -> None:
+        """The pair geometry the server holds, from its stored dict."""
+        if self.stored_pair is None and raw and "R" in raw and "T" in raw:
+            self.stored_pair = (np.asarray(raw["R"], float).reshape(3, 3),
+                                np.asarray(raw["T"], float).ravel())
 
     def clear(self) -> None:
         self.samples.clear()
@@ -870,9 +895,14 @@ class CalibrationFlow:
             if key in stale:
                 continue
             count, resid = _measure(key, res)
-            if not _better(count, resid, self.saved.get(key)):
-                continue
             was = self.saved.get(key)
+            moved = self._of_another_rig(key, res)
+            if moved:
+                # The stored figure describes another rig: no bar to clear.
+                self.last_note = moved
+                was = None
+            if not _better(count, resid, was):
+                continue
             self.saved[key] = (was.adopt(count, resid) if was is not None
                                else Saved.first(count, resid))
             kind, _, side = key.partition(":")
@@ -882,13 +912,40 @@ class CalibrationFlow:
                 payload.setdefault(side, {})["intrinsics"] = res.as_config()
                 self._retire_dependants(side)
             elif kind == "stereo":
+                self.stored_pair = (np.asarray(res.R, float), np.asarray(res.T, float).ravel())
                 payload["_extrinsics"] = res.as_config()
             elif kind == "plane":
                 self.solved_plane = res
+                self.stored_plane = res
                 payload["_laser_plane"] = res.as_config()
             elif kind == "readout":
                 payload.setdefault(side, {})["readout"] = res.as_config()
         return payload or None
+
+    def _of_another_rig(self, key: str, res) -> str | None:
+        """Why the server's solve for `key` is of another rig, told by the
+        geometry itself: a new pair or sheet from enough data that sits
+        farther from the stored one than calibration noise allows. None
+        when they agree, when nothing is stored, or when the new solve is
+        too thin to be believed over the old."""
+        if key == "stereo" and self.stored_pair is not None and res.n_views >= MOVED_MIN_VIEWS:
+            r0, t0 = self.stored_pair
+            cos = (np.trace(np.asarray(r0).T @ np.asarray(res.R, float)) - 1.0) / 2.0
+            ang = float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
+            dt = float(np.linalg.norm(np.asarray(res.T, float).ravel() - t0))
+            if ang > PAIR_MOVED_DEG or dt > PAIR_MOVED_MM:
+                return (f"the pair differs from the server's by {ang:.1f}° / {dt:.0f} mm: "
+                        "the rig moved — replacing it")
+        if key == "plane" and self.stored_plane is not None and res.n_frames >= MOVED_MIN_FRAMES:
+            n0 = np.asarray(self.stored_plane.normal, float)
+            n1 = np.asarray(res.normal, float)
+            cos = abs(float(n0 @ n1)) / max(np.linalg.norm(n0) * np.linalg.norm(n1), 1e-12)
+            ang = float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
+            dd = abs(float(res.d) - float(self.stored_plane.d))
+            if ang > PLANE_MOVED_DEG or dd > PLANE_MOVED_MM:
+                return (f"the sheet differs from the server's by {ang:.1f}° / {dd:.1f} mm: "
+                        "the laser moved — replacing it")
+        return None
 
     def _stale_dependants(self, out: Outcome) -> set[str]:
         """The cycle's solves that rest on intrinsics that will not be in force.
