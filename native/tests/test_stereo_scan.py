@@ -209,6 +209,20 @@ def test_scan_recovers_a_curve_on_the_plane() -> None:
     assert np.allclose(zb, 100.0 - 30.0 * np.sin(xb / 25.0), atol=0.5)
 
 
+def test_scan_points_remember_their_left_pixel() -> None:
+    """Each kept point knows the stripe pixel it came from — what its colour
+    is read beside — and the two stay aligned through every gate."""
+    rig, plane = _rig(), _plane()
+    truth = _curve(lambda x: 500.0 + 30.0 * np.sin(x / 25.0))
+    left = _pixels(KL, np.eye(3), np.zeros(3), truth)
+    right = _pixels(KR, R_TRUE, T_TRUE, truth)
+    out = scan_frame(rig, plane, left, right, BOARD2_R, BOARD2_T, WIDE)
+    assert out.pixels_left.shape == (out.n_kept, 2)
+    back = _project(KL, np.eye(3), np.zeros(3), out.points_camera)
+    assert np.abs(back - out.pixels_left).max() < 1e-3
+    assert out.colours is None                              # the worker fills these
+
+
 def test_scan_vetoes_what_the_right_eye_did_not_see() -> None:
     """A red wire in the left eye lands on the sheet somewhere — but not where
     the right eye saw stripe. And a flank hidden from the right eye yields

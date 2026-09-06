@@ -138,6 +138,12 @@ class ScanParams:
     #: Locate the stripe on each scanline by a Gaussian fit of its profile
     #: rather than the centroid — see `laser.stripe_centroids`.
     centroid_fit: bool = True
+    #: Where a point's colour is read: this many pixels to either side of
+    #: the stripe, across it, in the left eye. Under the stripe every
+    #: surface is laser-red; beside it, past the halo, it is itself. The
+    #: strobed off-frame (BACKLOG) would make this exact; until then 8 px
+    #: clears the 4-10 px stripes this rig produces with room to spare.
+    colour_offset_px: float = 8.0
     volume: ScanVolume = field(default_factory=ScanVolume)
 
 
@@ -152,6 +158,13 @@ class ScanFrame:
     #: The scanline each kept point came from — what lets consecutive
     #: still frames be averaged point by point.
     scanlines: np.ndarray = field(default_factory=lambda: np.empty(0, np.int64))
+    #: The left-eye pixel each kept point came from - the scanline and the
+    #: sub-pixel position across it - as (x, y) in the full frame. What the
+    #: colour is read beside.
+    pixels_left: np.ndarray = field(default_factory=lambda: np.empty((0, 2), np.float64))
+    #: RGB per kept point, uint8, read beside the stripe by the scan worker
+    #: - or None while no colour image came with the frame.
+    colours: np.ndarray | None = None
     #: Scanlines (columns or rows) holding any stripe in the left eye.
     n_scanlines: int = 0
     #: Which of the two `scanlines` counts along: columns when True, rows
@@ -337,6 +350,41 @@ def _not_a_jump(xyz_cam: np.ndarray, scan: np.ndarray, jump_mm: float) -> np.nda
     return keep
 
 
+def sample_beside(bgr: np.ndarray, pixels: np.ndarray, along_x: bool,
+                  offset_px: float, wh: tuple[int, int]) -> np.ndarray:
+    """The surface's colour at each stripe point, read BESIDE the stripe.
+
+    Under the stripe every surface is laser-red; a few pixels to either side,
+    across the stripe, it is its own colour. `pixels` are (N, 2) left-eye
+    positions in the full frame; `bgr` is the eye's colour image as
+    published - on the GPU path the half-size copy - so positions are scaled
+    to it. Both sides are read, five pixels along the stripe each, and the
+    median per channel is the answer: a glint a few pixels wide on one side
+    does not tint the point. Returns (N, 3) uint8 RGB.
+    """
+    n = len(pixels)
+    if not n:
+        return np.empty((0, 3), np.uint8)
+    h, w = bgr.shape[:2]
+    sx, sy = w / float(wh[0]), h / float(wh[1])
+    p = np.asarray(pixels, np.float64).reshape(-1, 2) * [sx, sy]
+    along = np.array([-2.0, -1.0, 0.0, 1.0, 2.0])[None, :]
+    if along_x:                                  # scanlines are columns: across is y
+        off = offset_px * sy
+        xs = p[:, 0:1] + along
+        X = np.concatenate([xs, xs], axis=1)
+        Y = np.concatenate([p[:, 1:2] - off + 0.0 * along, p[:, 1:2] + off + 0.0 * along], axis=1)
+    else:                                        # scanlines are rows: across is x
+        off = offset_px * sx
+        ys = p[:, 1:2] + along
+        X = np.concatenate([p[:, 0:1] - off + 0.0 * along, p[:, 0:1] + off + 0.0 * along], axis=1)
+        Y = np.concatenate([ys, ys], axis=1)
+    xi = np.clip(np.rint(X).astype(np.int64), 0, w - 1)
+    yi = np.clip(np.rint(Y).astype(np.int64), 0, h - 1)
+    med = np.median(bgr[yi, xi], axis=1)                       # (N, 3), BGR
+    return np.clip(np.rint(med), 0, 255).astype(np.uint8)[:, ::-1]
+
+
 def scan_frame(
     rig: StereoRig,
     plane: LaserPlane | None,
@@ -402,6 +450,7 @@ def scan_frame(
     finite = np.isfinite(xyz_cam).all(axis=1)
     xyz_cam, scan = xyz_cam[finite], scan[finite]
     rows = centroids[finite, 1] if len(centroids) else np.empty(0)
+    pix = centroids[finite] if len(centroids) else np.empty((0, 2))
 
     # The reach: the baseline is the one line both cameras share, and the
     # subject sits a known distance from it whatever the board does.
@@ -409,12 +458,12 @@ def scan_frame(
     reach = _reach_mm(xyz_cam, rig)
     in_range = (reach >= lo) & (reach <= hi)
     n_range = int((~in_range).sum())
-    xyz_cam, rows, scan = xyz_cam[in_range], rows[in_range], scan[in_range]
+    xyz_cam, rows, scan, pix = xyz_cam[in_range], rows[in_range], scan[in_range], pix[in_range]
 
     # No jumps along the stripe.
     smooth = _not_a_jump(xyz_cam, scan, params.jump_mm)
     n_jump = int((~smooth).sum())
-    xyz_cam, rows = xyz_cam[smooth], rows[smooth]
+    xyz_cam, rows, pix = xyz_cam[smooth], rows[smooth], pix[smooth]
 
     # Into the board's frame: the volume is defined relative to the board, so
     # it stays put when the board moves and "above" keeps meaning above it.
@@ -436,6 +485,7 @@ def scan_frame(
     return ScanFrame(
         points_board=xyz_board[inside],
         points_camera=xyz_cam[inside],
+        pixels_left=pix[inside],
         scanlines=scan[smooth][inside].astype(np.int64) if len(scan) else np.empty(0, np.int64),
         n_scanlines=n_lines,
         along_x=bool(left.along_x),
@@ -487,6 +537,12 @@ class PointCloud:
         self._sum = np.empty((0, 3), np.float64)
         self._count = np.empty(0, np.int64)
         self._mean = np.empty((0, 3), np.float64)
+        # Colour alongside, with a count of its own: a sweep that carried no
+        # colour image must not darken a voxel a coloured sweep lit.
+        self._csum = np.empty((0, 3), np.float64)
+        self._ccount = np.empty(0, np.int64)
+        self._rgb = np.empty((0, 3), np.uint8)
+        self._coloured = False
         self._n = 0
         self._lo = np.full(3, np.inf)
         self._hi = np.full(3, -np.inf)
@@ -506,15 +562,18 @@ class PointCloud:
         if need <= cap:
             return
         cap = max(need, 2 * cap, 4096)
-        for name in ("_sum", "_mean"):
-            grown = np.empty((cap, 3), np.float64)
+        for name, dtype in (("_sum", np.float64), ("_mean", np.float64),
+                            ("_csum", np.float64), ("_rgb", np.uint8)):
+            grown = np.zeros((cap, 3), dtype)
             grown[: self._n] = getattr(self, name)[: self._n]
             setattr(self, name, grown)
-        count = np.zeros(cap, np.int64)
-        count[: self._n] = self._count[: self._n]
-        self._count = count
+        for name in ("_count", "_ccount"):
+            count = np.zeros(cap, np.int64)
+            count[: self._n] = getattr(self, name)[: self._n]
+            setattr(self, name, count)
 
-    def add(self, pts: np.ndarray) -> None:
+    def add(self, pts: np.ndarray, rgb: np.ndarray | None = None) -> None:
+        """Merge points, and their (N, 3) uint8 colours when there are any."""
         if not len(pts):
             return
         pts = np.asarray(pts, np.float64).reshape(-1, 3)
@@ -539,16 +598,28 @@ class PointCloud:
             rows[fresh] = start + np.arange(n_new)
             self._sum[start: start + n_new] = 0.0
             self._count[start: start + n_new] = 0
+            self._csum[start: start + n_new] = 0.0
+            self._ccount[start: start + n_new] = 0
+            self._rgb[start: start + n_new] = 0
             self._n += n_new
         self._sum[rows] += sums
         self._count[rows] += counts
         self._mean[rows] = self._sum[rows] / self._count[rows, None]
+        if rgb is not None:
+            csums = np.zeros((len(uniq), 3))
+            np.add.at(csums, inverse, np.asarray(rgb, np.float64).reshape(-1, 3))
+            self._csum[rows] += csums
+            self._ccount[rows] += counts
+            self._rgb[rows] = np.clip(
+                np.rint(self._csum[rows] / self._ccount[rows, None]), 0, 255)
+            self._coloured = True
         np.minimum(self._lo, pts.min(axis=0), out=self._lo)
         np.maximum(self._hi, pts.max(axis=0), out=self._hi)
 
     def clear(self) -> None:
         self._index.clear()
         self._n = 0
+        self._coloured = False
         self._lo[:] = np.inf
         self._hi[:] = -np.inf
 
@@ -556,6 +627,18 @@ class PointCloud:
         """One point per voxel: the mean of what fell in it. A view — copy
         before keeping it across an `add`."""
         return self._mean[: self._n]
+
+    def colors(self) -> np.ndarray | None:
+        """RGB per voxel, uint8: the mean of what was read beside the stripe
+        - or None while no sweep carried colour. A view, like `points()`."""
+        return self._rgb[: self._n] if self._coloured else None
+
+    def snapshot(self, max_n: int) -> tuple[np.ndarray, np.ndarray | None]:
+        """`decimated`, with the matching colours (None without any)."""
+        pts = self.points()
+        stride = max(1, -(-len(pts) // max_n))
+        rgb = self.colors()
+        return pts[::stride].copy(), (None if rgb is None else rgb[::stride].copy())
 
     def bounds(self) -> tuple[np.ndarray, np.ndarray] | None:
         if not self._n:
@@ -578,13 +661,23 @@ class PointCloud:
         point count. Binary because an ASCII writer loops in Python: a million
         points took seconds, on the GUI thread, behind the Export button."""
         p = np.ascontiguousarray(self.points().astype("<f4"))
+        rgb = self.colors()
+        props = "property float x\nproperty float y\nproperty float z\n"
+        if rgb is None:
+            body = p.tobytes()
+        else:
+            # red/green/blue as uchar: what every viewer, and `read_ply`, expects.
+            props += "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+            rec = np.empty(len(p), dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+                                          ("red", "u1"), ("green", "u1"), ("blue", "u1")])
+            rec["x"], rec["y"], rec["z"] = p[:, 0], p[:, 1], p[:, 2]
+            rec["red"], rec["green"], rec["blue"] = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+            body = rec.tobytes()
         header = ("ply\nformat binary_little_endian 1.0\n"
-                  f"element vertex {len(p)}\n"
-                  "property float x\nproperty float y\nproperty float z\n"
-                  "end_header\n")
+                  f"element vertex {len(p)}\n" + props + "end_header\n")
         with open(path, "wb") as f:
             f.write(header.encode("ascii"))
-            f.write(p.tobytes())
+            f.write(body)
         return len(p)
 
 
@@ -671,9 +764,19 @@ class CloudOverlay:
 
     def __init__(self) -> None:
         self._pts = np.empty((0, 3), np.float64)
+        self._rgb: np.ndarray | None = None
 
-    def publish(self, pts: np.ndarray) -> None:
+    def publish(self, pts: np.ndarray, rgb: np.ndarray | None = None) -> None:
+        # Colours first, points second: a reader that saw the new points
+        # and the old colours would index past the end; the other way round
+        # it merely draws a stale colour for one frame.
+        self._rgb = rgb
         self._pts = pts
 
     def points(self) -> np.ndarray:
         return self._pts
+
+    def colors(self) -> np.ndarray | None:
+        """Matching (M, 3) uint8 colours, or None while the scan has none."""
+        rgb = self._rgb
+        return rgb if rgb is not None and len(rgb) == len(self._pts) else None

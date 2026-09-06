@@ -31,7 +31,15 @@ from .config import RigConfig
 from .laser import StripePixels
 from .laserplane import LaserPlane, from_config as plane_from_config
 from .rolling import Motion, Readout
-from .scan import CloudOverlay, PointCloud, ScanFrame, ScanParams, scan_frame, stripe_rows
+from .scan import (
+    CloudOverlay,
+    PointCloud,
+    ScanFrame,
+    ScanParams,
+    sample_beside,
+    scan_frame,
+    stripe_rows,
+)
 from .stereo import StereoRig, result_from_config
 from .worker import EyeResult, Latest
 
@@ -83,7 +91,7 @@ def _still(a: tuple[np.ndarray, np.ndarray], b: tuple[np.ndarray, np.ndarray]) -
     return float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0)))) <= STILL_DEG
 
 
-def average_still(frames: list[ScanFrame]) -> np.ndarray:
+def average_still(frames: list[ScanFrame]) -> tuple[np.ndarray, np.ndarray | None]:
     """One point per scanline from a batch of still frames: the per-axis
     TRIMMED mean of the frames' points on that scanline — the lowest and the
     highest dropped once there are four or more — kept when at least half
@@ -92,19 +100,29 @@ def average_still(frames: list[ScanFrame]) -> np.ndarray:
     8 mm toward it; as the extreme it is dropped instead, and the remaining
     three average with most of the mean's noise reduction (a median of five
     keeps only 70% of it). A scanline seen once in five is a flicker, not a
-    surface."""
+    surface.
+
+    Returns `(points, colours)`. The colours go through the same trimmed
+    mean, channel by channel, when every frame of the batch carried them;
+    a batch with a colourless frame in it gives None — half a colour is
+    worse than none.
+    """
+    coloured = all(f.colours is not None for f in frames)
     if len(frames) == 1:
-        return frames[0].points_board
+        return frames[0].points_board, (frames[0].colours if coloured else None)
     keys = np.concatenate([f.scanlines for f in frames])
     pts = np.concatenate([f.points_board for f in frames])
+    if coloured:
+        rgb = np.concatenate([f.colours for f in frames]).astype(np.float64)
+        pts = np.concatenate([pts, rgb], axis=1)
     if not len(keys):
-        return np.empty((0, 3))
+        return np.empty((0, 3)), (np.empty((0, 3), np.uint8) if coloured else None)
     order = np.argsort(keys, kind="stable")
     keys, pts = keys[order], pts[order]
     uniq, start, counts = np.unique(keys, return_index=True, return_counts=True)
     rank = np.arange(len(keys)) - np.repeat(start, counts)
     width = int(counts.max())
-    table = np.full((len(uniq), width, 3), np.nan)
+    table = np.full((len(uniq), width, pts.shape[1]), np.nan)
     table[np.repeat(np.arange(len(uniq)), counts), rank] = pts
     enough = counts >= -(-len(frames) // 2)
     table, counts = table[enough], counts[enough]
@@ -113,7 +131,10 @@ def average_still(frames: list[ScanFrame]) -> np.ndarray:
     trim = (counts >= 4)[:, None]
     keep = np.where(trim, (ranks >= 1) & (ranks <= counts[:, None] - 2), ranks < counts[:, None])
     weights = keep.astype(np.float64)[:, :, None]
-    return np.nansum(table * weights, axis=1) / weights.sum(axis=1)
+    out = np.nansum(table * weights, axis=1) / weights.sum(axis=1)
+    if not coloured:
+        return out, None
+    return out[:, :3], np.clip(np.rint(out[:, 3:]), 0, 255).astype(np.uint8)
 
 
 @dataclass
@@ -128,6 +149,11 @@ class ScanInput:
     #: Mean row of the corners the pose came from: the instant, within the
     #: frame's readout, that the pose holds for. NaN without a board.
     pose_row: float = float("nan")
+    #: The eye's colour image as it was published — on the GPU path the
+    #: half-size copy the view draws, 1.5 MB, and a reference to it, not a
+    #: copy — kept for the left eye only, so each kept point can be given
+    #: the colour beside its stripe pixel.
+    bgr: np.ndarray | None = None
 
 
 @dataclass
@@ -216,11 +242,11 @@ class ScanWorker:
                 spilled = self._take_batch()
         if self._merge(spilled):
             with self._cloud_lock:
-                snap = self.cloud.decimated(OVERLAY_MAX)
+                snap = self.cloud.snapshot(OVERLAY_MAX)
         if snap is not None:
             # The batch's points joined the cloud; the eyes and the panel
             # must see them even though no pair follows.
-            self.overlay.publish(snap)
+            self.overlay.publish(*snap)
             self._publish(None, None)
 
     def clear(self) -> None:
@@ -231,8 +257,8 @@ class ScanWorker:
             self._offered_left = 0
         with self._cloud_lock:
             self.cloud.clear()
-            snap = self.cloud.decimated(OVERLAY_MAX)
-        self.overlay.publish(snap)
+            snap = self.cloud.snapshot(OVERLAY_MAX)
+        self.overlay.publish(*snap)
         self._publish(None, None)
 
     def export(self, path: str) -> int:
@@ -251,7 +277,8 @@ class ScanWorker:
             row = float(np.asarray(board.corners).reshape(-1, 2)[:, 1].mean())
         item = ScanInput(res.capture_mono, res.stripe,
                          None if board is None else board.R,
-                         None if board is None else board.t, res.wh, pose_row=row)
+                         None if board is None else board.t, res.wh, pose_row=row,
+                         bgr=res.bgr if res.side == "left" else None)
         with self._lock:
             if not self._active:
                 return
@@ -346,6 +373,9 @@ class ScanWorker:
         self._prev_left = a
         frame = scan_frame(rig, plane, a.stripe, b.stripe, a.board_R, a.board_t, params,
                            motion=motion, rs_note=note)
+        if frame.n_kept and a.bgr is not None:
+            frame.colours = sample_beside(a.bgr, frame.pixels_left, frame.along_x,
+                                          params.colour_offset_px, a.wh)
         snap = None
         with self._lock:
             self._pairs += 1
@@ -354,9 +384,9 @@ class ScanWorker:
         # threads, and a voxel merge under it stalls both eyes every pair.
         if self._merge(spilled):
             with self._cloud_lock:
-                snap = self.cloud.decimated(OVERLAY_MAX)
+                snap = self.cloud.snapshot(OVERLAY_MAX)
         if snap is not None:
-            self.overlay.publish(snap)
+            self.overlay.publish(*snap)
         self._publish(frame, None)
 
     # ── still batches (under the lock) ────────────────────────────────────
@@ -396,11 +426,11 @@ class ScanWorker:
         offer lock."""
         if not frames:
             return False
-        pts = average_still(frames)
+        pts, rgb = average_still(frames)
         if not len(pts):
             return False
         with self._cloud_lock:
-            self.cloud.add(pts)
+            self.cloud.add(pts, rgb)
         return True
 
     def _motion(self, a: ScanInput, readout: Readout | None):

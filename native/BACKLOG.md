@@ -20,8 +20,10 @@ becomes 14 levels above zero instead of 14 above a background of 40; a blue
 battery, a red switch, a glint of the desk lamp all cancel; the threshold
 becomes a number about the laser, not about the bench. The calibration-mode
 line fits get the same stripe. And the off frame gives each scanned point its
-real colour — today points are laser-tinted, sampled under the laser (the old
-handheld pipeline had a laser-off frame for exactly this and lost it).
+real colour — today it is read beside the stripe (`scan.sample_beside`, 8 px
+across from it): the surface's own colour under room light, but not the pixel
+the point is on, and slightly warm next to the halo (the old handheld pipeline
+had a laser-off frame for exactly this and lost it).
 
 **Why it is weeks, not days.** Two things have to be true at once:
 

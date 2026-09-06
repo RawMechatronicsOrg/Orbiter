@@ -306,7 +306,8 @@ class MainWindow(QMainWindow):
             self.scan.on_status(status)
         # The same decimated snapshot the eyes draw; the view uploads it
         # only when the scan thread published a new one.
-        self.cloud.set_live_points(self.scanner.overlay.points(), len(self.scanner.cloud))
+        self.cloud.set_live_points(self.scanner.overlay.points(), len(self.scanner.cloud),
+                                   self.scanner.overlay.colors())
         rows = dict(self.scanner.stripe_rows)
         if rows != self._rows_pushed:
             for side, worker in self.workers.items():
