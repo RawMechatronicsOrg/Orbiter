@@ -35,6 +35,13 @@ behind it whose normal happens to face the lens is not (§2.6).
 view buckets bin the photographs that were *selected* — which is to say, the
 ones that were captured. A direction nobody ever photographed is not a failure
 of the clean pass, and the gate must not report it as one.
+
+**The sources COLMAP compares are ours; the list of images is not.**
+The last thing here rewrites the `patch-match.cfg` `image_undistorter`
+wrote. Its image lines are the authoritative record of what COLMAP
+registered, so they are kept exactly and only the source lines are
+replaced — with sources bucketed by angle, because the nearest view is
+the one baseline that cannot triangulate.
 """
 
 from __future__ import annotations
@@ -898,3 +905,302 @@ def observation_counts(
     generous enough (§7 assumption 2).
     """
     return {image_id: len(seen) for image_id, seen in points2d_per_image.items()}
+
+
+# ── the cfg the undistorter wrote, rewritten ─────────────────────────────
+
+
+#: The source line `image_undistorter` writes under every image it
+#: registered: `__auto__` plus `--num_patch_match_src_images`, whose default
+#: is 20. The rewrite never writes it — an image we have no geometry for keeps
+#: its own line, whatever number that line carries — it is here because it is
+#: the shape of the file, and what a caller comparing or logging one reads it
+#: as.
+AUTO_SOURCES = "__auto__, 20"
+
+#: A cfg line that is blank or starts with this is not a name and not a
+#: source list: COLMAP's own reader drops both before it pairs the rest. We
+#: pair around them and pass them through untouched.
+CFG_COMMENT = "#"
+
+
+@dataclass(frozen=True)
+class CfgParams:
+    """The angle buckets a reference image draws its sources from, and the
+    two numbers the depth-range fallback is decided by.
+
+    One dataclass for the reason `SelectParams` is one: a threshold cannot
+    then be passed to one place and not another, and `session.json` carries
+    the lot verbatim.
+    """
+
+    #: `(low, high, count)` per bucket, degrees, half-open `[low, high)` so a
+    #: candidate at exactly 15 degrees belongs to one bucket and not to two.
+    #: Sources are bucketed rather than sorted by proximity because
+    #: nearest-first composed with the 8 degree / 20 mm novelty gate produces
+    #: the *minimum* baseline every time — 20 mm at 300 mm is 3.8 degrees,
+    #: which gives a depth sigma around a millimetre, worse than the laser
+    #: cloud the dense pass exists to improve on.
+    buckets: tuple[tuple[float, float, int], ...] = (
+        (8.0, 15.0, 2), (15.0, 30.0, 3), (30.0, 45.0, 3))
+    #: No source closer in viewing direction than this, ever — including the
+    #: ones drawn in to fill a short bucket. It is the floor the buckets
+    #: start at, written down separately because the fill has to honour it
+    #: too, and it is what replaced the old `min_baseline_mm` knob.
+    min_angle_deg: float = 8.0
+    #: Seed points an image must observe for its own track-derived depth
+    #: range to mean anything.
+    min_observations: int = 50
+    #: The fraction of the selection that may be thinner than that before a
+    #: global range is passed instead. Strictly more than this, so one thin
+    #: image in ten is not an emergency.
+    thin_frac: float = 0.10
+    #: How far past the volume's own extent the fallback range is opened, as
+    #: a fraction of that extent. The poses are good to a millimetre and the
+    #: cylinder is already generous, but a range that clips the subject costs
+    #: the surface it clipped.
+    pad: float = 0.20
+
+    @property
+    def n_sources(self) -> int:
+        """Sources per reference image — the buckets' counts, added up. There
+        is no second knob for the total: it is what the buckets ask for."""
+        return sum(int(count) for _, _, count in self.buckets)
+
+
+@dataclass(frozen=True)
+class CfgReport:
+    """The rewritten cfg, and what became of every name involved."""
+
+    #: The whole file, ready to write over `dense/stereo/patch-match.cfg`.
+    text: str
+    #: Images whose source line was replaced with a bucketed list.
+    rewritten: tuple[str, ...]
+    #: Registered images whose source line was left exactly as it was —
+    #: either the selection has no geometry for them, or it has no candidate
+    #: far enough away to offer. `__auto__` is a worse answer than ours and a
+    #: far better one than an empty line, which aborts the stage.
+    kept_auto: tuple[str, ...]
+    #: Selected images the undistorter never registered. They are dropped,
+    #: not added: naming a frame COLMAP did not register aborts
+    #: `patch_match_stereo` before it computes anything.
+    missing: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DepthRange:
+    """The global depth range to force on PatchMatch when the tracks are too
+    thin to give it a per-image one, and the sentence that says why."""
+
+    depth_min_mm: float
+    depth_max_mm: float
+    #: What the operator is told, naming the seed cap first — thin tracks
+    #: usually mean the cap is too low for this object rather than that the
+    #: range needs forcing.
+    warning: str
+
+
+def plan_patch_match_cfg(cfg_text: str, selection: Selection,
+                         params: CfgParams = CfgParams()) -> CfgReport:
+    """Rewrite the source lines of the cfg `image_undistorter` wrote, and say
+    what became of every name in it.
+
+    **The cfg comes from the undistorter, not from us.** Its image lines are
+    the authoritative list of frames COLMAP actually registered, and a frame
+    that failed to register, named here, aborts the whole
+    `patch_match_stereo` stage before it computes a single depth map. So
+    every image line is kept verbatim and in order, only source lines are
+    touched, and a selected photograph the undistorter did not register is
+    *dropped* — named in the report rather than written into the file.
+
+    An image the selection has no geometry for keeps its own source line,
+    which is `__auto__, 20`: we cannot rank sources for a photograph whose
+    pose we do not hold, and COLMAP's covisibility fallback is exactly what
+    that line asks for.
+
+    **Sources are bucketed by angle, not sorted by proximity.** Each
+    reference image takes `count` sources from each `(low, high, count)`
+    bucket of `params.buckets`, nearest first within a bucket; a bucket that
+    cannot be filled leaves its places to the nearest remaining candidates at
+    least `params.min_angle_deg` away, whatever bucket those came from.
+    Nearest-first alone would hand PatchMatch the smallest baseline available
+    every time, which is the one geometry that cannot triangulate.
+    """
+    lines = cfg_text.splitlines()
+    pairs = _cfg_pairs(lines)
+    registered = [lines[name_at].strip() for name_at, _ in pairs]
+
+    by_name = {v.photo.name: v for v in selection.accepted}
+    dirs = {name: by_name[name].photo.direction
+            for name in registered if name in by_name}
+
+    replaced: dict[int, str] = {}
+    rewritten: list[str] = []
+    kept_auto: list[str] = []
+    for name_at, source_at in pairs:
+        name = lines[name_at].strip()
+        sources = (_sources_for(name, dirs, params)
+                   if source_at is not None and name in dirs else [])
+        (rewritten if sources else kept_auto).append(name)
+        if sources:
+            replaced[source_at] = ", ".join(sources)
+
+    out = [replaced.get(i, line) for i, line in enumerate(lines)]
+    known = set(registered)
+    return CfgReport(
+        text="".join(f"{line}\n" for line in out),
+        rewritten=tuple(rewritten),
+        kept_auto=tuple(kept_auto),
+        missing=tuple(v.photo.name for v in selection.accepted
+                      if v.photo.name not in known),
+    )
+
+
+def rewrite_patch_match_cfg(cfg_text: str, selection: Selection,
+                            params: CfgParams = CfgParams()) -> str:
+    """The rewritten `dense/stereo/patch-match.cfg` as text — what
+    `plan_patch_match_cfg` produces, for a caller that wants the file and
+    none of the bookkeeping."""
+    return plan_patch_match_cfg(cfg_text, selection, params).text
+
+
+def _cfg_pairs(lines: list[str]) -> list[tuple[int, int | None]]:
+    """`(image line, source line)` index pairs, skipping the blank and
+    comment lines COLMAP's own reader skips.
+
+    The last pair's source index is None when the file ends on a name, which
+    is the one way this format can be broken without looking broken. Such a
+    name keeps the nothing it has: this rewrites source lines, it does not
+    invent them, and a truncated cfg should fail COLMAP's own reader rather
+    than be quietly patched into something that runs.
+    """
+    pairs: list[tuple[int, int | None]] = []
+    name_at: int | None = None
+    for i, line in enumerate(lines):
+        text = line.strip()
+        if not text or text.startswith(CFG_COMMENT):
+            continue
+        if name_at is None:
+            name_at = i
+        else:
+            pairs.append((name_at, i))
+            name_at = None
+    if name_at is not None:
+        pairs.append((name_at, None))
+    return pairs
+
+
+def _sources_for(name: str, dirs: dict[str, np.ndarray],
+                 params: CfgParams) -> list[str]:
+    """This reference image's sources: the buckets in order, then whatever
+    places the short buckets left, given to the nearest remaining candidates.
+
+    Empty when nothing is far enough away to be a source at all, which is the
+    caller's signal to leave that image's own `__auto__` line alone.
+    """
+    d = dirs[name]
+    ranked = sorted((_view_angle_deg(d, other_d), other)
+                    for other, other_d in dirs.items() if other != name)
+
+    picked: list[str] = []
+    taken: set[str] = set()
+    for lo, hi, count in params.buckets:
+        wanted = int(count)
+        for deg, other in ranked:
+            if wanted <= 0:
+                break
+            if other in taken or not (lo <= deg < hi):
+                continue
+            picked.append(other)
+            taken.add(other)
+            wanted -= 1
+    for deg, other in ranked:
+        if len(picked) >= params.n_sources:
+            break
+        if other in taken or deg < params.min_angle_deg:
+            continue
+        picked.append(other)
+        taken.add(other)
+    return picked
+
+
+def _view_angle_deg(a: np.ndarray, b: np.ndarray) -> float:
+    """The angle between two viewing directions, degrees — the same number
+    the novelty rule compares against 8 degrees, and the axis the buckets are
+    laid out along."""
+    cos = float(np.clip(np.dot(np.asarray(a, float).ravel(),
+                               np.asarray(b, float).ravel()), -1.0, 1.0))
+    return float(np.degrees(np.arccos(cos)))
+
+
+def depth_range_fallback(selection: Selection, counts: dict[int, int],
+                         volume: ScanVolume,
+                         params: CfgParams = CfgParams()) -> DepthRange | None:
+    """The global `(depth_min, depth_max)` to force on PatchMatch, or None to
+    leave the ranges to the tracks — which is the default and the better
+    answer.
+
+    COLMAP derives each image's depth range from the 3D points that image
+    observes, one range per image, and no single global pair can beat that.
+    So this returns None unless the tracks are demonstrably too thin to do
+    the job: more than `params.thin_frac` of the selected images observing
+    fewer than `params.min_observations` seed points. An image the counts do
+    not mention observes none, which is as thin as it gets.
+
+    When it does fire, the range is the scan volume seen from the selection:
+    for every accepted photograph, how far along its optical axis the
+    cylinder starts and ends; the nearest start and the farthest end of all
+    of them, opened by `params.pad` at both ends. That is a bound rather than
+    a measurement, which is why the warning names the seed cap first.
+    """
+    accepted = selection.accepted
+    if not accepted:
+        return None
+    thin = sum(1 for v in accepted
+               if counts.get(v.image_id, 0) < params.min_observations)
+    frac = thin / len(accepted)
+    if frac <= params.thin_frac:
+        return None
+
+    near, far = float("inf"), float("-inf")
+    for v in accepted:
+        lo, hi = _volume_depths(volume, v.photo.centre_mm, v.photo.direction)
+        near, far = min(near, lo), max(far, hi)
+    span = far - near
+    # A depth range has to start in front of the camera: a photograph taken
+    # from inside the volume would otherwise ask PatchMatch for a negative
+    # near plane.
+    depth_min = max(near - params.pad * span, _MIN_DEPTH_MM)
+    depth_max = far + params.pad * span
+
+    warning = (
+        f"{frac:.0%} of the selected images ({thin} of {len(accepted)}) "
+        f"observe fewer than {params.min_observations} seed points — raising "
+        f"the {selection.params.seed_cap:,}-point seed cap is the first thing "
+        f"to try; passing an explicit depth range "
+        f"{depth_min:.0f}-{depth_max:.0f} mm is the fallback, and it is "
+        f"unverified that it overrides COLMAP's own per-image ranges")
+    return DepthRange(depth_min_mm=depth_min, depth_max_mm=depth_max,
+                      warning=warning)
+
+
+def _volume_depths(volume: ScanVolume, centre_mm: np.ndarray,
+                   direction: np.ndarray) -> tuple[float, float]:
+    """How far along one camera's optical axis the scan volume starts and
+    ends, millimetres.
+
+    Depth along the axis is linear in the point, so its extremes over the
+    cylinder sit on the rims: the farthest point is whichever end cap the
+    axis tilts towards, displaced by the full radius across the axis, and the
+    nearest is the other cap displaced the other way. Written out rather than
+    sampled, because a sample of a cylinder is a bound that is quietly too
+    tight.
+    """
+    d = np.asarray(direction, float).ravel()
+    d = d / max(float(np.linalg.norm(d)), 1e-12)
+    # How much of the disc's radius lies across the axis, and where the two
+    # end caps land along it.
+    lateral = float(volume.radius_mm) * float(np.hypot(d[0], d[1]))
+    caps = (d[2] * float(volume.floor_mm), d[2] * float(volume.height_mm))
+    base = -float(d @ np.asarray(centre_mm, float).ravel())
+    return base + min(caps) - lateral, base + max(caps) + lateral
