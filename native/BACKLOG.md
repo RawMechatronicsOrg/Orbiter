@@ -4,7 +4,56 @@ What is planned and why, in the order it is worth doing. Each entry says what
 it buys and what it costs, so a session can pick the next one without
 re-deriving the reasoning. Done work moves to the README's design notes.
 
+## Landed: the photogrammetry pass
+
+Photographs with board poses beside the scan, laser removal from them, and an
+offline COLMAP chain to a textured `model.glb`. The reasoning is in the
+README's design notes; how to run it is in
+[docs/PHOTOGRAMMETRY.md](docs/PHOTOGRAMMETRY.md). By story, so a later session
+can find the seam it wants:
+
+| Story | What landed |
+|---|---|
+| **A1** | the retained JPEG on `Frame`/`EyeResult` and `gpu.sharpness`, for **both** eyes |
+| **A2** | `photos.py` — session directory, `CapturePolicy`, the stripe sidecars, the manifest, the writer thread |
+| **A3** | `CapturePolicy` wired into `ScanWorker`: `arm_photos`, `set_photo_pass`, the 4-tuple smoother payload, the decision taken outside `_lock` |
+| **B1** | `ridge.py` — Steger response and sub-pixel centres, torch on CUDA with a numpy reference |
+| **B2** | `stripemask.py` — the mask and the inpaint |
+| **B3** | the stripe detector v2 behind `LaserParams.use_ridge`, held to the measured ship rule by `tests/test_ridge_bench.py` |
+| **C1** | `colmapio.py` — the text model incl. `rigs.txt`/`frames.txt`, and the binary reader |
+| **C2a** | `views.py` — selection, seed points, tracks, the texture set, the 24 × 3 direction buckets |
+| **C2b** | `views.py` — the angle-bucketed `patch-match.cfg` rewrite and the depth-range fallback |
+| **C3** | `scan.py` — PCA normals, PLY normals, `read_ply_full`, `merge_clouds` and `MergeParams` |
+| **D1a** | `recon.py` — the `Backend` protocol, the canonical thirteen steps, resume, the computed disk estimate, the M1 chain |
+| **D1b** | `recon.py` — `clean_images`, the dense block, the lazy GPU probe, the one-shot fallback with its workspace wipe, the merge driver |
+| **D2** | `reconcli.py` — `orbiter-recon`, `--check` and `[project.scripts]` |
+| **D3** | `native/docker/colmap-cuda128` — COLMAP 4.2.0 from source for `75;89;120` |
+| **E1** | the SCAN panel's PHOTOS group and RECONSTRUCT row |
+| **E2** | these docs |
+
+Two things only a live run can settle, and both are written down as such:
+whether COLMAP accepts our **two-rig** model (`validate_sparse` asks it in
+minutes, on Milestone 1), and whether the RTX 5060 Ti's driver JIT-compiles
+compute_90 PTX forward to sm_120 (the first minutes of the first dense
+`patch_match_stereo`).
+
 ## Laser strobing — background subtraction and true colour  ★ must
+
+**It is also the principled successor to the inpainting and the manual clean
+pass this repo now ships.** Today the laser stripe is kept out of the dense
+matcher and out of the texture atlas by three layers in priority order — a
+laser-off *clean pass* the operator makes by hand, `stripemask`'s inpaint over
+the laser photographs, and a fusion mask (`docs/PHOTOGRAMMETRY.md` §7). Each is
+a workaround for the same missing thing: a photograph of this subject, from this
+pose, with the laser off. Strobing produces exactly that, per frame and for
+free — the off frame is a clean photograph with a real pose beside it, so
+nothing has to be invented by an inpainter, nothing has to be masked out of
+fusion, and the operator does not have to flip a switch and turn the board a
+second time (which can nudge the subject, which is why every photograph carries
+a `pass_id` and why `write_sparse` scores each pass on silhouette agreement).
+It would also retire the clean-coverage gate — 12 photographs and 80 % of the
+buckets the selection covers — since every pose would have its clean photograph
+by construction.
 
 **What.** Toggle the laser per frame from the ESP32 (GPIO on the laser's
 TTL/enable), so the stream alternates laser-on and laser-off frames.
@@ -125,6 +174,74 @@ Persist the plane collector the way the sample set is persisted: the raw
 stripe pixels, corners, ids and `R_hint` per frame, keyed to the board spec.
 Then a restart can refit the sheet through whatever intrinsics are in force,
 which is what every cycle already tries to do.
+
+## After the photogrammetry pass
+
+Recorded while the chain was built. None of them blocks a run; each is named
+where the code already says it would be needed.
+
+**A one-rig, two-sensor COLMAP model.** We write **two** rigs — `1 1 CAMERA 1`
+and `2 1 CAMERA 2`, one frame per image — because a single-sensor rig needs no
+sensor pose and `RIG_FROM_WORLD` is then byte-for-byte the pose already in
+`images.txt`, which is what the golden test pins. That the topology is accepted
+at all is an assumption: the sibling converter
+(`Orbiter/software/tools/sfm_priors_to_colmap.py`) proves the *columns* but runs
+one camera on a motorised orbit. `validate_sparse` is the check and it answers in
+minutes. If it ever refuses, the fix is one rig carrying both cameras with the
+right sensor's fixed offset — a change to `colmapio.write_rigs`/`write_frames`
+alone, and nothing else in the chain moves. Worth doing on its own merits too:
+one rig is what actually describes this hardware.
+
+**Draw the textured mesh in the GL view.** `mesh/model.glb` is opened in an
+external viewer today; the Cloud panel's **Open PLY** covers `fused.ply` and
+`merged.ply` and stops there. `glview` already draws a cloud through a vertex
+shader with the eye's own pose and distortion, so a textured triangle mesh is a
+second draw path rather than a second viewer — but it needs index buffers, a
+texture upload and a normal, and the atlas is the deliverable, so it was cut
+from the pass rather than half-done.
+
+**Publish a session to the library service.** A finished session is already a
+self-describing directory — `session.json` with the rig, the units and every
+threshold; `photos.jsonl`; `laser.ply`; `mesh/model.glb` — which is most of what
+the sibling library service wants of a scan. What is missing is the upload and
+the mapping onto that service's own generation model. Until then a session is a
+folder on one machine and the app's **Open folder** button is the whole
+interface to it.
+
+**Prompt for the clean pass instead of documenting it.** The rule is currently
+in the guide: turn the board once with the laser on, then flip the switch, tick
+`photo pass (laser off)` and turn it again all the way round, because the gate
+is about *where* the clean photographs look — ≥ 80 % of the buckets the
+selection covers. The panel already knows the buckets the session has covered,
+so it could say which arc is still missing while the operator is still holding
+the board, rather than letting `write_sparse` say it an hour later with
+`texture_source=raw`. That is the cheapest fix available to the most common
+degraded outcome.
+
+**`--check` should fold `--max-image-size` into its estimate.**
+`reconcli.check` calls `_probe_disk(mode, session, recon.ReconParams()
+.max_image_size, …)` — always the default 1600, even when the same command line
+passed `--max-image-size 1000`. So a check that says a dense run does not fit
+can be answering about a run nobody asked for. The number is on the parsed
+arguments already; it just is not threaded through.
+
+**Session ids are not unique below one second.** `PhotoSession.session_id` is
+`started.strftime("%Y%m%d-%H%M%S")`, and `_make_dir` disambiguates a collision
+by suffixing the **directory** (`…-1`, up to 99) — but `session_id` itself is
+not updated, so two sessions started in the same second sit in different
+directories while `session.json` and every log line call them the same thing.
+Rare on a hand-driven rig and certain under a test that opens sessions in a
+loop. Either carry the suffix into `session_id` or give the id sub-second
+resolution.
+
+**One place builds the GPU listing command, not two.** The *rule* is already
+shared — `reconcli._probe_gpu` imports `recon.gpu_entries` and
+`recon.gpu_choice`, so `--check` names the card the run will pin. What is still
+written twice is the invocation: the check builds `docker run --rm --gpus all
+<image> nvidia-smi -L` as a literal argv, while `recon._resolve_gpus` goes
+through `DockerBackend` with `GpuSpec(uuid=ALL_DEVICES)`. Give the backend a
+listing entry point both call, or `--check` will quietly stop probing the same
+command the moment `DockerBackend.command` grows an env var or a mount.
 
 ## Small ones
 

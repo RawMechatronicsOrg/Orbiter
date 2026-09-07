@@ -199,6 +199,154 @@ barely moved (the corners must move ≥ 3 px over one readout). The figure is
 stored per eye with its frame size (`stereo_rig.<eye>.readout`), like the
 intrinsics, and refused at another size; the two eyes cross-check each other.
 
+### The photogrammetry pass
+
+How to run it, and what to turn when a step disappoints, is in
+[docs/PHOTOGRAMMETRY.md](docs/PHOTOGRAMMETRY.md) — in Russian, like the other
+two guides. What follows is why it is shaped this way.
+
+**The photograph is the camera's own JPEG, not a second request.** A retained
+`bytes(payload)` on the `Frame` (~26 µs, only while `keep_jpeg` is on) is the
+one option that gives the *same frame the pose was solved on*, at full
+resolution, in the mode we actually scan in — GPU, where `bgr` is half size or
+absent. camserver's `GET /snapshot/{cam}` would return a **different** frame,
+with no `X-Capture-Monotonic` to time it, over an HTTP round trip on the scan
+thread: the pose would be wrong by up to a frame of motion, silently.
+Re-encoding `rgb_gpu` costs a 6 MB device→host copy and ~10 ms on a detector
+thread, and spends a generation of JPEG for nothing. One generation is spent
+regardless — `image_undistorter` re-encodes every image it copies — which is
+why it is worth not spending the first.
+
+**One pose per photograph is a claim about rolling shutter, and the still gate
+is what licenses it.** These sensors expose row by row; COLMAP is handed a
+single pose and treats every row as if it held. The 0.5 mm / 0.1° gate over
+five poses is that assumption, not a blur heuristic — blur has its own gate,
+relative to the run's own median sharpness rather than an absolute number,
+because Laplacian variance is a fact about the subject's texture. `photos.py`
+imports nothing from `scanworker`: that would close an import cycle, and
+`scanworker._still` is pairwise over a batch rather than the window the policy
+wants, so the two stillness constants are duplicated with a comment instead.
+
+**The right photograph's pose is composed across the pair.** `PoseFix` is
+board→**left**, so writing one pose into both photographs of a pair is wrong by
+the baseline — 145 mm here — in a way COLMAP accepts without complaint. The left
+photograph keeps the smoothed pose; the right stores
+`stereo.compose_right_pose(R_s, t_s, rig.geom)` and `CAMERA_ID 2`. The manifest
+records which it is (`pose_composed`), and records each photograph's **own**
+`capture_mono` beside the pair's, because `_process` rewrites the aligned right
+input to the left's instant: up to `PAIR_WINDOW_S` (20 ms) of asymmetry, under
+0.02 mm at the still gate, accepted knowingly and written down so it can be
+audited rather than discovered.
+
+**The clean pass reuses the pose path with the stripe path switched off.** A
+photograph taken with the laser off still needs a board pose, so photo-pass mode
+runs the same pairing, `align_right`, steadiness and pose fusion and skips
+`scan_frame` alone — the switch is `ScanWorker._photo_pass`, not the absence of
+a stripe, which in production never happens. There is then no `ScanFrame`, so
+the smoother's payload carries `None` in its place and `_place`/`_bank` return
+early. A separate sink that paired frames itself would have forked the subtlest
+few hundred lines in the repo.
+
+**Masks, inpainting and a clean pass are three layers in priority order, not
+three options.** `stereo_fusion` honours `--StereoFusion.mask_path`;
+`patch_match_stereo` takes **no mask at all** and computes a depth map for every
+pixel, so by the time fusion has a say the stripe has already contaminated every
+NCC window it touched — masking is deleting the damage afterwards. So the stripe
+is painted out of the pixels PatchMatch reads, and the mask stays as the second
+line, because inpainting invents texture and invented texture matches
+spuriously just as happily as a stripe does. Best of all is a photograph with no
+stripe in it, which is why the clean pass exists and why it is worth an
+operator's extra rotation.
+
+**The texture workspace is the only lever `mesh_texturer` offers.** Its complete
+option set is `--workspace_path --input_path --output_path --output_type` plus
+nine `MeshTextureMapping.*` knobs — no image flag, no image list, and no
+per-image preference, so "prefer the clean photographs" is a sort order rather
+than an exclusion. The atlas is therefore controlled the only way it can be: a
+second workspace, `colmap/texture/`, undistorted from the same validated sparse
+model with `image_undistorter --image_list_path`. That flag is the single
+unverified thing the whole texture story rests on, so the step asserts it
+immediately — the workspace's file count against the list, and
+`read_images_bin` against the same names — and fails by name otherwise. It is
+also why the clean set is all-or-nothing: admitting the laser photographs whose
+buckets no clean one covers would fill exactly those holes, and then leak
+stripes onto vertices a clean photograph also sees.
+
+**`clean_images` writes a second directory rather than overwriting the first,
+and that is what makes a `--mode` switch decidable.** With one directory
+rewritten in place, one path meant different pixels in different modes: a
+resumed run that switched mode read whichever pixels the previous run happened
+to leave, and no step could tell by looking. `colmap/images/` is
+`write_sparse`'s, verbatim in both modes, never rewritten; `colmap/images_clean/`
+is `clean_images`', under the same names. The mode then shows up in the argv as
+`--image_path`, `clean_images` is idempotent because its input is a directory
+nothing else writes, and the invalidation rule is mechanical:
+`texture_workspace` is the first step whose *input directory* depends on the
+mode, so a mode change invalidates it and everything after it, in both
+directions, while `write_sparse` and `validate_sparse` survive.
+
+**The laser cloud is the sparse model, and the tracks are what PatchMatch
+actually reads.** COLMAP derives each image's `depth_min`/`depth_max` from the
+3D points that image observes, and `__auto__` resolves source images by shared
+observations — with no tracks, both are empty. So the confident cloud is
+voxel-subsampled to 30 000 points (unbounded, a million voxels at tens of tracks
+each is a multi-gigabyte ASCII file `image_undistorter` must parse and rewrite)
+and written with tracks into each photograph, `POINTS2D` generated from the same
+track list in the same pass so no dangling observation can exist. We pass no
+depth range by default: a global pair cannot beat COLMAP's per-image one, and
+the claim that an explicit range overrides it is an assumption rather than a
+read of 4.2.0's controller — the range goes in only when more than 10 % of the
+selection observes fewer than 50 points, and `session.json` records whether it
+took effect. The `patch-match.cfg` is likewise **rewritten from the cfg the
+undistorter wrote**, which is the authoritative list of registered images:
+naming one COLMAP did not register aborts the stage. Only source lines change,
+bucketed by angle — 2 from 8-15°, 3 from 15-30°, 3 from 30-45° — because
+nearest-first composed with the 8° / 20 mm novelty gate hands PatchMatch the
+minimum baseline every time, and 20 mm at 300 mm is 3.8°, a depth σ worse than
+the laser cloud the dense pass exists to improve on.
+
+**The merge, in three sentences.** A dense point is *supported* when at least
+five laser neighbours lie within 3.0 mm of it **laterally** — in the plane
+perpendicular to the local laser normal, whatever their offset along it — and a
+supported point is dropped, because the laser measured that surface better;
+unsupported points are kept only on the rim of a hole or in a coherent dense
+patch, and the disagreement is reported as a **signed** point-to-plane residual
+before either cloud is believed. The candidates come from a ball of
+`hypot(support_mm, max_normal_mm)` ≈ 10.44 mm rather than a Euclidean
+`support_mm` one, because lateral distance never exceeds Euclidean distance —
+a `support_mm` ball makes the lateral test a tautology, and the case that broke
+three earlier designs, a dense point 4 mm above fully covered laser surface,
+comes back with an **empty** ball and is kept as hole fill. The registration
+gate splits its residuals into z-slabs crossed with **normal-direction octants**
+because outward normals mean a translation reads +δ on one side of a closed
+object and −δ on the other: z bands alone average the two halves to zero and
+wave the misregistration through, while octants land them in different cells
+with opposite signs and fail both.
+
+**Two milestones, and the first one asks for no GPU.** Milestone 1 is the laser
+cloud meshed with Poisson and painted from the photographs — six steps, minutes,
+not one `--gpus` flag and no `nvidia-smi` probe anywhere in it, so a machine
+with a broken nvidia runtime completes it. It is also what proves the things
+only a real COLMAP can prove: that our hand-written text model loads,
+`rigs.txt`/`frames.txt` included, and that `--image_list_path` restricts.
+Milestone 2 adds the dense stage on top of that, and the GPU is requested by
+exactly one invocation in it — which is what keeps a CPU-only chain from dying
+at step 1 on a driver problem it never needed.
+
+**The module map.** `photos.py` — session directory, `CapturePolicy`, the
+manifest, the stripe sidecars, the writer thread and `bytes_on_disk`.
+`ridge.py` — Steger ridge response and sub-pixel centres, torch on CUDA with a
+numpy reference; **optional to everything else**, which is why the reference
+exists. `stripemask.py` — one photograph's stripe mask and its inpainted copy;
+decides, and lets `recon` write. `colmapio.py` — writes the text model
+(`cameras`/`images`/`points3D`/`rigs`/`frames`) and reads the **binary** model
+`image_undistorter` produces. `views.py` — view selection, the 24 × 3 direction
+buckets and the clean-coverage test, the per-photo tracks, the image lists, and
+the angle-bucketed cfg rewrite. `recon.py` — the `Backend` protocol
+(docker / local / fake), the canonical thirteen steps, the mode-aware resumable
+chain, the computed disk estimate, the lazy GPU probe and the merge driver.
+`reconcli.py` — `orbiter-recon`, its argument names and its three exit codes.
+
 ## Known limits
 
 What is planned, and why in that order, lives in [BACKLOG.md](BACKLOG.md).
@@ -806,6 +954,34 @@ they would with the laser switched off. `orbiter-rigcheck` exits non-zero when
 it finds something that stops a scan, so it is worth running after a
 calibration sweep and not only when something already looks wrong.
 
+## Reconstructing a session
+
+```bash
+native/.venv/Scripts/orbiter-recon --check --mode texture-only
+native/.venv/Scripts/orbiter-recon --session ~/.orbiter-native/sessions/20260907-051417 --mode texture-only
+```
+
+Takes a photo session — the photographs the SCAN panel's PHOTOS group wrote,
+with the board poses they were taken at — and runs COLMAP over it: the laser
+cloud as the sparse model, Poisson for the mesh, the photographs for the
+texture, and in `--mode dense` a PatchMatch stage merged into the laser surface
+where the laser saw nothing.
+
+`--check` asks every question a run depends on and prints one line each —
+Docker, the image, COLMAP's version, the nvidia runtime (dense only), the
+container's user, the bind mount, a local COLMAP, free disk — and starts
+nothing longer than a second. Like `orbiter-rigcheck` it is worth running
+first: every one of those failures otherwise looks identical from the app, a
+step exiting non-zero an unknown number of minutes in. The run half takes
+`--mode`, `--from/--to/--only`, `--restart`, `--force`, `--max-image-size`,
+`--dry-run` and `--list-steps`, and exits 0 when the chain finished, 1 when a
+step failed, 2 on a refusal an operator can act on before anything starts.
+
+Everything else — what is captured and why, the session layout, the clean pass,
+what each COLMAP step does and which knob to turn when it disappoints, how to
+read the merge statistics, and the two live-bench checklists — is in
+[docs/PHOTOGRAMMETRY.md](docs/PHOTOGRAMMETRY.md).
+
 ## Tests
 
 ```bash
@@ -818,3 +994,19 @@ line, redness vs bright neutral pixels, mask confinement, outlier rejection,
 determinism), the MJPEG demultiplexer across hostile chunk boundaries, and
 config parsing — including that phone intrinsics never stand in for an eye's
 own. The threads and widgets are checked by running the app.
+
+The photogrammetry pass is covered the same way, and by the same rule — a story
+is done when the **whole** suite is green, not only its own file:
+`test_photos.py`, `test_photo_capture.py` and `test_photo_gate.py` for the
+session, the capture policy and the sidecars; `test_colmapio.py` for the text
+model against golden bytes and the binary model against a golden struct;
+`test_views.py` and `test_patchmatch_cfg.py` for selection, buckets, tracks and
+the cfg rewrite; `test_stripemask.py`, `test_ridge.py`, `test_ridge_bench.py`
+and `test_ridge_toggle.py` for the mask, the ridge detector and the ship rule
+that decides its default; `test_merge.py` and `test_normals.py` for the merge
+rule and every gate; `test_recon.py`, `test_recon_dense.py` and
+`test_reconcli.py` for the chain through a fake backend — argv, step order,
+resume, the mode-switch invalidation, which invocations carry `--gpus`, the GPU
+fallback and its workspace wipe, the computed disk estimate; `test_reconpanel.py`
+for the two panel groups offline; and `test_dockerfile.py` for the sm_120 image,
+which is a text check needing no daemon. The GPU tests skip without CUDA.
