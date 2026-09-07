@@ -1,4 +1,5 @@
-"""Scan controls: switch scanning on, watch what it keeps and drops, export.
+"""Scan controls: switch scanning on, watch what it keeps and drops, export —
+and, below them, the photographs and the reconstruction they feed.
 
 The rejection counters are the useful part of this panel. A scan that produces
 nothing looks identical whether the board is out of view, the laser is off, the
@@ -7,7 +8,10 @@ and each of those calls for a different fix. So they are counted separately and
 shown while scanning, not summarised afterwards.
 
 The panel owns no data. The cloud lives in `ScanWorker`, on its own thread;
-this widget pushes settings down and shows the status that comes back up.
+this widget pushes settings down and shows the status that comes back up. The
+PHOTOS and RECONSTRUCT groups own even less: they emit what the operator asked
+for and let the window decide what that reaches, because "take photos" is three
+calls across three objects and only the window holds all three.
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ import logging
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
@@ -32,13 +37,51 @@ from .scanworker import ScanStatus, ScanWorker
 
 log = logging.getLogger("orbiter_native.scanpanel")
 
+#: Every group heading in this panel, so three of them cannot drift apart.
+_TITLE = "color:#7cc4ff; font-weight:600; letter-spacing:2px; font-size:12px;"
+#: The small monospace type the live numbers are shown in.
+_MONO = "color:#8b9aac; font-family:Consolas; font-size:11px;"
+
+#: The reconstruction modes, in the order the operator meets them: texture-only
+#: is minutes and needs no GPU, dense is hours and does.
+MODES = ("texture-only", "dense")
+
+
+def _size(n_bytes: int) -> str:
+    """Bytes as an operator reads them.
+
+    One scale would not do: a laser pass is tens of megabytes and a dense run
+    is tens of gigabytes, and this label is how the operator notices the
+    second one filling the disk.
+    """
+    n = float(max(int(n_bytes), 0))
+    if n < 1024.0:
+        return f"{n:.0f} B"
+    for unit in ("kB", "MB"):
+        n /= 1024.0
+        if n < 1024.0:
+            return f"{n:.1f} {unit}"
+    return f"{n / 1024.0:.1f} GB"
+
 
 class ScanPanel(QFrame):
-    """Toggle scanning, watch the counters, export the cloud."""
+    """Toggle scanning, watch the counters, export the cloud — and arm the
+    photographs and the reconstruction that turn it into a model."""
 
     #: Emitted when scanning is switched on or off, so the window can make sure
     #: the laser detector is running — scanning without it finds nothing.
     active_changed = Signal(bool)
+    #: The cloud was emptied. A session ends with the cloud it was taken
+    #: alongside, so the window opens the next one (§2.3 of the plan).
+    cloud_cleared = Signal()
+    #: The two PHOTOS switches. What each of them has to reach is the window's
+    #: business: "take photos" is three calls across three objects.
+    photos_toggled = Signal(bool)
+    photo_pass_toggled = Signal(bool)
+    #: The RECONSTRUCT row: the chosen mode, Abort, and Open folder.
+    reconstruct_requested = Signal(str)
+    abort_requested = Signal()
+    open_folder_requested = Signal()
 
     def __init__(self, scanner: ScanWorker, parent=None) -> None:
         super().__init__(parent)
@@ -46,14 +89,21 @@ class ScanPanel(QFrame):
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self._scanner = scanner
         self._status: ScanStatus | None = None
+        #: The session the window has open, which is not always the session
+        #: the last status belongs to: nothing pairs while the operator is
+        #: standing at the bench with scanning off, so a status can be older
+        #: than the session and must not have its counters read as this one's.
+        self._session_id = ""
+        #: While a reconstruction runs the one button is Abort, and the mode
+        #: it was started in is not up for changing.
+        self._reconstructing = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 8, 10, 10)
         root.setSpacing(6)
 
         title = QLabel("SCAN")
-        title.setStyleSheet(
-            "color:#7cc4ff; font-weight:600; letter-spacing:2px; font-size:12px;")
+        title.setStyleSheet(_TITLE)
         root.addWidget(title)
 
         self.active = QCheckBox("scanning")
@@ -173,17 +223,84 @@ class ScanPanel(QFrame):
 
         row = QHBoxLayout()
         self.btn_clear = QPushButton("Clear cloud")
-        self.btn_clear.clicked.connect(self._scanner.clear)
+        self.btn_clear.clicked.connect(self._clear)
         self.btn_export = QPushButton("Export PLY")
         self.btn_export.clicked.connect(self._export)
         row.addWidget(self.btn_clear)
         row.addWidget(self.btn_export)
         root.addLayout(row)
 
+        photos_title = QLabel("PHOTOS")
+        photos_title.setStyleSheet(_TITLE)
+        root.addWidget(photos_title)
+
+        self.photos = QCheckBox("take photos")
+        self.photos.setToolTip(
+            "Keep a photograph of the subject wherever the rig stands still "
+            "and looks somewhere it has not looked from before, with the board "
+            "pose it was taken at. These are what the reconstruction textures "
+            "the mesh from — the scan measures the shape, the photographs "
+            "carry the colour."
+        )
+        self.photos.toggled.connect(self.photos_toggled)
+        root.addWidget(self.photos)
+
+        self.photo_pass = QCheckBox("photo pass (laser off)")
+        self.photo_pass.setToolTip(
+            "Photograph without scanning: switch the laser off at the switch, "
+            "tick this, and turn the board once more. The stripe is what puts "
+            "red into the texture, so a pass without it is the cheapest way to "
+            "a clean atlas. Toggling starts a new pass — photographs taken "
+            "either side of that switch are not the same evidence."
+        )
+        self.photo_pass.toggled.connect(self.photo_pass_toggled)
+        root.addWidget(self.photo_pass)
+
+        self.photo_stats = QLabel("no session yet")
+        self.photo_stats.setWordWrap(True)
+        self.photo_stats.setStyleSheet(_MONO)
+        root.addWidget(self.photo_stats)
+
+        recon_title = QLabel("RECONSTRUCT")
+        recon_title.setStyleSheet(_TITLE)
+        root.addWidget(recon_title)
+
+        recon_row = QHBoxLayout()
+        self.mode = QComboBox()
+        self.mode.addItems(MODES)
+        self.mode.setToolTip(
+            "texture-only meshes the laser cloud and paints it with the "
+            "photographs: minutes, and no GPU is asked for. dense adds "
+            "COLMAP's own stereo to fill what the laser never saw: hours, and "
+            "tens of gigabytes."
+        )
+        recon_row.addWidget(self.mode)
+        self.btn_recon = QPushButton("Reconstruct")
+        self.btn_recon.setEnabled(False)
+        self.btn_recon.setToolTip(
+            "Export the cloud as laser.ply and run the chain over this "
+            "session. It runs on a thread of its own, so the eyes keep going; "
+            "recon.log in the session directory has every command and every "
+            "line of its output."
+        )
+        self.btn_recon.clicked.connect(self._reconstruct)
+        recon_row.addWidget(self.btn_recon)
+        self.btn_folder = QPushButton("Open folder")
+        self.btn_folder.setEnabled(False)
+        self.btn_folder.clicked.connect(self.open_folder_requested)
+        recon_row.addWidget(self.btn_folder)
+        root.addLayout(recon_row)
+
+        # One line, not a log viewer: the step, and the last thing it said.
+        # `recon.log` is authoritative for everything else.
+        self.recon_status = QLabel("")
+        self.recon_status.setWordWrap(True)
+        self.recon_status.setStyleSheet(_MONO)
+        root.addWidget(self.recon_status)
+
         self.stats = QLabel("idle")
         self.stats.setWordWrap(True)
-        self.stats.setStyleSheet(
-            "color:#8b9aac; font-family:Consolas; font-size:11px;")
+        self.stats.setStyleSheet(_MONO)
         self.stats.setAlignment(Qt.AlignmentFlag.AlignTop)
         root.addWidget(self.stats)
         root.addStretch(1)
@@ -217,6 +334,46 @@ class ScanPanel(QFrame):
     def on_status(self, status: ScanStatus) -> None:
         self._status = status
         self._refresh()
+        self._refresh_photos()
+
+    def set_session(self, session_id: str) -> None:
+        """The window opened a session, or closed one.
+
+        Only the identity: the counters and the size go on arriving with the
+        status, like everything else here. But they arrive with a PAIR, and
+        "Clear cloud" is pressed with the cameras idle — so without this the
+        group would name the previous session until scanning started again.
+        """
+        self._session_id = session_id
+        self._refresh_photos()
+
+    def _refresh_photos(self) -> None:
+        """The PHOTOS group: the session the window has open, and the counters
+        the scan worker last published for it.
+
+        The size comes with the status and is a counter the writer keeps, not
+        a directory walk: this runs on every tick, and walking a session that
+        a dense run has filled with depth maps would stall the GUI thread for
+        as long as the disk took.
+        """
+        if not self._session_id:
+            self.photo_stats.setText("no session yet")
+            self.btn_folder.setEnabled(False)
+            self.btn_recon.setEnabled(self._reconstructing)
+            return
+        st = self._status
+        if st is None or st.session_id != self._session_id:
+            # A status from the session before this one says nothing about it.
+            st = ScanStatus(0, None, 0, session_id=self._session_id)
+        self.photo_stats.setText(
+            f"session {st.session_id} · pass {st.pass_id} · {_size(st.session_bytes)}\n"
+            f"photos  L {st.photos_left} · R {st.photos_right} · "
+            f"dropped {st.photos_dropped}")
+        self.btn_folder.setEnabled(True)
+        # Nothing to reconstruct from until a photograph exists; while one is
+        # running the button is Abort, which is always live.
+        self.btn_recon.setEnabled(
+            self._reconstructing or bool(st.photos_left or st.photos_right))
 
     def _refresh(self) -> None:
         st = self._status
@@ -277,7 +434,39 @@ class ScanPanel(QFrame):
                              f"{f.speed_mm_s:.0f} mm/s {f.spin_deg_s:.0f}°/s")
         self.stats.setText("\n".join(lines))
 
+    # ── the reconstruction ────────────────────────────────────────────────
+
+    def set_reconstructing(self, on: bool) -> None:
+        """A run started or ended: the one button changes job."""
+        self._reconstructing = on
+        self.btn_recon.setText("Abort" if on else "Reconstruct")
+        self.mode.setEnabled(not on)
+        self._refresh_photos()
+
+    def set_recon_status(self, step: str, line: str) -> None:
+        """The one status line: which step is running, and the last thing the
+        chain said. Everything else is in `recon.log`."""
+        self.recon_status.setText(" · ".join(p for p in (step, line) if p))
+
+    def _reconstruct(self) -> None:
+        """One button, two jobs — the second only while the first is running,
+        so there is never a live Reconstruct beside a live Abort."""
+        if self._reconstructing:
+            self.abort_requested.emit()
+        else:
+            self.reconstruct_requested.emit(self.mode.currentText())
+
     # ── actions ───────────────────────────────────────────────────────────
+
+    def _clear(self) -> None:
+        """Empty the cloud, then say so.
+
+        The cloud goes first: `clear` flushes the frames still waiting for a
+        neighbour, and the photographs riding them belong to the session that
+        is ending, not to the one the window is about to open.
+        """
+        self._scanner.clear()
+        self.cloud_cleared.emit()
 
     def _export(self) -> None:
         if self._status is None or not self._status.n_points:

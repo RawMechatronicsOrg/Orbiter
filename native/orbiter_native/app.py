@@ -17,12 +17,16 @@ window fell further behind the cameras the longer it ran.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections import deque
 from pathlib import Path
+from typing import Any
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction
+import cv2
+import numpy as np
+from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
     QLabel,
@@ -36,15 +40,26 @@ from PySide6.QtWidgets import (
 
 import httpx
 
+from . import recon
 from .calibpanel import CalibrationPanel
 from .cloudview import CloudPanel
-from .config import ConfigClient, RigConfig
+from .config import ConfigClient, Eye, RigConfig
+from .cvcore import BoardSpec
 from .exposure import EXPOSURE_MIN, ExposureKeeper
 from .guide import Guide
 from .guidepanel import GuideBanner
 from .laser import LaserParams
 from .panel import EyePanel
+from .photos import (
+    BoardSnapshot,
+    EyeSnapshot,
+    Extrinsics,
+    PhotoSession,
+    PhotoWriter,
+    RigSnapshot,
+)
 from .posesmooth import median_pose
+from .scan import ScanVolume
 from .scanpanel import ScanPanel
 from .scanworker import POSE_RECENT_S, ScanWorker
 from .screens import adapter_of_window, same_gpu
@@ -63,6 +78,99 @@ _PAINT_MS = 33
 #: The guide's prompt is re-read this often: quick enough that "hold still"
 #: follows the hand, slow enough that the big type does not flicker.
 _GUIDE_MS = 250
+#: How often the recon thread's lines are drained into the panel's one status
+#: line. Faster than a person reads them; slower than any step takes.
+_RECON_MS = 250
+#: How long `closeEvent` waits for the recon thread once it has been asked to
+#: stop. It stops at its child's next line of output, and every step it did
+#: finish is in `recon-state.json`, so a run that outlasts this is resumed.
+_RECON_JOIN_S = 3.0
+
+
+def _f(value: Any, default: float = float("nan")) -> float:
+    """A number out of the server's JSON, or `default`. Missing and malformed
+    are the same thing here: a session records what it knows."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _aruco_dict_name(dict_id: int) -> str:
+    """OpenCV's `DICT_*` constant as its own name.
+
+    The manifest is read by people and by a converter, and neither wants to
+    look `DICT_5X5_100` up from `5`. The server stores only the int, so the
+    name is resolved here, against the OpenCV this rig actually runs.
+    """
+    names = sorted(name for name in dir(cv2.aruco)
+                   if name.startswith("DICT_") and getattr(cv2.aruco, name) == dict_id)
+    return names[0] if names else str(dict_id)
+
+
+def _board_snapshot(spec: BoardSpec | None) -> BoardSnapshot | None:
+    if spec is None:
+        return None
+    return BoardSnapshot(squares_x=int(spec.squares_x), squares_y=int(spec.squares_y),
+                         square_mm=float(spec.square_length_mm),
+                         marker_mm=float(spec.marker_length_mm),
+                         dictionary=_aruco_dict_name(int(spec.aruco_dict_id)))
+
+
+def _eye_snapshot(eye: Eye | None, live_wh: tuple[int, int] | None) -> EyeSnapshot | None:
+    """One eye as the session records it, or None when no camera is assigned.
+
+    The size is the intrinsics' own: a camera matrix is only valid at the
+    resolution it was solved at, and that is the resolution the photographs
+    have to be at for anybody to use them. The live frame size is the
+    fallback, so a session opened before the first solve still says which
+    camera took the pictures.
+    """
+    if eye is None or not eye.camera_id:
+        return None
+    k = eye.intrinsics_raw or {}
+    try:
+        solved_wh = (int(k["width"]), int(k["height"]))
+    except (KeyError, TypeError, ValueError):
+        solved_wh = live_wh or (0, 0)
+    return EyeSnapshot(
+        camera_id=eye.camera_id,
+        wh=solved_wh,
+        fx=_f(k.get("fx"), 0.0), fy=_f(k.get("fy"), 0.0),
+        cx=_f(k.get("cx"), 0.0), cy=_f(k.get("cy"), 0.0),
+        dist=tuple(_f(d, 0.0) for d in (k.get("dist") or ())),
+        rms_px=_f(k.get("rms_px")),
+    )
+
+
+def _extrinsics_snapshot(raw: dict[str, Any] | None) -> Extrinsics | None:
+    """The pair's geometry as stored, or None when it has not been solved."""
+    if not isinstance(raw, dict):
+        return None
+    try:
+        R = np.asarray(raw["R"], float).reshape(3, 3)
+        t_mm = np.asarray(raw["T"], float).ravel()
+    except (KeyError, TypeError, ValueError):
+        return None
+    return Extrinsics(R=R, t_mm=t_mm, rms_px=_f(raw.get("rms_px")))
+
+
+def rig_snapshot(cfg: RigConfig, volume: ScanVolume,
+                 live_wh: dict[str, tuple[int, int] | None]) -> RigSnapshot:
+    """The rig frozen at the instant a session opens: both eyes, the pair, the
+    board, and the volume being scanned inside.
+
+    Mapped here rather than in `photos.py` because this window is the only
+    thing that holds a `RigConfig`; the session module sits underneath the
+    config client in the import graph and takes the snapshot ready-made.
+    """
+    return RigSnapshot(
+        board=_board_snapshot(cfg.board),
+        volume=volume,
+        left=_eye_snapshot(cfg.left, live_wh.get("left")),
+        right=_eye_snapshot(cfg.right, live_wh.get("right")),
+        extrinsics=_extrinsics_snapshot(cfg.extrinsics_raw),
+    )
 
 
 class MainWindow(QMainWindow):
@@ -106,7 +214,30 @@ class MainWindow(QMainWindow):
 
         self.scan = ScanPanel(self.scanner)
         self.scan.active_changed.connect(self._on_scan_toggled)
+        self.scan.cloud_cleared.connect(self._new_session)
+        self.scan.photos_toggled.connect(self._on_photos_toggled)
+        self.scan.photo_pass_toggled.connect(self._on_photo_pass_toggled)
+        self.scan.reconstruct_requested.connect(self._reconstruct)
+        self.scan.abort_requested.connect(self._abort_recon)
+        self.scan.open_folder_requested.connect(self._open_session_folder)
         self.cloud = CloudPanel()
+
+        #: The photographs: where they go, and the thread that writes them.
+        #: Opened lazily — on "Clear cloud", or at the first scan or photo
+        #: after launch — because a session is a directory on the operator's
+        #: disk and an app that merely started has taken no photographs.
+        self._session: PhotoSession | None = None
+        self._writer: PhotoWriter | None = None
+        #: The reconstruction: the thread running the chain, the Event that
+        #: aborts it, and the lines it has produced since the timer last took
+        #: them. The list is appended to on the recon thread and swapped out
+        #: on the GUI thread, under `_recon_lock` and nothing else.
+        self._recon_thread: threading.Thread | None = None
+        self._recon_cancel = threading.Event()
+        self._recon_lock = threading.Lock()
+        self._recon_lines: list[str] = []
+        self._recon_step = ""
+        self._recon_last = ""
 
         # The guide: which stage, what to do, where to bring the board.
         self.guide = Guide()
@@ -185,6 +316,11 @@ class MainWindow(QMainWindow):
         self._exposure_timer = QTimer(self)
         self._exposure_timer.timeout.connect(self._exposure_tick)
         self._exposure_timer.start(1000)
+
+        # Runs only while a reconstruction does: there is nothing to drain
+        # otherwise, and an hour-long run is the only thing that produces lines.
+        self._recon_timer = QTimer(self)
+        self._recon_timer.timeout.connect(self._recon_tick)
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll_config)
@@ -336,6 +472,10 @@ class MainWindow(QMainWindow):
         """Scanning without the laser detector finds nothing, so turn it on."""
         if on and not self._laser.isChecked():
             self._laser.setChecked(True)      # this also pushes it to the workers
+        if on:
+            # A scan is one of the two things that opens a session: the cloud
+            # and the photographs of one run belong in one directory.
+            self._open_session()
         for w in self.workers.values():
             w.set_scan_mode(on)
         for panel in self.panels.values():
@@ -415,6 +555,171 @@ class MainWindow(QMainWindow):
     def _on_status(self, side: str, error: object) -> None:
         self._offline[side] = error if isinstance(error, str) else None
         self.panels[side].on_status(self._offline[side])
+
+    # ── photographs ───────────────────────────────────────────────────────
+
+    def _open_session(self) -> PhotoSession | None:
+        """The session photographs go into, opened on demand.
+
+        Refused without a config, with a message that says why: the rig
+        snapshot is what makes a session reconstructable, and one taken before
+        the server answered would carry no intrinsics, no pair and no board —
+        eighty photographs nobody can use, discovered an hour later.
+        """
+        if self._session is not None:
+            return self._session
+        cfg = self._config
+        if cfg is None:
+            self.statusBar().showMessage(
+                "no rig config yet — the server has not answered, so a session "
+                "would carry no intrinsics, no pair and no board. Photographs "
+                "stay off until it does.")
+            return None
+        session = PhotoSession(
+            rig=rig_snapshot(cfg, self.scan.params().volume, self._wh))
+        writer = PhotoWriter(session)
+        writer.start()
+        self.scanner.set_session(session, writer)
+        self._session, self._writer = session, writer
+        self.scan.set_session(session.session_id)
+        log.info("photo session %s in %s", session.session_id, session.path)
+        self.statusBar().showMessage(f"photo session {session.session_id} — {session.path}")
+        return session
+
+    def _close_session(self) -> None:
+        """Stop writing into the current session and forget it; the files stay.
+
+        The writer is drained rather than dropped: what is queued was earned
+        by the operator standing at the bench, and it is a fraction of a
+        second's work to finish it.
+        """
+        writer, self._writer = self._writer, None
+        self._session = None
+        self.scanner.set_session(None, None)
+        self.scan.set_session("")
+        if writer is not None:
+            writer.stop()
+
+    def _new_session(self) -> None:
+        """The cloud was cleared, so the run is over: the next photographs
+        belong to the next session, not to the cloud that has just gone."""
+        self._close_session()
+        self._open_session()
+
+    def _on_photos_toggled(self, on: bool) -> None:
+        """Three calls, not one — and missing any of them is silent.
+
+        The eye workers retain each frame's JPEG bytes and measure how sharp
+        it is; the scan worker builds candidates, asks the policy and enqueues
+        what it accepts. Without the first there are no bytes to write;
+        without the second nothing is ever decided. Either way the session
+        comes out empty, and nobody finds out until the pass is over.
+        """
+        if on and self._open_session() is None:
+            # Refused: put the switch back where it was, which comes through
+            # here again as False and disarms all three.
+            self.scan.photos.setChecked(False)
+            return
+        for w in self.workers.values():
+            w.set_photo_capture(on)
+        self.scanner.arm_photos(on)
+
+    def _on_photo_pass_toggled(self, on: bool) -> None:
+        """Photo-pass mode is the scan worker's alone: the eyes go on doing
+        exactly what "take photos" asked of them, and only the pairing changes."""
+        self.scanner.set_photo_pass(on)
+
+    # ── the reconstruction ────────────────────────────────────────────────
+
+    def _reconstruct(self, mode: str) -> None:
+        """Export the cloud the photographs were taken alongside, then run the
+        chain on a thread of its own.
+
+        `laser.ply` is written first, and from here: it comes out of the live
+        cloud, which only this process holds, and `write_sparse` — the chain's
+        very first step — reads it. The run itself never touches a widget; it
+        appends lines to a list a timer drains.
+        """
+        if self._recon_thread is not None:
+            return
+        session = self._session
+        if session is None:
+            self.statusBar().showMessage(
+                "no session yet — take some photographs before reconstructing")
+            return
+        try:
+            n = self.scanner.export(str(session.path / "laser.ply"))
+        except OSError as exc:
+            self.statusBar().showMessage(f"could not write laser.ply — {exc}")
+            return
+        self._recon_cancel = threading.Event()
+        self._recon_step, self._recon_last = "", f"laser.ply: {n} points"
+        with self._recon_lock:
+            self._recon_lines = []
+        cancel, path = self._recon_cancel, session.path
+
+        def work() -> None:
+            try:
+                recon.run(path, mode, on_line=self._recon_line, cancel=cancel)
+            except Exception as exc:                              # noqa: BLE001
+                # A refusal, a failed step and an abort all carry a full
+                # sentence; the log file has the rest. What must not happen is
+                # a thread that dies with the panel still saying "running".
+                log.exception("the reconstruction raised")
+                self._recon_line(f"{exc.__class__.__name__}: {exc}")
+
+        self._recon_thread = threading.Thread(target=work, name="recon", daemon=True)
+        self._recon_thread.start()
+        self.scan.set_reconstructing(True)
+        self.scan.set_recon_status(self._recon_step, self._recon_last)
+        self._recon_timer.start(_RECON_MS)
+
+    def _recon_line(self, line: str) -> None:
+        """The recon thread's one reach into this window: append, and return.
+
+        Accumulate-and-swap rather than `worker.Latest`, which overwrites —
+        right for a status object, wrong for a line stream, where it would
+        drop nearly every line between two ticks.
+        """
+        with self._recon_lock:
+            self._recon_lines.append(line)
+
+    def _recon_tick(self) -> None:
+        """Swap the accumulated lines out and show the last one, beside the
+        step that is running. `recon.log` keeps every one of them."""
+        with self._recon_lock:
+            lines, self._recon_lines = self._recon_lines, []
+        for line in lines:
+            name, _, rest = line.partition(": ")
+            if rest == "running" and name in recon.CANONICAL_STEPS:
+                self._recon_step = name
+        if lines:
+            self._recon_last = lines[-1]
+            self.scan.set_recon_status(self._recon_step, self._recon_last)
+        thread = self._recon_thread
+        if thread is not None and not thread.is_alive():
+            self._recon_thread = None
+            self._recon_timer.stop()
+            self.scan.set_reconstructing(False)
+            if self._session is not None:
+                # The run wrote gigabytes through paths the writer's byte
+                # counter never saw, so the size label is re-measured once —
+                # here, and not on any tick.
+                self._session.rewalk()
+
+    def _abort_recon(self) -> None:
+        """Abort is the cancel Event, and nothing else: the chain stops at its
+        child's next line of output and terminates it. Every step that did
+        finish stays recorded, so the next run resumes rather than starts
+        over."""
+        self._recon_cancel.set()
+        self.scan.set_recon_status(self._recon_step, "aborting")
+
+    def _open_session_folder(self) -> None:
+        session = self._session
+        if session is None:
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(session.path)))
 
     # ── the guide ─────────────────────────────────────────────────────────
 
@@ -532,9 +837,23 @@ class MainWindow(QMainWindow):
 
         Without this the reader threads keep a socket open and Qt tears down
         widgets underneath the timer still firing.
+
+        The reconstruction is asked to stop and waited on briefly rather than
+        abandoned: it holds a child process, and a container left running past
+        the window that started it is one nobody will think to kill. What it
+        finished is in `recon-state.json`, so the next run resumes.
         """
         self._paint_timer.stop()
         self._timer.stop()
+        self._recon_timer.stop()
+        self._recon_cancel.set()
+        thread, self._recon_thread = self._recon_thread, None
+        if thread is not None:
+            thread.join(_RECON_JOIN_S)
+            if thread.is_alive():
+                log.warning("the reconstruction did not stop within %.0f s; "
+                            "its state file records what finished", _RECON_JOIN_S)
+        self._close_session()
         for w in self.workers.values():
             w.stop()
         self.scanner.stop()
