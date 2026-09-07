@@ -38,7 +38,7 @@ import time
 
 import numpy as np
 
-from .laser import LaserParams, StripePixels
+from .laser import LaserParams, StripePixels, ridge_centres
 
 log = logging.getLogger("orbiter_native.gpu")
 
@@ -207,7 +207,12 @@ def stripe_pixels(rgb, p: LaserParams = LaserParams(),
     """`laser.find_stripe_pixels` on a GPU frame: every pixel scoring at least
     `redness_min`, with its score, in the same row-major order OpenCV's
     `findNonZero` yields. Only the pixel list comes back to the CPU. `rows`
-    limits the search to the band the sheet can appear in."""
+    limits the search to the band the sheet can appear in.
+
+    With `LaserParams.use_ridge` the score also feeds `ridge.response`, which
+    is why that runs here and not at the call site: the score is a float32
+    plane on the card, the ridge wants exactly that, and nothing but the
+    per-scanline crest ever has to be downloaded."""
     t0 = time.perf_counter()
     _, h, w = rgb.shape
     y0, y1 = (0, h) if rows is None else (max(0, int(rows[0])), min(h, int(rows[1])))
@@ -228,6 +233,7 @@ def stripe_pixels(rgb, p: LaserParams = LaserParams(),
     along_x = bool((x.max() - x.min()) >= (y.max() - y.min()))
     return StripePixels(x=x, y=y, w=weight.cpu().numpy(), r=red.cpu().numpy(), wh=(w, h),
                         along_x=along_x, reason=None,
+                        crest=ridge_centres(score, along_x, y0) if p.use_ridge else None,
                         ms=(time.perf_counter() - t0) * 1000.0)
 
 

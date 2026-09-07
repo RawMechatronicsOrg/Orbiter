@@ -37,6 +37,8 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
+from . import ridge
+
 
 @dataclass(frozen=True)
 class LaserParams:
@@ -58,6 +60,21 @@ class LaserParams:
     #: Side of the opening, at half resolution, that estimates each channel's
     #: background for `excess_redness`. Wider than the stripe ever is.
     background_px: int = 15
+    #: Take each scanline's centre from `ridge`'s crest rather than from
+    #: `stripe_centroids`. On because the benchmark says so, and the
+    #: benchmark is `tests/test_ridge_bench.py`: on the same synthetic
+    #: families the ridge is 3.6x better on a saturated core (0.012 px RMS
+    #: against 0.043), 2-3x better on the narrow unsaturated profiles the
+    #: repo already measured, and it finds every scanline of a stripe too
+    #: dim to clear `redness_min` at all, for 2.9 ms of GPU time per 1080p
+    #: frame.
+    #:
+    #: It is a toggle because that 2.9 ms is the GPU's. Where there is no
+    #: CUDA device the numpy reference runs instead, at about a tenth of a
+    #: second over a 240-row band and 0.7 s over a whole 1080p frame — so a
+    #: machine scanning on the CPU path wants this off, and gives up only
+    #: the saturated core by doing so.
+    use_ridge: bool = True
 
 
 @dataclass
@@ -228,6 +245,13 @@ class StripePixels:
     wh: tuple[int, int] = (0, 0)
     #: True when the stripe runs mostly along x (scanlines are columns).
     along_x: bool = True
+    #: `ridge.centres` over the score image this pixel list was thresholded
+    #: out of — `(scan, pos)`, the pair `stripe_centroids` returns first, in
+    #: whole-frame coordinates. Carried here because the score is the one
+    #: thing the detector has and throws away, and the ridge needs the
+    #: neighbourhood rather than the surviving pixels. None when
+    #: `LaserParams.use_ridge` did not ask for it.
+    crest: tuple[np.ndarray, np.ndarray] | None = None
     ms: float = 0.0
     reason: str | None = "no data"
 
@@ -295,7 +319,8 @@ def find_stripe_pixels(bgr: np.ndarray, p: LaserParams = LaserParams(),
     y0, y1 = (0, h) if rows is None else (max(0, int(rows[0])), min(h, int(rows[1])))
     if y1 <= y0:
         return done(StripePixels(wh=(w, h), reason="the sheet cannot appear in this frame"))
-    lit = _lit(stripe_score(bgr[y0:y1], p.background_px), p.redness_min, None)
+    score = stripe_score(bgr[y0:y1], p.background_px)
+    lit = _lit(score, p.redness_min, None)
     if lit is None:
         return done(StripePixels(wh=(w, h), reason="no stripe above the redness threshold"))
     lit, along_x = lit
@@ -304,7 +329,8 @@ def find_stripe_pixels(bgr: np.ndarray, p: LaserParams = LaserParams(),
                              y=(xy[:, 1] + y0).astype(np.int32),
                              w=lit[xy[:, 1], xy[:, 0]],
                              r=bgr[xy[:, 1] + y0, xy[:, 0], 2], wh=(w, h),
-                             along_x=along_x, reason=None))
+                             along_x=along_x, reason=None,
+                             crest=ridge_centres(score, along_x, y0) if p.use_ridge else None))
 
 
 #: A red value this high is the sensor's ceiling, as the JPEG hands it over.
@@ -450,6 +476,71 @@ def stripe_centroids(key: np.ndarray, across: np.ndarray, w: np.ndarray,
 
     scan = b_key[chosen].astype(np.float64)
     return scan, pos, int(len(lines)), n_split, n_rejected
+
+
+#: How far the ridge's crest may sit from the centroid it would replace
+#: before the two are judged to be looking at different things. Half the
+#: live stripe's FWHM, so the fraction of a pixel two honest estimators
+#: disagree by always passes — while a glint on the same scanline never
+#: does. That last case is the whole reason for the bound: the veto has
+#: already decided WHICH run on the scanline is the stripe, and the ridge,
+#: taking the strongest crest of the whole band, has not been told.
+RIDGE_AGREE_PX = 6.0
+
+
+def ridge_centres(score, along_x: bool,
+                  y0: int = 0) -> tuple[np.ndarray, np.ndarray] | None:
+    """`ridge`'s sub-pixel crest per scanline, in whole-frame coordinates.
+
+    `score` is the stripe score the detector has just computed over the band
+    starting at row `y0` — a numpy plane on the CPU path, a CUDA tensor on
+    the GPU one. `ridge.response` runs wherever its input already lives, so
+    the GPU path never brings the score down; only the handful of numbers
+    per scanline that `ridge.centres` yields comes back.
+
+    Returns `(scan, pos)` — `stripe_centroids`'s first two values — or None
+    when the band is thinner than the kernel mirrors into. `ridge.response`
+    refuses that by name and is right to, but the band is `scan.stripe_rows`'
+    answer rather than anything the operator chose, and a detector that threw
+    because the sheet's reach came out narrow in one frame would take the
+    scan down over a frame it could not have measured anyway.
+    """
+    radius = int(np.ceil(ridge.KERNEL_SIGMAS * ridge.SIGMA_PX))
+    if min(score.shape[-2:]) <= radius:
+        return None
+    scan, pos = ridge.centres(*ridge.response(score), "x" if along_x else "y")
+    # A row of the band is `y0` rows further down the frame, and which of
+    # the two returns carries a row depends on which way the stripe runs.
+    return (scan, pos + y0) if along_x else (scan + y0, pos)
+
+
+def prefer_ridge(scan: np.ndarray, pos: np.ndarray, pixels: StripePixels) -> np.ndarray:
+    """`pos` with the ridge's centre wherever the two estimators agree about
+    which feature they are looking at, and the centroid's everywhere else.
+
+    The ridge measures the crest's shape and the centroid measures the lit
+    pixels' balance, so on a core clipped at 255 — where there is a shape but
+    no balance left — the ridge is the better number, and on everything else
+    the benchmark says it is no worse. What it does NOT have is the veto's
+    knowledge: `ridge.centres` reports the strongest crest of the whole
+    scanline, while `scan_frame` has already picked out the one run the other
+    eye confirmed. Where those two are more than `RIDGE_AGREE_PX` apart they
+    are not two opinions about one stripe, they are two different features,
+    and the confirmed one wins.
+
+    Only the position moves. Which scanlines are live, how wide their runs
+    had to be, and every counter the caller reports stay exactly what the
+    thresholded pixels made them.
+    """
+    crest = pixels.crest
+    if crest is None or not len(scan) or not len(crest[0]):
+        return pos
+    c_scan, c_pos = crest
+    # Both are ascending in the scanline index and both hold it exactly (it
+    # is an integer in a float), so the lookup is an equality, not a search.
+    j = np.clip(np.searchsorted(c_scan, scan), 0, len(c_scan) - 1)
+    take = (c_scan[j] == scan) & (np.abs(c_pos[j] - pos) <= RIDGE_AGREE_PX)
+    return np.where(take, c_pos[j], pos)
 
 
 def _centroids(lit: np.ndarray, along_x: bool) -> np.ndarray:

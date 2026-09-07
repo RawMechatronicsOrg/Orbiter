@@ -74,7 +74,7 @@ import cv2
 import numpy as np
 from scipy.spatial import cKDTree
 
-from .laser import BLOB_GAP_PX, StripePixels, stripe_centroids
+from .laser import BLOB_GAP_PX, StripePixels, prefer_ridge, stripe_centroids
 from .laserplane import LaserPlane, rays
 from .rolling import Motion
 from .stereo import StereoRig
@@ -738,6 +738,11 @@ def scan_frame(
     scan, pos, n_live, n_split, n_blob = stripe_centroids(
         key[confirmed], across[confirmed], left.w[confirmed], params.blob_width_px,
         fit=params.centroid_fit)
+    # Where the detector was asked for the ridge (`LaserParams.use_ridge`),
+    # its crest is the better centre on a core clipped at 255 and no worse
+    # elsewhere. It moves the position only: which scanlines are live, and
+    # every count above and below, stay the confirmed pixels'.
+    pos = prefer_ridge(scan, pos, left)
     centroids = (np.stack([scan, pos], axis=1) if left.along_x
                  else np.stack([pos, scan], axis=1))
     n_unconfirmed = n_lines - n_live
