@@ -30,6 +30,14 @@ import numpy as np
 from .config import RigConfig
 from .laser import StripePixels
 from .laserplane import LaserPlane, from_config as plane_from_config
+from .photos import (
+    SHARPNESS_WINDOW,
+    SIDES,
+    EyePhoto,
+    PhotoCandidate,
+    PhotoSession,
+    PhotoWriter,
+)
 from .posesmooth import PoseSmoother
 from .rolling import Motion, Readout
 from .scan import (
@@ -44,7 +52,12 @@ from .scan import (
     stripe_rows,
     write_ply,
 )
-from .stereo import StereoRig, compose_left_pose, result_from_config
+from .stereo import (
+    StereoRig,
+    compose_left_pose,
+    compose_right_pose,
+    result_from_config,
+)
 from .timealign import align_right
 from .worker import EyeResult, Latest
 from .cvcore import build_board, estimate_pose, refine_pose_pair
@@ -110,6 +123,16 @@ MIN_POSE_CORNERS = 12
 #: period, so a set survives one.
 STEADY_FRAMES = 12
 MIN_STEADY_CORNERS = 12
+
+#: Smoothed board poses kept for the photo policy's stillness window. Longer
+#: than `photos.STILL_HISTORY` so a policy configured with a wider window
+#: still finds one, and short enough to stay a handful of frames of memory.
+PHOTO_POSES = 16
+#: A pause longer than this ends the stillness window rather than spanning it:
+#: nobody watched the rig across the gap, so the poses either side of it are
+#: not consecutive looks at a rig standing still. The smoother draws its own
+#: windows at the same number (`posesmooth.MAX_GAP_S`) and for the same reason.
+PHOTO_GAP_S = 0.5
 
 
 def _still(a: tuple[np.ndarray, np.ndarray], b: tuple[np.ndarray, np.ndarray]) -> bool:
@@ -276,6 +299,16 @@ class ScanStatus:
     n_confident: int = -1
     n_lonely: int = 0
     n_flicker: int = 0
+    #: Photographs written this session, per side, and how many the writer
+    #: threw away because the disk fell behind the cameras.
+    photos_left: int = 0
+    photos_right: int = 0
+    photos_dropped: int = 0
+    #: The session's directory name, the pass the operator is on, and what
+    #: the session occupies on disk — all empty or zero without a session.
+    session_id: str = ""
+    pass_id: int = 0
+    session_bytes: int = 0
 
 
 class ScanWorker:
@@ -325,6 +358,39 @@ class ScanWorker:
         #: Per eye, the corner ids of its last frames, for `_steady`.
         self._ids_seen: dict[str, deque] = {"left": deque(maxlen=STEADY_FRAMES),
                                             "right": deque(maxlen=STEADY_FRAMES)}
+
+        # ── photographs ──────────────────────────────────────────────────
+        # Guards the photo bookkeeping below, and nothing else. Deliberately
+        # not `_lock`: a decision walks every photograph already kept on a
+        # side, and `_lock` is the one both detector threads take on every
+        # result. This one is never held while `_lock` is — the decision
+        # happens after that block is left — so the two cannot deadlock.
+        self._photo_lock = threading.Lock()
+        self._session: PhotoSession | None = None
+        self._writer: PhotoWriter | None = None
+        #: The decision gate. Candidates are built, judged and enqueued only
+        #: while it is on, so an unarmed scan costs what it always did.
+        self._armed = False
+        #: Photo-pass mode: the laser is switched off, so a pair carries no
+        #: stripe and exists only to be photographed.
+        self._photo_pass = False
+        #: The rig the pending candidates were paired through. `_process` has
+        #: one to hand; `set_active` and `clear` flush candidates it built and
+        #: have none, and a right photograph's pose cannot be composed without
+        #: it. One reference, assigned whole, read by whoever flushes.
+        self._photo_rig: StereoRig | None = None
+        #: The smoothed board poses the recent candidates were judged
+        #: against, oldest first — what stillness is measured over.
+        self._pose_hist: deque[tuple[float, np.ndarray, np.ndarray]] = deque(
+            maxlen=PHOTO_POSES)
+        #: Per eye, the photographs already written as `(capture_mono, R, t)`
+        #: — one list answers both the minimum interval and the novelty test.
+        self._kept: dict[str, list[tuple[float, np.ndarray, np.ndarray]]] = {
+            side: [] for side in SIDES}
+        #: Per eye, the sharpness of the recent offers. The blur gate is
+        #: relative to the run's own scale, so the run has to keep one.
+        self._offers: dict[str, deque[float]] = {
+            side: deque(maxlen=SHARPNESS_WINDOW) for side in SIDES}
 
         self.cloud = PointCloud()
         self.overlay = CloudOverlay()
@@ -391,8 +457,50 @@ class ScanWorker:
         with self._lock:
             self._params = params
 
+    def set_session(self, session: PhotoSession | None,
+                    writer: PhotoWriter | None) -> None:
+        """The session photographs go into, and the thread that writes them.
+
+        The seam the window wires up: nothing here opens, starts or stops
+        either of them. A new session has photographed nothing yet, and the
+        poses and sharpnesses of the last one describe another run, so the
+        bookkeeping starts again with it.
+        """
+        with self._photo_lock:
+            self._session = session
+            self._writer = writer
+            self._pose_hist.clear()
+            for side in SIDES:
+                self._kept[side].clear()
+                self._offers[side].clear()
+
+    def arm_photos(self, on: bool) -> None:
+        """Build candidates, consult the policy and enqueue what it accepts —
+        or, off, do none of those three. This is the scan worker's own gate;
+        retaining the JPEG bytes it decides on is `EyeWorker`'s
+        `set_photo_capture`, which is a different switch on the same
+        checkbox."""
+        self._armed = bool(on)
+
+    def set_photo_pass(self, on: bool) -> None:
+        """Photo-pass mode: the laser has been switched off by hand, so pairs
+        carry no stripe and exist only to be photographed. Pairing runs on
+        this alone, with no scan underneath it, and every toggle starts a new
+        pass — photographs taken either side of that switch are not evidence
+        of the same configuration."""
+        with self._lock:
+            if bool(on) == self._photo_pass:
+                return
+            self._photo_pass = bool(on)
+        # Outside that lock on purpose: the session has a lock of its own,
+        # and `_lock` is the one both detector threads take.
+        session = self._session
+        if session is not None:
+            session.next_pass()
+
     def set_active(self, on: bool) -> None:
         snap = None
+        emitted: list[tuple] = []
         with self._lock:
             self._active = on
             spilled = []
@@ -405,14 +513,19 @@ class ScanWorker:
                     q.clear()
                 # Frames still waiting for neighbours are placed with what
                 # they have: the session is over, no neighbour is coming.
-                for (f, m, own_t), r_s, t_s in self._smooth.flush():
+                for item, r_s, t_s in self._smooth.flush():
+                    f, m, own_t, _cand = item
                     self._place(f, m, own_t, r_s, t_s, self._params)
                     spilled += self._bank(f, r_s, t_s)
+                    emitted.append((item, r_s, t_s))
                 spilled += self._take_batch()
                 # The next session starts its own batch: kept, this pose
                 # would be what the first frame of that session is judged
                 # still against.
                 self._batch_pose = None
+        # Collected under the lock, decided outside it — the rule every flush
+        # site here obeys.
+        self._photos(emitted, self._photo_rig)
         if self._merge(spilled):
             snap = self._snapshot(self._params)
         if snap is not None:
@@ -422,12 +535,20 @@ class ScanWorker:
             self._publish(None, None)
 
     def clear(self) -> None:
+        emitted: list[tuple] = []
         with self._lock:
             self._batch.clear()
             self._batch_pose = None
-            self._smooth.flush()
+            # The cloud is going, but the photographs are not: pending frames
+            # ride a photo candidate each, and flushing them into the bin
+            # would silently lose every photograph the operator had earned in
+            # the last tenth of a second. Their points are not placed — the
+            # cloud they would join is being emptied in the same call.
+            for item, r_s, t_s in self._smooth.flush():
+                emitted.append((item, r_s, t_s))
             self._pairs = 0
             self._offered_left = 0
+        self._photos(emitted, self._photo_rig)
         with self._cloud_lock:
             self.cloud.clear()
             self._clean = None
@@ -463,7 +584,10 @@ class ScanWorker:
                          ids=None if board is None else board.ids,
                          jpeg=res.jpeg, sharpness=res.sharpness)
         with self._lock:
-            if not self._active:
+            # A photo pass pairs the eyes with no scan underneath it: the
+            # laser is off, there is nothing to triangulate, and the pairs
+            # exist so the photographs can carry a pose.
+            if not (self._active or self._photo_pass):
                 return
             self._hist[res.side].append(item)
             if res.side == "left":
@@ -556,14 +680,20 @@ class ScanWorker:
 
     def _process(self, a: ScanInput, b: ScanInput, other: ScanInput | None,
                  cfg: RigConfig | None, params: ScanParams) -> None:
+        # Read once, at the top: both are toggled from the GUI thread, and one
+        # pair must be paired, posed and photographed in a single mode.
+        photo_pass, armed = self._photo_pass, self._armed
         rig, plane, readout, board = self._geometry(cfg, a.wh, b.wh)
         if rig is None:
             self._publish(None, "no pair calibration for this frame size — "
                                 "solve intrinsics and the stereo pair first")
             return
-        if a.stripe is None or b.stripe is None:
-            self._publish(None, "laser detector is off")
-            return
+        # The right eye's OWN instant and its own stripe, before the alignment
+        # below rewrites the one to the left's instant and moves the other to
+        # it. A right photograph is taken from its own place on the rig at its
+        # own moment, and the manifest records both (§2.4).
+        right_capture_mono = b.capture_mono
+        right_stripe = b.stripe
         # The right eye at the left's instant: corners and stripe interpolated
         # against the right frame on the far side, and the right's own pose
         # re-solved through the moved corners, so every comparison below —
@@ -599,37 +729,162 @@ class ScanWorker:
             self._publish(None, (f"{corners} board corners across both eyes: too few for a "
                                  f"steady pose, {MIN_POSE_CORNERS} needed"))
             return
+        # The stripe guard sits below the pose block on purpose: a photo pass
+        # has the laser switched off and wants the pose, not the stripe. In
+        # production it is unreachable either way — `worker.py:388-389` always
+        # constructs a `StripePixels` — so `_photo_pass`, and not the absence
+        # of a stripe, is what tells the two modes apart. It stays as the
+        # defensive no-op it has always been.
+        if not photo_pass and (a.stripe is None or b.stripe is None):
+            self._publish(None, "laser detector is off")
+            return
         motion, note = self._motion(a, fix, readout)
         self._prev = (fix, a.capture_mono, a.pose_row)
-        frame = scan_frame(rig, plane, a.stripe, b.stripe, fix.R, fix.t, params,
-                           motion=motion, rs_note=note)
-        frame.pose_source, frame.pose_rms_px = fix.source, fix.rms_px
-        frame.pose_gap_deg, frame.pose_gap_mm = fix.gap_deg, fix.gap_mm
-        frame.sync_gap_ms, frame.sync_note = aligned.gap_ms, aligned.note
-        if frame.n_kept and a.bgr is not None:
-            frame.colours = sample_beside(a.bgr, frame.pixels_left, frame.along_x,
-                                          params.colour_offset_px, a.wh)
+        # A photo pass scans nothing: no stripe means no `ScanFrame`, and
+        # building an empty one would bank empty frames and publish a scan
+        # that is not happening.
+        frame = None
+        if not photo_pass:
+            frame = scan_frame(rig, plane, a.stripe, b.stripe, fix.R, fix.t, params,
+                               motion=motion, rs_note=note)
+            frame.pose_source, frame.pose_rms_px = fix.source, fix.rms_px
+            frame.pose_gap_deg, frame.pose_gap_mm = fix.gap_deg, fix.gap_mm
+            frame.sync_gap_ms, frame.sync_note = aligned.gap_ms, aligned.note
+            if frame.n_kept and a.bgr is not None:
+                frame.colours = sample_beside(a.bgr, frame.pixels_left, frame.along_x,
+                                              params.colour_offset_px, a.wh)
+        # Everything about the photograph except its pose, which the smoother
+        # has not decided yet, and its kept points, which `_place` has not
+        # produced yet. Both are filled in below, after the lock.
+        cand = None
+        if armed:
+            cand = self._candidate(a, b, fix, corners, right_capture_mono,
+                                   b.stripe is not right_stripe, photo_pass)
+            # The flush sites have no rig of their own, and a candidate they
+            # hand over still needs one to carry its pose across the pair.
+            self._photo_rig = rig
         snap = None
         placed = None
+        emitted: list[tuple] = []
         with self._lock:
             self._pairs += 1
             # The frame waits for its neighbours in time; what comes back is
             # the frame from the middle of the window, with the median pose
             # of the window to place its points through.
             spilled = []
-            for (f, m, own_t), r_s, t_s in self._smooth.push(
-                    (frame, motion, np.asarray(fix.t, float).ravel()),
+            for item, r_s, t_s in self._smooth.push(
+                    (frame, motion, np.asarray(fix.t, float).ravel(), cand),
                     fix.R, fix.t, a.capture_mono):
+                f, m, own_t, _cand = item
                 self._place(f, m, own_t, r_s, t_s, params)
                 spilled += self._bank(f, r_s, t_s)
-                placed = f
+                if f is not None:
+                    placed = f
+                emitted.append((item, r_s, t_s))
         # Deliberately outside that lock: `offer` takes it on both detector
-        # threads, and a voxel merge under it stalls both eyes every pair.
+        # threads, and a voxel merge — or a photo decision, which walks every
+        # photograph already kept on a side — under it stalls both eyes every
+        # pair.
+        self._photos(emitted, rig)
         if self._merge(spilled):
             snap = self._snapshot(params)
         if snap is not None:
             self.overlay.publish(*snap)
         self._publish(placed if placed is not None else frame, None)
+
+    def _candidate(self, a: ScanInput, b: ScanInput, fix: PoseFix, corners: int,
+                   right_capture_mono: float, right_shifted: bool,
+                   photo_pass: bool) -> PhotoCandidate:
+        """This pair offered as a photograph.
+
+        Both eyes' bytes, because a right-eye photograph is a photograph in
+        its own right, taken from its own place on the rig; both eyes' own
+        capture instants, because pairing rewrote the right one to the left's
+        and the manifest has to be able to show the difference; and both
+        eyes' stripe pixels, because the laser is masked out offline, when
+        the frames themselves are long gone.
+        """
+        session = self._session
+        return PhotoCandidate(
+            left=EyePhoto(camera_id=self._camera_id("left"), jpeg=a.jpeg, wh=a.wh,
+                          capture_mono=a.capture_mono, sharpness=a.sharpness,
+                          stripe=a.stripe),
+            right=EyePhoto(camera_id=self._camera_id("right"), jpeg=b.jpeg, wh=b.wh,
+                           capture_mono=right_capture_mono, sharpness=b.sharpness,
+                           stripe=b.stripe, stripe_shifted=right_shifted),
+            pair_capture_mono=a.capture_mono,
+            pose_source=fix.source, pose_rms_px=fix.rms_px,
+            pose_gap_deg=fix.gap_deg, pose_gap_mm=fix.gap_mm,
+            pose_corners=corners,
+            pass_id=0 if session is None else session.pass_id,
+            # The laser is off for the length of a photo pass, which is the
+            # whole point of one — §2.7 groups the photographs by it.
+            laser_on=not photo_pass)
+
+    def _camera_id(self, side: str) -> str:
+        """What the session calls this eye, or "" before there is a session."""
+        session = self._session
+        eye = None if session is None else getattr(session.rig, side)
+        return "" if eye is None else eye.camera_id
+
+    def _photos(self, emitted: list[tuple], rig: StereoRig | None) -> None:
+        """Judge the emitted candidates, and hand what the policy accepts to
+        the writer.
+
+        Called from all three flush sites and, at every one of them, only
+        after `_lock` has been released. That is the whole point of the
+        method: a decision walks every photograph already kept on a side and
+        ends at the writer's queue, and `_lock` is the one both detector
+        threads take on every result — the same reason the voxel merge above
+        is outside it.
+
+        The poses arrive here rather than at the candidate because a
+        photograph is placed through the SMOOTHED pose, and the smoother only
+        decides a frame's pose once its neighbours in time have arrived. The
+        left photograph takes that pose as it is; the right one takes it
+        carried across the pair, because the two cameras stand 200 mm apart
+        and one pose written to both would be wrong by the baseline.
+        """
+        writer = self._writer
+        if writer is None or not emitted:
+            return
+        with self._photo_lock:
+            session = self._session
+            if session is None:
+                return
+            policy = session.policy
+            for (f, _motion, own_t, cand), r_s, t_s in emitted:
+                if cand is None:
+                    continue
+                R_s = np.asarray(r_s, float)
+                t_s = np.asarray(t_s, float).ravel()
+                cand.pose_smooth_mm = float(np.linalg.norm(
+                    t_s - np.asarray(own_t, float).ravel()))
+                # `_place` has run and cropped the frame to the scan volume,
+                # so these are the points that actually joined the cloud. A
+                # photo pass has no frame, and so no points at all.
+                cand.kept_xyz_board = (
+                    np.zeros((0, 3), np.float32) if f is None
+                    else np.asarray(f.points_board, np.float32).reshape(-1, 3))
+                cand.left.R, cand.left.t_mm = R_s, t_s
+                if rig is not None:
+                    cand.right.R, cand.right.t_mm = compose_right_pose(R_s, t_s, rig.geom)
+                if (self._pose_hist
+                        and cand.pair_capture_mono - self._pose_hist[-1][0] > PHOTO_GAP_S):
+                    self._pose_hist.clear()
+                self._pose_hist.append((cand.pair_capture_mono, R_s, t_s))
+                poses = list(self._pose_hist)
+                for side in SIDES:
+                    eye = cand.eye(side)
+                    if eye.jpeg is None or eye.R is None or eye.t_mm is None:
+                        continue
+                    if eye.sharpness == eye.sharpness:          # not NaN: disarmed
+                        self._offers[side].append(float(eye.sharpness))
+                    if policy.decide(cand, side, poses, self._kept[side],
+                                     self._offers[side]) is not None:
+                        continue
+                    writer.put_nowait(cand.record(side))
+                    self._kept[side].append((eye.capture_mono, eye.R, eye.t_mm))
 
     def _steady(self, side: str, x: ScanInput, k, board) -> ScanInput:
         """This eye's input with its pose re-solved through the corners it
@@ -655,12 +910,18 @@ class ScanWorker:
                        board_R=pose[0], board_t=pose[1])
 
     @staticmethod
-    def _place(frame: ScanFrame, motion: Motion | None, own_t: np.ndarray,
+    def _place(frame: ScanFrame | None, motion: Motion | None, own_t: np.ndarray,
                R: np.ndarray, t: np.ndarray, params: ScanParams) -> None:
         """Put a frame's points into the board frame through a pose other
         than its own — the smoothed one — and keep what the volume holds.
         The rolling-shutter twist, when the frame had one, is applied on
-        top of the new pose the same way it was on the old."""
+        top of the new pose the same way it was on the old.
+
+        A photo pass emits no frame: nothing was scanned, so there is nothing
+        to place, and the candidate riding the same payload is placed by
+        `_photos` instead."""
+        if frame is None:
+            return
         frame.pose_smooth_mm = float(np.linalg.norm(np.asarray(t, float).ravel() - own_t))
         if not frame.n_kept:
             return
@@ -681,14 +942,18 @@ class ScanWorker:
 
     # ── still batches (under the lock) ────────────────────────────────────
 
-    def _bank(self, frame: ScanFrame, R, t) -> list[ScanFrame]:
+    def _bank(self, frame: ScanFrame | None, R, t) -> list[ScanFrame]:
         """Sort a frame into the still batch. Returns whatever the batch gave
         up, for `_merge` to average and add.
 
         The merge is not done here on purpose: this runs under the lock the
         detector threads take to hand their results over, and a voxel merge
         under that lock stalls both eyes.
+
+        A photo pass banks nothing, because it scanned nothing.
         """
+        if frame is None:
+            return []
         pose = (np.asarray(R, float), np.asarray(t, float).ravel())
         # A scanline id counts along columns in one frame and along rows in
         # another — `along_x` is decided per frame — so a batch that spans a
@@ -784,6 +1049,11 @@ class ScanWorker:
         return self._geom
 
     def _publish(self, frame: ScanFrame | None, note: str | None) -> None:
+        # The session's counters are read outside both locks: the session has
+        # a lock of its own, and nesting it inside `_lock` would put the GUI's
+        # tick behind the two detector threads.
+        session, writer = self._session, self._writer
+        counts = {} if session is None else session.counts
         with self._cloud_lock:
             n, bounds = len(self.cloud), self.cloud.bounds()
             clean = self._clean[2] if self._clean is not None else None
@@ -793,4 +1063,11 @@ class ScanWorker:
             if self._params.clean and clean is not None:
                 st.n_confident = len(clean.points)
                 st.n_lonely, st.n_flicker = clean.n_lonely, clean.n_flicker
+        st.photos_left = counts.get("left", 0)
+        st.photos_right = counts.get("right", 0)
+        st.photos_dropped = 0 if writer is None else writer.dropped
+        if session is not None:
+            st.session_id = session.session_id
+            st.pass_id = session.pass_id
+            st.session_bytes = session.bytes_on_disk
         self.status.put(st)
