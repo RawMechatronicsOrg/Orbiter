@@ -34,14 +34,21 @@ the other one. `texture_workspace` is the first step whose input directory
 depends on the mode, so a mode change invalidates it and everything after it, in
 both directions, and says so by name.
 
-The steps of Milestone 2 — `clean_images`, the dense block and the merge — are
-named in `CANONICAL_STEPS` but are not registered here. `run(mode="dense")`
-refuses by name until they are, which is a plain sentence rather than a stub
-that would fail somewhere less legible.
+**The dense block takes one fallback, and it wipes before it retries.** The
+public COLMAP image carries no sm_120 kernels, so PatchMatch on an RTX 5060 Ti
+runs only if the driver compiles the compute_90 PTX forward. When it does not —
+or when the card runs out of memory — `colmap/dense/` is deleted whole and
+rebuilt at a smaller size on the other card, once. Deleted whole because
+`--max_image_size` belongs to `image_undistorter`: lowering it invalidates the
+masks (undistorted at the old `newK`), the cfg (the undistorter regenerates it)
+and every depth map the first attempt half-wrote, and PatchMatch skips images
+whose depth maps already exist. `clean_images`, `colmap/texture/` and `mesh/`
+sit outside the wipe — none of them has anything to do with the GPU.
 """
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import os
@@ -50,24 +57,40 @@ import shutil
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol, Sequence
 
 import numpy as np
 
-from . import colmapio
-from .colmapio import ImageRecord, read_images_bin
-from .scan import normals_pca, orient_normals, read_ply_full, write_ply
+from . import colmapio, stripemask
+from .colmapio import ImageRecord, read_images_bin, read_pinhole_bin
+from .laser import StripePixels
+from .scan import (
+    MergeParams,
+    MergeStats,
+    ScanVolume,
+    merge_clouds,
+    normals_pca,
+    orient_normals,
+    read_ply_full,
+    write_ply,
+)
+from .stripemask import MaskParams
 from .views import (
     MODES,
+    CfgParams,
+    DepthRange,
     PhotoMeta,
+    PhotoView,
     Selection,
     SelectParams,
     SessionInfo,
     buckets,
+    depth_range_fallback,
     load_session,
+    plan_patch_match_cfg,
     seed_points,
     select,
     texture_set,
@@ -182,6 +205,59 @@ COLMAP_LOCAL_ENV = "ORBITER_COLMAP"
 JIT_VOLUME_ENV = "ORBITER_COLMAP_JIT_VOLUME"
 DEFAULT_JIT_VOLUME = "orbiter-colmap-jit"
 JIT_CACHE_BYTES = 1 << 30
+
+#: Which card PatchMatch is to run on: a UUID, or a case-insensitive substring
+#: of the card's name. The default names the RTX 5060 Ti, which is the card
+#: this rig wants put to work; when nothing matches, the first card listed is
+#: used and the log says so.
+COLMAP_GPU_ENV = "ORBITER_COLMAP_GPU"
+DEFAULT_GPU_MATCH = "5060"
+#: The `GpuSpec.uuid` that means "every device". Only the listing probe uses
+#: it — `docker run --gpus all <image> nvidia-smi -L` is the call that
+#: enumerates the cards, and it is the same call `--check` makes. It carries no
+#: JIT cache: a listing compiles nothing.
+ALL_DEVICES = "all"
+#: One line of `nvidia-smi -L`: `GPU 0: NVIDIA GeForce RTX 5060 Ti (UUID: GPU-…)`.
+_GPU_LINE_RE = re.compile(
+    r"^\s*GPU\s+(\d+)\s*:\s*(.+?)\s*\(\s*UUID\s*:\s*(GPU-[0-9A-Fa-f-]+)\s*\)")
+
+#: What the GPU fallback lowers `--max_image_size` to: 1000 against 1600 is
+#: under 40 % of the pixels, which is what an exhausted card needs. A missing
+#: kernel does not care about the size — the smaller workspace is simply what
+#: the retry is cheapest at.
+FALLBACK_MAX_IMAGE_SIZE = 1000
+#: A missing sm_120 kernel, and an exhausted card. The `CUDA error` catch-all
+#: is deliberately NOT matched: it covers both, and retrying an out-of-memory
+#: failure unchanged is not a fallback. Anything matching neither is not
+#: retried at all.
+KERNEL_ERROR_RE = re.compile(r"no kernel image|invalid device function", re.I)
+OOM_RE = re.compile(r"out of memory", re.I)
+#: How many lines of a failing step are kept to decide the cause. PatchMatch
+#: prints a line per image for an hour; the diagnosis is always in the tail,
+#: and `recon.log` has the whole of it either way.
+FAILURE_TAIL_LINES = 500
+
+#: What the fallback clears from `recon-state.json` before it retries. Outside
+#: the set on purpose: `clean_images` (its output is device-independent and
+#: expensive to rebuild), `texture_workspace` (`colmap/texture/` has nothing to
+#: do with the GPU), `write_sparse` and `validate_sparse`.
+FALLBACK_CLEARS = ("image_undistorter", "undistort_masks",
+                   "write_patch_match_cfg", "patch_match_stereo",
+                   "stereo_fusion", "merge")
+#: ...and what it runs again, in this order, before the retry itself. The
+#: masks and the cfg are rebuilt because both are made of numbers the new
+#: `--max_image_size` changes.
+FALLBACK_RERUNS = ("image_undistorter", "undistort_masks",
+                   "write_patch_match_cfg")
+
+#: The laser silhouette in an undistorted image: every projected point becomes
+#: a disc this wide, the discs are closed into one region, and the region is
+#: grown once more before everything outside it is ignored. The close is what
+#: joins a decimated cloud's dots into a surface; the dilation is the slack for
+#: a pose good to a millimetre.
+SILHOUETTE_DISC_PX = 8
+SILHOUETTE_CLOSE_PX = 15
+SILHOUETTE_DILATE_PX = 10
 
 #: Where the session is mounted inside the container. Every path in every argv
 #: is written relative to this, by `container_path` and nothing else.
@@ -361,7 +437,12 @@ class DockerBackend:
         """The full command line, so the log and the tests see the same thing
         the shell would."""
         cmd = [self.docker, "run", "--rm", "-v", f"{self.mount}:{CONTAINER_ROOT}"]
-        if gpu is not None:
+        if gpu is not None and gpu.uuid == ALL_DEVICES:
+            # The listing probe, and nothing else: it asks for every card
+            # because its whole job is to find out what they are, and it
+            # mounts no JIT cache because it compiles nothing.
+            cmd += ["--gpus", "all"]
+        elif gpu is not None:
             cmd += ["--gpus", f"device={gpu.uuid}",
                     "-v", f"{gpu.volume()}:/jitcache",
                     "-e", "CUDA_CACHE_PATH=/jitcache",
@@ -678,6 +759,17 @@ class ReconParams:
 
     #: How the photographs are chosen, seeded and bucketed.
     select: SelectParams = SelectParams()
+    #: How the stripe is found and painted out. Milestone 2 only:
+    #: `clean_images` is the one step that reads it.
+    mask: MaskParams = MaskParams()
+    #: The angle buckets a reference image draws its PatchMatch sources from,
+    #: and the two numbers the depth-range fallback is decided by.
+    cfg: CfgParams = CfgParams()
+    #: The ten thresholds the laser/dense merge is decided by, written verbatim
+    #: into `session.json` so a run can be reproduced from it. A factory
+    #: because `MergeParams` is mutable and a shared default would be one
+    #: object across every run in a process.
+    merge: MergeParams = field(default_factory=MergeParams)
     #: The dense `image_undistorter`'s limit — the knob the GPU fallback lowers
     #: to 1000, and the one the disk estimate is computed at.
     max_image_size: int = 1600
@@ -759,6 +851,20 @@ class Run:
     degraded: list[str] = field(default_factory=list)
     #: `session.json`'s `reconstruct` block as it is being built.
     report: dict[str, Any] = field(default_factory=dict)
+
+    #: The model on disk, as the dense steps read it. Filled on first use and
+    #: kept, because four steps ask the same question of the same files.
+    dense_model: DenseModel | None = None
+    #: The `--max_image_size` the dense undistorter is running at. It starts at
+    #: `params.max_image_size` and the GPU fallback lowers it, once.
+    max_image_size: int = 0
+    #: The card PatchMatch ran on, once it is known.
+    gpu: GpuSpec | None = None
+    #: Whether the GPU fallback has been taken, and what made it necessary. It
+    #: is taken at most once: a second kernel error or a second exhausted card
+    #: aborts by name rather than looping on an hour-long step.
+    fell_back: bool = False
+    fallback_reason: str | None = None
 
     def path(self, *parts: str) -> Path:
         """A session-relative path on the host."""
@@ -1111,6 +1217,210 @@ def _validate_sparse(run: Run) -> None:
     run.path(out).unlink(missing_ok=True)
 
 
+# ── what the dense steps read back ───────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class DenseModel:
+    """The selection as `colmap/sparse/images.txt` records it, and how many
+    seed points each of its images observes.
+
+    The dense steps read this rather than whatever `Selection` `write_sparse`
+    happened to leave in memory, for one reason: `--from undistort_masks` on a
+    session whose `write_sparse` finished last week must see exactly the images
+    that went into the model. `images.txt` is the file COLMAP was handed, so it
+    is the authority on which photographs are in the reconstruction and under
+    which ids; `photos.jsonl` stays the authority on where each was taken from.
+    Reading both also makes the resumed path and the fresh path the same path,
+    which is the only way a resume is not a second-class citizen.
+    """
+
+    selection: Selection
+    #: `{image_id: seed points observed}` — what the depth-range fallback is
+    #: decided by, counted off the POINTS2D lines rather than recomputed.
+    observations: dict[int, int]
+
+
+def _dense_model(run: Run) -> DenseModel:
+    """The model on disk, read once per run."""
+    if run.dense_model is not None:
+        return run.dense_model
+
+    images_txt = run.path("colmap", "sparse", "images.txt")
+    if not images_txt.exists():
+        raise ReconRefused(
+            f"{images_txt} does not exist — write_sparse is the step that "
+            "writes the model every dense step reads. Run without --from, or "
+            "with --restart.")
+    session, photos = load_session(run.session_dir)
+    by_name = {photo.name: photo for photo in photos}
+
+    views: list[PhotoView] = []
+    observations: dict[int, int] = {}
+    for image_id, name, n_observed in _read_images_txt(images_txt):
+        photo = by_name.get(name)
+        if photo is None:
+            raise ReconRefused(
+                f"colmap/sparse/images.txt names {name}, which photos.jsonl "
+                "does not — the model and the manifest describe different "
+                "sessions. Re-run with --restart.")
+        views.append(PhotoView(photo=photo, image_id=image_id))
+        observations[image_id] = n_observed
+
+    model = DenseModel(
+        selection=Selection(session=session, params=run.params.select,
+                            views=views, accepted=list(views)),
+        observations=observations)
+    run.dense_model = model
+    if run.session is None:
+        run.session, run.photos = session, photos
+    return model
+
+
+def _read_images_txt(path: Path) -> list[tuple[int, str, int]]:
+    """`(image_id, name, observations)` per image of an `images.txt`, in file
+    order.
+
+    Two lines per image, and the second one is counted rather than parsed: it
+    is `POINTS2D[] as (X, Y, POINT3D_ID)`, so a third of its fields is the
+    number of seed points this image observes. It is also **empty** for an
+    image that observes none, which is why the pairing toggles on position and
+    never skips a blank line while a POINTS2D line is expected — skipping one
+    would pair every later image with the wrong list.
+    """
+    rows: list[tuple[int, str, int]] = []
+    pending: tuple[int, str] | None = None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if pending is None:
+            text = line.strip()
+            if not text or text.startswith("#"):
+                continue
+            parts = text.split()
+            pending = (int(parts[0]), parts[-1])
+        else:
+            rows.append((pending[0], pending[1], len(line.split()) // 3))
+            pending = None
+    if pending is not None:
+        raise ReconRefused(
+            f"{path} ends after {pending[1]}'s pose line with no POINTS2D line "
+            "— the model was truncated. Re-run with --restart.")
+    return rows
+
+
+def _eye_matrix(eye: Any) -> np.ndarray:
+    """One eye's camera matrix in the raw sensor frame, as OpenCV wants it."""
+    return np.array([[eye.fx, 0.0, eye.cx],
+                     [0.0, eye.fy, eye.cy],
+                     [0.0, 0.0, 1.0]], float)
+
+
+def _odd(px: int) -> int:
+    """The nearest odd side at or below `px`, so a structuring element grows a
+    region by the same amount in every direction."""
+    return 2 * (int(px) // 2) + 1
+
+
+# ── (3) clean_images ─────────────────────────────────────────────────────
+
+
+@_step("clean_images")
+def _clean_images(run: Run) -> None:
+    """Paint the laser stripe out of the photographs the dense stage reads, and
+    cache the mask that says where it was.
+
+    This step is Fork D's whole point, and its position in the chain is half of
+    it: it sits between `validate_sparse` and `texture_workspace`, so **both**
+    dense consumers — the texture workspace and the dense undistorter — read
+    inpainted pixels. Revision 3 built these images inside `undistort_masks`,
+    after the undistorter had already run, so PatchMatch matched against raw
+    stripes while `session.json` claimed otherwise.
+
+    **It never writes to `colmap/images/`.** That directory is `write_sparse`'s,
+    it is verbatim in both modes, and it is what makes this step re-runnable and
+    a `--mode` switch decidable by looking at an argv. Every selected
+    photograph ends up in `colmap/images_clean/` under exactly the same NAME —
+    the laser ones inpainted at JPEG q95, the clean-pass ones copied across
+    unchanged — so `--image_path` can point at that one directory.
+
+    The archive copy in `clean/` is the lossless one, and it is the only place
+    the inpainted pixels exist without a second generation of JPEG on them: it
+    is what an operator opens to judge whether the inpaint did something
+    sensible. The file COLMAP reads is a JPEG because `image_undistorter`
+    re-encodes every image it copies, so a lossless intermediate never survives
+    into `dense/images` anyway.
+    """
+    model = _dense_model(run)
+    session = model.selection.session
+    inpainted = copied = no_sidecar = 0
+
+    for view in model.selection.accepted:
+        photo = view.photo
+        source = run.path("colmap", "images", photo.name)
+        target = run.path("colmap", "images_clean", photo.name)
+        if not source.exists():
+            raise StepFailed(
+                f"clean_images: {source} is missing — write_sparse writes one "
+                "verbatim copy per selected photograph, and this step reads "
+                "them. Re-run with --from write_sparse.")
+        if not photo.laser_on:
+            # A clean-pass photograph has no stripe to remove and its pixels
+            # are the ones the atlas wants, so it crosses over byte for byte.
+            shutil.copyfile(source, target)
+            copied += 1
+            continue
+
+        stripe, kept_xyz = _sidecar(run, photo)
+        if stripe is None:
+            no_sidecar += 1
+        eye = session.eye(photo.side)
+        projected = None
+        if eye is not None and len(kept_xyz):
+            projected = stripemask.project_points(
+                kept_xyz, photo.R, photo.t_mm, _eye_matrix(eye),
+                np.asarray(eye.dist, float))
+        mask, clean = stripemask.build(source.read_bytes(), stripe, projected,
+                                       run.params.mask)
+        stripemask.write_mask(
+            run.path("colmap", "_masks_raw", f"{photo.name}.png"), mask)
+        stripemask.write_clean(
+            run.path("clean", f"{Path(photo.name).stem}.png"), clean)
+        target.write_bytes(stripemask.encode_jpeg(clean))
+        inpainted += 1
+
+    run.log.line(f"clean_images: {inpainted} photographs inpainted, {copied} "
+                 f"copied verbatim from the clean pass, {len(model.selection.accepted)} "
+                 "in colmap/images_clean/")
+    if no_sidecar:
+        run.warn(
+            f"clean_images: {no_sidecar} laser photographs had no "
+            "stripe/*.npz beside them, so their masks were built from the "
+            "pixels alone — the detected stripe and the frame's own kept "
+            "points could not be used. The session was written by an older "
+            "app, or the sidecars were deleted.")
+
+
+def _sidecar(run: Run, photo: PhotoMeta) -> tuple[StripePixels | None, np.ndarray]:
+    """One photograph's `stripe/<side>_<n>.npz`: the pixels that eye called
+    stripe, and the frame's kept points in the board frame.
+
+    Missing is a degraded case rather than a failure. `stripemask.build` takes
+    `None` for either term and falls back to its own detection pass over the
+    pixels, which is the weakest of the three but still finds a laser line.
+    """
+    path = run.path(photo.stripe)
+    if not path.exists():
+        return None, np.zeros((0, 3), np.float32)
+    with np.load(path) as data:
+        wh = data["wh"]
+        stripe = StripePixels(
+            x=np.asarray(data["x"], np.int32), y=np.asarray(data["y"], np.int32),
+            w=np.asarray(data["w"], np.uint8), r=np.asarray(data["r"], np.uint8),
+            wh=(int(wh[0]), int(wh[1])), along_x=bool(data["along_x"]),
+            reason=None)
+        kept = np.asarray(data["kept_xyz_board"], float).reshape(-1, 3)
+    return stripe, kept
+
+
 # ── (4) texture_workspace ────────────────────────────────────────────────
 
 
@@ -1178,6 +1488,702 @@ def _check_texture_workspace(run: Run) -> None:
               "PHOTOGRAMMETRY.md for the texture_sparse fallback.")
     run.log.line(f"texture_workspace: {len(listed)} images, and the workspace "
                  "holds exactly those")
+
+
+# ── (5) image_undistorter ────────────────────────────────────────────────
+
+
+@_step("image_undistorter")
+def _image_undistorter(run: Run) -> None:
+    """Undistort the inpainted photographs into the dense workspace.
+
+    `--image_path` is `colmap/images_clean`, which is `MODE_IMAGE_PATH["dense"]`
+    — this step exists only in dense mode, so it never sees the other value.
+    `--max_image_size` is the run's own, which starts at `params.max_image_size`
+    and which the GPU fallback lowers once; it is a flag of *this* step, which
+    is why lowering it invalidates everything the first attempt built.
+    """
+    code = run.colmap([
+        "colmap", "image_undistorter",
+        "--image_path", run.inside(MODE_IMAGE_PATH[run.mode]),
+        "--input_path", run.inside("colmap/sparse"),
+        "--output_path", run.inside("colmap/dense"),
+        "--output_type", "COLMAP",
+        "--max_image_size", str(run.max_image_size),
+    ])
+    if code != 0:
+        raise StepFailed(
+            f"image_undistorter: exited {code} — colmap/dense/ was not built; "
+            f"read the lines above in {LOG_NAME}.")
+
+
+# ── (6) undistort_masks ──────────────────────────────────────────────────
+
+
+@_step("undistort_masks")
+def _undistort_masks(run: Run) -> None:
+    """One fusion mask per SELECTED image: the stripe, plus everything outside
+    the laser silhouette.
+
+    Two terms, unioned as *ignore*. The stripe term is the raw-frame mask
+    `clean_images` cached, undistorted with **that eye's own `newK`** — using
+    the left eye's on a right image warps every mask it touches, which is why
+    the camera is resolved per image through `images.bin` rather than assumed.
+    A clean-pass photograph has no cached mask and gets the second term alone.
+
+    The second term is what keeps the table, the backdrop and the operator's
+    hands out of fusion. They are inside no `ScanVolume`, but `stereo_fusion`
+    does not know that: every point fused out there lands in `dense_points` and
+    deflates `agree_frac`, the number the merge is judged by. So the laser cloud
+    is projected into each undistorted image — through its `newK` and its pose
+    from the session manifest, because undistortion changes the intrinsics and
+    not the pose — and everything outside the closed, dilated silhouette is 0.
+
+    **Every selected image gets a file**, and the step says so afterwards: a
+    count that quietly disagreed would make `stereo_fusion` fuse everything for
+    the images it missed, which is exactly the failure the masks exist for.
+    """
+    import cv2
+
+    model = _dense_model(run)
+    session = model.selection.session
+    sparse = run.path("colmap", "dense", "sparse")
+    if not (sparse / "cameras.bin").exists():
+        raise StepFailed(
+            f"undistort_masks: {sparse / 'cameras.bin'} is missing — "
+            "image_undistorter writes the dense workspace's own binary model, "
+            "and the undistorted intrinsics come from it.")
+    cameras = read_pinhole_bin(sparse / "cameras.bin")
+    registered = read_images_bin(sparse / "images.bin")
+    laser_xyz, _, _ = read_ply_full(str(run.path(LASER_PLY)))
+
+    #: `cv2.initUndistortRectifyMap` is the expensive half and depends only on
+    #: the eye — two cameras, and up to 150 images between them.
+    remaps: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    unregistered: list[str] = []
+    written = 0
+    for view in model.selection.accepted:
+        photo = view.photo
+        camera_id = registered.get(photo.name)
+        if camera_id is None or camera_id not in cameras:
+            unregistered.append(photo.name)
+            continue
+        new_k, width, height = cameras[camera_id]
+
+        cached = run.path("colmap", "_masks_raw", f"{photo.name}.png")
+        if cached.exists():
+            raw = cv2.imdecode(np.frombuffer(cached.read_bytes(), np.uint8),
+                               cv2.IMREAD_GRAYSCALE)
+            # Keyed by both halves of what the map is made of, so a model that
+            # ever paired a side with another camera builds its own map rather
+            # than reusing one solved for different intrinsics.
+            key = f"{photo.side}:{camera_id}"
+            if key not in remaps:
+                eye = session.eye(photo.side)
+                remaps[key] = cv2.initUndistortRectifyMap(
+                    _eye_matrix(eye), np.asarray(eye.dist, float), None,
+                    new_k, (width, height), cv2.CV_32FC1)
+            map_x, map_y = remaps[key]
+            # Nearest neighbour, never interpolation: a mask has two values and
+            # an average of them is neither.
+            mask = cv2.remap(raw, map_x, map_y, cv2.INTER_NEAREST,
+                             borderMode=cv2.BORDER_CONSTANT,
+                             borderValue=stripemask.MASK_IGNORE)
+        else:
+            mask = np.full((height, width), stripemask.MASK_USE, np.uint8)
+
+        silhouette = _silhouette(laser_xyz, photo, new_k, (width, height))
+        mask[silhouette == 0] = stripemask.MASK_IGNORE
+        stripemask.write_mask(
+            run.path("colmap", "dense", "masks", f"{photo.name}.png"), mask)
+        written += 1
+
+    n_selected = len(model.selection.accepted)
+    if unregistered:
+        raise StepFailed(
+            f"undistort_masks: image_undistorter registered {n_selected - len(unregistered)} "
+            f"of the {n_selected} selected photographs — "
+            f"{', '.join(unregistered[:5])} "
+            f"{'is' if len(unregistered) == 1 else 'are'} not in "
+            "colmap/dense/sparse/images.bin, so colmap/dense/ was built from a "
+            "different model than colmap/sparse/. Re-run with --restart.")
+    if written != n_selected:
+        raise StepFailed(
+            f"undistort_masks: wrote {written} masks for {n_selected} selected "
+            "photographs — stereo_fusion looks a mask up by name and fuses "
+            "everything for an image that has none.")
+    run.log.line(f"undistort_masks: {written} masks, one per selected "
+                 f"photograph, through {len(cameras)} undistorted cameras")
+
+
+def _silhouette(xyz_board: np.ndarray, photo: PhotoMeta, new_k: np.ndarray,
+                wh: tuple[int, int]) -> np.ndarray:
+    """Where the laser cloud lands in one undistorted image, as a filled
+    region: 255 inside, 0 outside.
+
+    No distortion coefficients: the image has been undistorted, so `newK` alone
+    projects into it. Points behind the camera are dropped rather than
+    projected — dividing by a negative z mirrors a point through the principal
+    point and lands it somewhere perfectly plausible.
+    """
+    import cv2
+
+    width, height = int(wh[0]), int(wh[1])
+    out = np.zeros((height, width), np.uint8)
+    xyz = np.asarray(xyz_board, float).reshape(-1, 3)
+    if not len(xyz):
+        return out
+    cam = xyz @ np.asarray(photo.R, float).T + np.asarray(photo.t_mm, float)
+    cam = cam[cam[:, 2] > 1e-6]
+    if not len(cam):
+        return out
+
+    u = np.rint(new_k[0, 0] * cam[:, 0] / cam[:, 2] + new_k[0, 2]).astype(np.int64)
+    v = np.rint(new_k[1, 1] * cam[:, 1] / cam[:, 2] + new_k[1, 2]).astype(np.int64)
+    inside = (u >= 0) & (u < width) & (v >= 0) & (v < height)
+    if not inside.any():
+        return out
+    out[v[inside], u[inside]] = 255
+
+    def disc(px: int) -> np.ndarray:
+        side = _odd(px)
+        return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (side, side))
+
+    out = cv2.dilate(out, disc(SILHOUETTE_DISC_PX))
+    out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, disc(SILHOUETTE_CLOSE_PX))
+    return cv2.dilate(out, disc(SILHOUETTE_DILATE_PX))
+
+
+# ── (7) write_patch_match_cfg ────────────────────────────────────────────
+
+
+@_step("write_patch_match_cfg")
+def _write_patch_match_cfg(run: Run) -> None:
+    """Rewrite the source lines of the cfg the undistorter wrote.
+
+    The cfg comes from `image_undistorter`, not from us: its image lines are
+    the authoritative list of frames COLMAP actually registered, and naming one
+    it did not aborts the whole stage before a single depth map is computed. So
+    every image line is kept verbatim and only the source lines change —
+    bucketed by angle, because nearest-first hands PatchMatch the smallest
+    baseline available every time, which is the one geometry that cannot
+    triangulate.
+    """
+    path = run.path("colmap", "dense", "stereo", "patch-match.cfg")
+    if not path.exists():
+        raise StepFailed(
+            f"write_patch_match_cfg: {path} does not exist — image_undistorter "
+            "writes it, and this step rewrites the file it wrote rather than "
+            "inventing one.")
+    report = plan_patch_match_cfg(path.read_text(encoding="utf-8"),
+                                  _dense_model(run).selection, run.params.cfg)
+    # Newlines held to "\n": COLMAP's own reader is line-based and the file it
+    # wrote had Unix endings, so a Windows host must not put CRLF back in.
+    with path.open("w", encoding="utf-8", newline="\n") as fh:
+        fh.write(report.text)
+    run.log.line(
+        f"write_patch_match_cfg: {len(report.rewritten)} images given "
+        f"angle-bucketed sources, {len(report.kept_auto)} left at __auto__, "
+        f"{len(report.missing)} selected images the undistorter never registered")
+
+
+# ── (8) patch_match_stereo ───────────────────────────────────────────────
+
+
+@_step("patch_match_stereo")
+def _patch_match_stereo(run: Run) -> None:
+    """The depth and normal maps — the only step that asks for a GPU, and the
+    only one that can fall back.
+
+    Three things happen here that happen nowhere else: the `nvidia-smi -L`
+    probe, which is lazy so that a texture-only run never touches the nvidia
+    runtime; the disk estimate re-checked against the undistorted size, which
+    is only now known exactly; and the fallback, which wipes the dense
+    workspace and rebuilds it smaller on the other card. All three are §2.8.
+    """
+    model = _dense_model(run)
+    _recheck_disk(run, model)
+    depth = depth_range_fallback(model.selection, model.observations,
+                                 model.selection.session.volume, run.params.cfg)
+    if depth is not None:
+        run.warn(depth.warning)
+
+    primary, fallback = _resolve_gpus(run)
+    code, tail = _attempt_patch_match(run, primary, depth)
+    if code == 0:
+        _record_gpu(run, primary, depth)
+        return
+
+    cause = _failure_cause(tail)
+    if cause is None:
+        raise StepFailed(
+            f"patch_match_stereo: exited {code}, and the output names neither a "
+            "missing kernel nor an exhausted card — so it is not retried, "
+            f"because nothing about a smaller workspace would help. Read the "
+            f"lines above in {LOG_NAME}.")
+    # One retry, written as one retry: the second attempt is the last line of
+    # this function rather than a loop with a counter, so there is no state to
+    # get wrong about how many have been taken.
+    target = fallback
+    if target is None:
+        if cause.startswith("no CUDA kernel"):
+            raise StepFailed(
+                f"patch_match_stereo: {cause}, and this machine has one card — "
+                "retrying the same missing kernel on the same card cannot "
+                "help. Build native/docker/colmap-cuda128 (COLMAP 4.2.0 with "
+                "-DCMAKE_CUDA_ARCHITECTURES=\"75;89;120\") and point "
+                f"{COLMAP_IMAGE_ENV} at it, or reconstruct with --mode "
+                "texture-only.")
+        # An exhausted card with nowhere to go still has somewhere to go: the
+        # smaller workspace is what the smaller size is for.
+        target = primary
+
+    run.log.line(
+        f"patch_match_stereo: {cause} — deleting colmap/dense/ and rebuilding "
+        f"it at --max_image_size {FALLBACK_MAX_IMAGE_SIZE} on "
+        + (f"{target.name} ({target.uuid})" if target is not None
+           else "the same device") + ". This is the one retry.")
+    run.fell_back = True
+    run.fallback_reason = cause
+    _fallback_rerun(run)
+
+    code, tail = _attempt_patch_match(run, target, depth)
+    if code != 0:
+        again = _failure_cause(tail) or f"exit {code}"
+        raise StepFailed(
+            f"patch_match_stereo: the fallback attempt failed too ({again}) — "
+            "the run stops here rather than wiping the workspace a second "
+            "time. Build native/docker/colmap-cuda128, or reconstruct with "
+            "--mode texture-only; laser.ply and colmap/sparse/ are intact.")
+    _record_gpu(run, target, depth)
+
+
+def _attempt_patch_match(run: Run, gpu: GpuSpec | None,
+                         depth: DepthRange | None) -> tuple[int, list[str]]:
+    """One PatchMatch invocation, with the tail of its output kept.
+
+    The tail is what the cause is read out of. It is bounded because this step
+    prints a line per image for an hour and the diagnosis is always at the end;
+    `recon.log` carries the whole of it regardless.
+    """
+    argv = [
+        "colmap", "patch_match_stereo",
+        "--workspace_path", run.inside("colmap/dense"),
+        "--workspace_format", "COLMAP",
+        "--PatchMatchStereo.geom_consistency", "true",
+        "--PatchMatchStereo.num_iterations", "5",
+        "--PatchMatchStereo.filter_min_ncc", "0.1",
+        "--PatchMatchStereo.filter_min_triangulation_angle", "3",
+        # The container is given exactly one device, so index 0 inside it is
+        # the card chosen by UUID outside it.
+        "--PatchMatchStereo.gpu_index", "0",
+    ]
+    if depth is not None:
+        # Passed only when the tracks are demonstrably too thin to give
+        # COLMAP a per-image range of its own; its own is the better answer.
+        argv += ["--PatchMatchStereo.depth_min", f"{depth.depth_min_mm:.6g}",
+                 "--PatchMatchStereo.depth_max", f"{depth.depth_max_mm:.6g}"]
+
+    tail: collections.deque[str] = collections.deque(maxlen=FAILURE_TAIL_LINES)
+
+    def sink(line: str) -> None:
+        run.log.line(line)
+        tail.append(line)
+
+    code = run.backend.run(argv, on_line=sink, gpu=gpu, cancel=run.cancel)
+    return code, list(tail)
+
+
+def _failure_cause(lines: Iterable[str]) -> str | None:
+    """Which of the two retryable failures this output describes, as a clause
+    for the log, or None when it is neither.
+
+    Two patterns and no catch-all: `CUDA error` matches both and would retry an
+    out-of-memory failure unchanged, which is not a fallback.
+    """
+    text = "\n".join(lines)
+    if KERNEL_ERROR_RE.search(text):
+        return ("no CUDA kernel for this card in the image (its SASS stops at "
+                "sm_90)")
+    if OOM_RE.search(text):
+        return "the card ran out of memory"
+    return None
+
+
+def _resolve_gpus(run: Run) -> tuple[GpuSpec | None, GpuSpec | None]:
+    """Which card PatchMatch runs on, and which one it falls back to.
+
+    The probe is `nvidia-smi -L` inside the COLMAP image with `--gpus all` —
+    the same call `--check` makes, and the call that has to work for a UUID to
+    be resolvable at all. It runs here and nowhere earlier: a texture-only run
+    must not be able to die on a broken nvidia runtime it never needed.
+
+    Selection is by identity because slot order decides device 0 and nothing
+    else does: `--gpus all` plus `CUDA_DEVICE_ORDER=PCI_BUS_ID` will not make a
+    chosen card index 0.
+    """
+    if isinstance(run.backend, LocalBackend):
+        # A local binary runs on the host, where there is no `--gpus` to pass
+        # and `gpu_index 0` addresses the host's own devices directly.
+        run.log.line("patch_match_stereo: the local backend pins no device — "
+                     "gpu_index 0 is whichever card the host calls first")
+        return None, None
+
+    entries: list[tuple[str, str]] = []
+
+    def sink(line: str) -> None:
+        run.log.line(line)
+        found = _GPU_LINE_RE.match(line)
+        if found:
+            entries.append((found.group(3), found.group(2)))
+
+    code = run.backend.run(["nvidia-smi", "-L"], on_line=sink,
+                           gpu=GpuSpec(uuid=ALL_DEVICES, name="every device"),
+                           cancel=run.cancel)
+    if code != 0 or not entries:
+        raise StepFailed(
+            f"patch_match_stereo: `nvidia-smi -L` in the COLMAP image listed "
+            f"no CUDA device (exit {code}) — the dense stage cannot run without "
+            "one. Check the nvidia container runtime with `orbiter-recon "
+            "--check --mode dense`, or reconstruct with --mode texture-only, "
+            "which asks for no GPU at any step.")
+
+    wanted = os.environ.get(COLMAP_GPU_ENV, DEFAULT_GPU_MATCH).strip()
+    needle = wanted.lower()
+    index = next((i for i, (uuid, name) in enumerate(entries)
+                  if needle in uuid.lower() or needle in name.lower()), None)
+    if index is None:
+        index = 0
+        run.log.line(f"patch_match_stereo: no card matches {COLMAP_GPU_ENV}="
+                     f"{wanted!r}; using the first one listed, "
+                     f"{entries[0][1]}")
+    primary = GpuSpec(uuid=entries[index][0], name=entries[index][1])
+    fallback = next((GpuSpec(uuid=uuid, name=name) for uuid, name in entries
+                     if uuid != primary.uuid), None)
+    run.log.line(
+        f"patch_match_stereo: {primary.name} ({primary.uuid})"
+        + (f", falling back to {fallback.name} if its kernel is missing"
+           if fallback is not None else " — the only card in this machine"))
+    return primary, fallback
+
+
+def _record_gpu(run: Run, gpu: GpuSpec | None, depth: DepthRange | None) -> None:
+    """What ran, on what, and whether the forced depth range took effect."""
+    run.gpu = gpu
+    run.report["gpu"] = {
+        "requested": os.environ.get(COLMAP_GPU_ENV, DEFAULT_GPU_MATCH),
+        "uuid": gpu.uuid if gpu is not None else None,
+        "name": gpu.name if gpu is not None else "",
+        "fallback_used": run.fell_back,
+        "fallback_uuid": gpu.uuid if (run.fell_back and gpu is not None) else None,
+        "reason": run.fallback_reason,
+        "max_image_size": run.max_image_size,
+    }
+    run.report["depth_range"] = _depth_range_report(run, depth)
+    if gpu is not None:
+        run.log.line(f"patch_match_stereo: ran on {gpu.name} ({gpu.uuid}) at "
+                     f"--max_image_size {run.max_image_size}"
+                     + (" after falling back" if run.fell_back else ""))
+
+
+def _depth_range_report(run: Run, depth: DepthRange | None
+                        ) -> dict[str, Any] | None:
+    """Whether an explicitly passed depth range took effect, measured rather
+    than assumed.
+
+    That the flags override COLMAP's own per-image ranges is an assumption
+    (§7): the reference never passes them and we have not read 4.2.0's
+    controller. So when the fallback fires, one geometric depth map is read
+    back and its own extent is recorded beside what was asked for. Null when no
+    range was forced, because there is then nothing to have taken effect.
+    """
+    if depth is None:
+        return None
+    observed = _observed_depth(run)
+    return {
+        "requested": [float(depth.depth_min_mm), float(depth.depth_max_mm)],
+        "observed_min": observed[0] if observed else None,
+        "observed_max": observed[1] if observed else None,
+    }
+
+
+def _observed_depth(run: Run) -> tuple[float, float] | None:
+    """The extent of one geometric depth map, or None when there is none to
+    read.
+
+    COLMAP's depth maps are `<width>&<height>&<channels>&` in ASCII followed by
+    that many float32s. Zero means "no depth here", so the extent is taken over
+    the positive values only; a map that is entirely zero says nothing and is
+    reported as nothing.
+    """
+    maps = sorted(run.path("colmap", "dense", "stereo", "depth_maps")
+                  .glob("*.geometric.bin"))
+    if not maps:
+        return None
+    raw = maps[0].read_bytes()
+    at = 0
+    shape: list[int] = []
+    for _ in range(3):
+        cut = raw.find(b"&", at)
+        if cut < 0:
+            return None
+        shape.append(int(raw[at:cut]))
+        at = cut + 1
+    count = shape[0] * shape[1] * shape[2]
+    if count <= 0 or len(raw) - at < count * 4:
+        return None
+    values = np.frombuffer(raw, np.float32, count=count, offset=at)
+    positive = values[values > 0.0]
+    if not len(positive):
+        return None
+    return float(positive.min()), float(positive.max())
+
+
+def _recheck_disk(run: Run, model: DenseModel) -> None:
+    """The dense estimate again, now that the undistorted size is a fact.
+
+    `write_sparse` computed it from `--max_image_size` and the sensor size,
+    which is an inference; `dense/sparse/cameras.bin` is what the undistorter
+    actually chose. This is the check that catches a session which filled up
+    during the undistort — before an hour of depth maps rather than after.
+    """
+    path = run.path("colmap", "dense", "sparse", "cameras.bin")
+    if not path.exists():
+        raise StepFailed(
+            f"patch_match_stereo: {path} is missing — image_undistorter writes "
+            "the dense workspace, and the size it undistorted at is what the "
+            "disk estimate is re-checked against. Start at --from "
+            "image_undistorter.")
+    cameras = read_pinhole_bin(path)
+    if not cameras:
+        return
+    width, height = max(((w, h) for _, w, h in cameras.values()),
+                        key=lambda wh: wh[0] * wh[1])
+    n_selected = len(model.selection.accepted)
+    estimate = disk_estimate_bytes("dense", n_selected, (width, height))
+    _check_disk(run, estimate,
+                f"the dense stage still needs about {_gb(estimate)} for "
+                f"{n_selected} images at {width}x{height} (depth and normal "
+                "maps dominate)")
+    # A resumed run has no `disk` block of its own to add to; what it records
+    # is the figure it actually checked, which is the honest one either way.
+    disk = dict(run.report.get("disk") or {})
+    disk["estimate_bytes_rechecked"] = estimate
+    run.report["disk"] = disk
+
+
+def _fallback_rerun(run: Run) -> None:
+    """Delete the dense workspace, forget what built it, and build it again
+    smaller.
+
+    All three of these are needed and all three were missing from the first
+    design of this fallback: the masks were undistorted at the old `newK`,
+    `image_undistorter` regenerates `stereo/patch-match.cfg` and so discards
+    the host's rewrite, and `patch_match_stereo` skips images whose depth maps
+    already exist — so a partial first pass is inherited by the second.
+
+    Deliberately outside the wipe: `clean_images` (its output is
+    device-independent and expensive to rebuild), `texture_workspace`,
+    `colmap/images/`, `colmap/images_clean/` and `mesh/` — which is where
+    `poisson_mesher` writes, so wiping the dense tree can no longer delete a
+    mesh.
+    """
+    shutil.rmtree(run.path("colmap", "dense"), ignore_errors=True)
+    for name in FALLBACK_CLEARS:
+        run.state.steps.pop(name, None)
+    run.max_image_size = FALLBACK_MAX_IMAGE_SIZE
+    run.state.max_image_size = FALLBACK_MAX_IMAGE_SIZE
+    run.state.write(run.session_dir)
+    for name in FALLBACK_RERUNS:
+        _run_step(run, name)
+
+
+# ── (9) stereo_fusion ────────────────────────────────────────────────────
+
+
+@_step("stereo_fusion")
+def _stereo_fusion(run: Run) -> None:
+    """Fuse the depth maps into `colmap/dense/fused.ply`, through the masks.
+
+    The mask path is dropped when there are no masks to point at, rather than
+    passed at an empty directory: COLMAP looks a mask up by name and an absent
+    one means "fuse everything", so a mask directory that exists and is empty
+    and a mask directory that was never made are the same thing to it — and
+    saying so in the log is the difference between a fused table nobody
+    expected and one somebody was warned about.
+    """
+    masks = run.path("colmap", "dense", "masks")
+    n_masks = len(list(masks.glob("*.png"))) if masks.is_dir() else 0
+
+    argv = [
+        "colmap", "stereo_fusion",
+        "--workspace_path", run.inside("colmap/dense"),
+        "--workspace_format", "COLMAP",
+        "--input_type", "geometric",
+        "--StereoFusion.max_reproj_error", "3.0",
+        "--StereoFusion.max_depth_error", "0.015",
+        "--StereoFusion.min_num_pixels", "4",
+    ]
+    if n_masks:
+        argv += ["--StereoFusion.mask_path", run.inside("colmap/dense/masks")]
+    else:
+        run.warn("stereo_fusion: no masks were written, so no mask path is "
+                 "passed — the laser stripe and everything outside the scan "
+                 "volume are fusable, and the merge's agree_frac will read "
+                 "lower than the object deserves.")
+    argv += ["--output_path", run.inside("colmap/dense/fused.ply")]
+
+    code = run.colmap(argv)
+    if code != 0:
+        raise StepFailed(
+            f"stereo_fusion: exited {code} — colmap/dense/fused.ply was not "
+            f"written; read the lines above in {LOG_NAME}.")
+    run.log.line(f"stereo_fusion: fused through {n_masks} masks")
+
+
+# ── (10) merge ───────────────────────────────────────────────────────────
+
+
+@_step("merge")
+def _merge(run: Run) -> None:
+    """The laser cloud, plus whatever of the dense cloud fills what the laser
+    never saw.
+
+    The rule and every gate live in `scan.merge_clouds`, which is where they are
+    tested; this step's job is to find both clouds, hand them over with the
+    volume the crop is defined by, report every number it gets back, and stop
+    the run when the merge refuses. It stops with the merge's own sentence
+    verbatim, because that sentence names the cells, the sign pattern and the
+    escape — and the escape is `--mode texture-only`, not `--to
+    poisson_mesher`, which in this mode would run the merge again and refuse
+    again.
+
+    The report is written **before** the refusal is raised. The numbers are the
+    point of a refused merge as much as of a passing one, and a `session.json`
+    that lost them would leave an operator with nothing to tune from.
+    """
+    model = _dense_model(run)
+    fused = run.path("colmap", "dense", "fused.ply")
+    if not fused.exists():
+        raise StepFailed(
+            f"merge: {fused} does not exist — stereo_fusion writes it, and "
+            "there is nothing to merge the laser cloud with until it does.")
+
+    dense_xyz, _, dense_n = read_ply_full(str(fused))
+    if dense_n is None:
+        # COLMAP writes normals into `fused.ply`; a cloud without them still
+        # has to be judged, and PCA is the same estimate the laser cloud gets.
+        dense_n = normals_pca(dense_xyz)
+    laser_xyz, _, laser_n = read_ply_full(str(run.path(LASER_PLY)))
+    if laser_n is None:
+        laser_n = orient_normals(
+            normals_pca(laser_xyz), laser_xyz,
+            np.array([v.photo.centre_mm for v in model.selection.accepted], float))
+
+    volume = model.selection.session.volume
+    xyz, normals, stats = merge_clouds(laser_xyz, laser_n, dense_xyz, dense_n,
+                                       run.params.merge, volume)
+    run.report["merge"] = _merge_report(stats)
+    for line in _merge_lines(stats, volume):
+        run.log.line(line)
+    for warning in stats.warnings:
+        run.warn(warning)
+
+    if stats.refused:
+        # `run` adds the `reconstruct` block only when the chain finishes, and
+        # a refusal never gets there — so the block is completed and written
+        # here, with the warnings this run had collected by now.
+        run.report["warnings"] = list(run.warnings)
+        run.report["degraded"] = list(run.degraded)
+        _write_report(run)
+        raise ReconRefused(stats.message or "merge refused")
+
+    write_ply(str(run.path("colmap", "dense", "merged.ply")), xyz, None, normals)
+    run.log.line(f"merge: colmap/dense/merged.ply holds {_num(len(xyz))} points "
+                 f"— {_num(stats.laser_points)} from the laser and "
+                 f"{_num(stats.dense_kept)} of dense hole fill")
+
+
+def _merge_report(stats: MergeStats) -> dict[str, Any]:
+    """Every field of `MergeStats`, and every threshold it was decided by,
+    as `session.json` carries them."""
+    cells = stats.cells
+    return {
+        "params": {f.name: getattr(stats.params, f.name)
+                   for f in fields(stats.params)},
+        "candidate_radius_mm": _finite(stats.candidate_radius_mm),
+        "laser_points": int(stats.laser_points),
+        "dense_points": int(stats.dense_points),
+        "dense_supported": int(stats.dense_supported),
+        "dense_kept": int(stats.dense_kept),
+        "floaters": int(stats.floaters),
+        "agree_frac": _finite(stats.agree_frac),
+        "keep_frac": _finite(stats.keep_frac),
+        "cells": {
+            "grid": list(cells.grid),
+            "gated": int(cells.gated),
+            "worst": cells.worst,
+            "medians_mm": {k: _finite(v) for k, v in cells.medians_mm.items()},
+            "counts": {k: int(v) for k, v in cells.counts.items()},
+            "skipped": list(cells.skipped),
+        },
+        "p90_abs_residual_mm": _finite(stats.p90_abs_residual_mm),
+        "kept_median_mm": _finite(stats.kept_median_mm),
+        "median_dense_neighbours": _finite(stats.median_dense_neighbours),
+        "refused": bool(stats.refused),
+        "refused_by": stats.refused_by,
+        "message": stats.message,
+        "warnings": list(stats.warnings),
+    }
+
+
+def _finite(value: float) -> float | None:
+    """A float JSON can carry, or None. `NaN` is a legal Python literal and an
+    illegal JSON one, and `session.json` is read by more than Python."""
+    number = float(value)
+    return number if np.isfinite(number) else None
+
+
+def _merge_lines(stats: MergeStats, volume: ScanVolume) -> list[str]:
+    """The merge as `recon.log` reports it: one summary line, then one line per
+    gated cell.
+
+    Every gated cell and not only the worst, because `agree_mm` is the first
+    number to tune from a real run and the whole table is what it is tuned
+    against."""
+    cells = stats.cells
+    worst = ""
+    if cells.worst:
+        worst = (f", worst {cells.worst} "
+                 f"{cells.medians_mm.get(cells.worst, float('nan')):+.2f} mm "
+                 f"(limit {stats.params.agree_mm})")
+    lines = [
+        f"merge: supported {_num(stats.dense_supported)} of "
+        f"{_num(stats.dense_points)} ({stats.agree_frac:.1%}, candidate radius "
+        f"{stats.candidate_radius_mm:.2f} mm), {cells.gated} of "
+        f"{cells.grid[0] * cells.grid[1]} cells gated{worst}, p90 |res| "
+        f"{stats.p90_abs_residual_mm:.2f} mm, kept {_num(stats.dense_kept)} "
+        f"({stats.keep_frac:.1%}, kept median {stats.kept_median_mm:.2f} mm), "
+        f"floaters {_num(stats.floaters)}"
+    ]
+    span = (float(volume.height_mm) - float(volume.floor_mm)) / max(cells.grid[0], 1)
+    for key in sorted(cells.medians_mm, key=lambda k: -abs(cells.medians_mm[k])):
+        slab = int(key.split(":")[0][1:])
+        low = float(volume.floor_mm) + (slab - 1) * span
+        lines.append(f"  {key}  {cells.medians_mm[key]:+.2f} mm over "
+                     f"{_num(cells.counts.get(key, 0))} points "
+                     f"(z {low:.0f}-{low + span:.0f} mm)")
+    if cells.skipped:
+        lines.append(f"  {len(cells.skipped)} cells below "
+                     f"{stats.params.band_min} supported points were not gated: "
+                     f"{', '.join(cells.skipped[:8])}")
+    return lines
+
+
+def _num(count: int) -> str:
+    """`2914501` as `2 914 501`: these counts run to the millions, and a wall
+    of digits hides an order of magnitude."""
+    return f"{int(count):,}".replace(",", " ")
 
 
 # ── (11) poisson_mesher ──────────────────────────────────────────────────
@@ -1420,6 +2426,26 @@ def _check_clean_images_first(run: Run, from_step: str | None,
             "reads the verbatim colmap/images/ instead.")
 
 
+def _run_step(run: Run, name: str) -> float:
+    """One step: make the directories it writes into, run it, record it.
+
+    Factored out of `run`'s loop because the GPU fallback runs three of these
+    again from inside `patch_match_stereo`, and a step that skipped its own
+    `mkdir` there would fail on the retry in a way it never fails in the chain.
+    """
+    for relative in DIRS_CREATED.get(name, ()):
+        run.session_dir.joinpath(*relative.split("/")).mkdir(
+            parents=True, exist_ok=True)
+    run.log.line(f"{name}: running")
+    started = time.monotonic()
+    STEPS[name](run)
+    seconds = time.monotonic() - started
+    run.state.done(name, seconds)
+    run.state.write(run.session_dir)
+    run.log.line(f"{name}: done in {seconds:.1f} s")
+    return seconds
+
+
 def run(session_dir: str | Path, mode: str = "texture-only", *,
         from_step: str | None = None, to_step: str | None = None,
         only: str | None = None, restart: bool = False, force: bool = False,
@@ -1468,7 +2494,8 @@ def run(session_dir: str | Path, mode: str = "texture-only", *,
         logger.line("--restart: the state file was cleared; every step will run")
 
     ctx = Run(session_dir=session_dir, mode=mode, backend=backend, log=logger,
-              params=params, state=state, force=force, cancel=cancel)
+              params=params, state=state, force=force, cancel=cancel,
+              max_image_size=params.max_image_size)
     ctx.report["started_utc"] = _utc_now()
 
     chosen = _chain(mode, from_step, to_step, only)
@@ -1506,17 +2533,8 @@ def run(session_dir: str | Path, mode: str = "texture-only", *,
                 logger.line(f"{name}: skipped, finished "
                             f"{state.steps[name].get('done_utc', 'earlier')}")
                 continue
-            for relative in DIRS_CREATED.get(name, ()):
-                session_dir.joinpath(*relative.split("/")).mkdir(
-                    parents=True, exist_ok=True)
-            logger.line(f"{name}: running")
-            started = time.monotonic()
-            STEPS[name](ctx)
-            seconds = time.monotonic() - started
-            state.done(name, seconds)
-            state.write(session_dir)
+            _run_step(ctx, name)
             ran.append(name)
-            logger.line(f"{name}: done in {seconds:.1f} s")
     finally:
         state.write(session_dir)
         backend.close()

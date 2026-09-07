@@ -365,20 +365,23 @@ def test_unknown_step_for_the_mode_is_refused_by_name(tmp_path) -> None:
         _run(session_dir, only="wobble")
 
 
-def test_dense_mode_is_refused_by_name_until_its_steps_exist(tmp_path) -> None:
-    """Dense's steps are named in `CANONICAL_STEPS` and are not implemented
-    here. That is a sentence naming them, not a stub that would fail somewhere
-    less legible — and it names the mode that does work."""
+def test_both_chains_are_fully_implemented_and_a_mode_is_named(tmp_path) -> None:
+    """Every step of both chains has an implementation, and a mode that does
+    not exist is refused by name.
+
+    Until D1b landed, `--mode dense` was itself a named refusal listing the
+    steps that had no implementation — a plain sentence rather than a stub that
+    would fail somewhere less legible. The refusal is still built (`run` checks
+    `STEPS` before it starts anything), and this is what keeps it honest: a
+    step named in `CANONICAL_STEPS` and never registered would resurrect it.
+    """
+    assert set(CANONICAL_STEPS) == set(recon.STEPS)
+    for mode, steps in MODE_STEPS.items():
+        assert set(steps) <= set(recon.STEPS), mode
+
     session_dir = _session(tmp_path)
-    with pytest.raises(ReconRefused) as caught:
-        _run(session_dir, mode="dense")
-    message = str(caught.value)
-    for name in ("clean_images", "image_undistorter", "undistort_masks",
-                 "write_patch_match_cfg", "patch_match_stereo",
-                 "stereo_fusion", "merge"):
-        assert name in message
-    assert "--mode texture-only" in message
-    assert set(MODE_STEPS["texture-only"]) <= set(recon.STEPS)
+    with pytest.raises(ReconRefused, match=r"no such mode: 'thick'"):
+        _run(session_dir, mode="thick")
 
 
 # ── disk ─────────────────────────────────────────────────────────────────
@@ -595,16 +598,17 @@ def test_only_runs_one_step(tmp_path) -> None:
 
 
 def _stub_dense(monkeypatch) -> list[str]:
-    """Register the dense steps D1b owns as recording no-ops.
+    """Replace the dense-only steps with recording no-ops.
 
-    The mode-invalidation rule is `run`'s, not theirs, and it cannot be
-    exercised at all while `--mode dense` refuses for want of an
-    implementation. The stubs live here rather than in `recon.py`, where a
-    placeholder would be a lie about what ships.
+    The mode-invalidation rule and the `--from` refusal are `run`'s, not the
+    dense steps' — what those tests need is the order the chain calls them in,
+    not a workspace on disk. Stubbing keeps them where they belong and out of
+    the fixtures a real dense run needs; `test_recon_dense.py` drives the same
+    two rules again with the real steps behind them.
     """
     seen: list[str] = []
     for name in CANONICAL_STEPS:
-        if name in recon.STEPS:
+        if name in MODE_STEPS["texture-only"]:
             continue
         monkeypatch.setitem(recon.STEPS, name,
                             (lambda n: lambda run: seen.append(n))(name))
