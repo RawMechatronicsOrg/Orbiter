@@ -499,6 +499,12 @@ def test_clear_drains_pending_candidates_instead_of_dropping_them(
     sw = _worker(session, writer)
     sw.set_active(True)
     _still_run(sw, board)
+    # `counts` is the writer thread's tally, bumped as each photograph reaches
+    # the disk — so a snapshot taken while it is still draining what the run
+    # queued counts the race rather than the run. Stopping it settles the
+    # number; `stop` on an already-stopped writer just writes by hand whatever
+    # `clear` puts in the queue after this, which is the whole point below.
+    writer.stop()
     before = session.counts["left"]
     assert before > 0                                 # the run itself worked
     assert sw._smooth.pending == 3
