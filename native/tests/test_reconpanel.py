@@ -96,10 +96,14 @@ def test_panel_shows_the_session_and_counts(tmp_path, monkeypatch) -> None:
         assert session is not None
         win.scan.on_status(_status(session.session_id, pass_id=1, photos_left=7,
                                    photos_right=6, photos_dropped=2,
+                                   photos_failed=1,
                                    session_bytes=3 * 1024 * 1024))
         text = win.scan.photo_stats.text()
         assert session.session_id in text and "pass 1" in text
         assert "L 7" in text and "R 6" in text and "dropped 2" in text
+        # A writer that took a photograph and could not put it down says so
+        # here: silently, it is a session that comes out short with no reason.
+        assert "failed 1" in text
         # The size is the counter the writer keeps, shown at a scale an
         # operator reads — and no directory was walked to produce it.
         assert "3.0 MB" in text
@@ -172,7 +176,11 @@ def test_arming_photos_without_a_config_is_refused_and_says_why(
         assert win._session is None
         assert not win.scan.photos.isChecked()
         assert armed == [False]                                # disarmed, never armed
-        assert "no rig config" in win.statusBar().currentMessage()
+        # On the panel and not in the status bar: `_poll_config` rewrites that
+        # every two seconds — with, on this window, the very message below.
+        assert "no rig config" in win.scan.notice.text()
+        assert win.scan.notice.isVisibleTo(win.scan)
+        assert "server unreachable" in win.statusBar().currentMessage()
     finally:
         win.close()
 
@@ -396,3 +404,188 @@ def test_close_event_stops_the_writer_and_the_recon_thread(
     finally:
         if not closed:
             win.close()
+
+
+# ── what must not escape a Qt slot ───────────────────────────────────────
+
+
+def test_a_session_that_cannot_be_opened_leaves_the_window_up_and_says_so(
+        tmp_path, monkeypatch) -> None:
+    """An exception out of a slot is not a message: Qt prints it and carries
+    on, and the window it came out of never reaches `closeEvent` — which is
+    what stops the reader threads and drains the writer. A read-only sessions
+    root costs the operator a sentence on the panel, and nothing else."""
+    win = _window(tmp_path, monkeypatch)
+    try:
+        from orbiter_native import app as appmod
+
+        def refuse(*args, **kwargs):
+            raise OSError(30, "Read-only file system")
+
+        monkeypatch.setattr(appmod, "PhotoSession", refuse)
+        _arm(win)
+        win.scan.photos.setChecked(True)
+
+        assert win._session is None and win._writer is None
+        assert not win.scan.photos.isChecked()             # the switch came back up
+        assert "could not open a photo session" in win.scan.notice.text()
+        assert win.scan.notice.isVisibleTo(win.scan)
+    finally:
+        win.close()
+
+
+def test_an_export_that_raises_leaves_the_window_up_and_says_so(
+        tmp_path, monkeypatch) -> None:
+    """`laser.ply` is written from this slot, and `export` walks the whole
+    cloud to do it. Only `OSError` was caught, so anything else it raised —
+    out of numpy, out of the cleaner — went out through the slot and took the
+    shutdown path with it."""
+    win = _window(tmp_path, monkeypatch)
+    try:
+        _ready_session(win, monkeypatch)
+
+        def boom(path: str) -> int:
+            raise RuntimeError("the cloud is not a cloud")
+
+        monkeypatch.setattr(win.scanner, "export", boom)
+        win.scan.btn_recon.click()
+
+        assert win._recon_thread is None                   # no run was started
+        assert "could not write laser.ply" in win.scan.notice.text()
+        assert win.scan.btn_recon.text() == "Reconstruct"
+    finally:
+        win.close()
+
+
+def test_a_thread_that_refuses_to_start_does_not_wedge_the_button(
+        tmp_path, monkeypatch) -> None:
+    """`_recon_thread` is the double-start guard. Assigned before `start`, a
+    thread the OS refused would sit in it for the rest of the session and
+    every later Reconstruct would return without a word."""
+    win = _window(tmp_path, monkeypatch)
+    try:
+        from orbiter_native import recon as reconmod
+
+        refused: list[str] = []
+
+        class _RefusesTheFirstRecon(threading.Thread):
+            def start(self) -> None:
+                if self.name == "recon" and not refused:
+                    refused.append(self.name)
+                    raise RuntimeError("can't start new thread")
+                super().start()
+
+        def fake_run(session_dir, mode="texture-only", *, on_line=None,
+                     cancel=None, **kwargs):
+            on_line("write_sparse: running")
+            return None
+
+        monkeypatch.setattr(reconmod, "run", fake_run)
+        monkeypatch.setattr(threading, "Thread", _RefusesTheFirstRecon)
+        _ready_session(win, monkeypatch)
+        with pytest.raises(RuntimeError):
+            win._reconstruct("texture-only")
+        assert refused == ["recon"]
+        assert win._recon_thread is None                   # nothing to wedge it
+
+        # And the next press, with threads to be had again, runs.
+        win.scan.btn_recon.click()
+        thread = win._recon_thread
+        assert thread is not None
+        thread.join(10.0)
+        win._recon_tick()
+        assert "write_sparse" in win.scan.recon_status.text()
+    finally:
+        win.close()
+
+
+class _EndsWhileAsked:
+    """A thread that writes its last line at the instant it is asked whether
+    it is still running — the one moment the old order lost it, between the
+    tick's swap of the line list and its look at `is_alive`."""
+
+    def __init__(self, thread, on_end) -> None:
+        self._thread, self._on_end = thread, on_end
+        self._said = False
+
+    def is_alive(self) -> bool:
+        alive = self._thread.is_alive()
+        if not alive and not self._said:
+            self._said = True
+            self._on_end()
+        return alive
+
+
+def test_the_last_line_of_a_run_is_not_left_behind(tmp_path, monkeypatch) -> None:
+    """The tick that notices the thread has ended is the last one: it stops
+    the timer. A line that arrived after that tick's swap has nobody left to
+    take it, so the panel's final word would be the second-to-last thing the
+    chain said — "Elapsed time" where it should read "done"."""
+    win = _window(tmp_path, monkeypatch)
+    try:
+        from orbiter_native import recon as reconmod
+
+        def fake_run(session_dir, mode="texture-only", *, on_line=None,
+                     cancel=None, **kwargs):
+            on_line("write_sparse: running")
+            return None
+
+        monkeypatch.setattr(reconmod, "run", fake_run)
+        _ready_session(win, monkeypatch)
+        win.scan.btn_recon.click()
+        thread = win._recon_thread
+        assert thread is not None
+        thread.join(10.0)
+        assert not thread.is_alive()
+
+        win._recon_thread = _EndsWhileAsked(
+            thread, lambda: win._recon_line("texture: done"))
+        win._recon_tick()
+
+        assert win._recon_thread is None
+        assert "texture: done" in win.scan.recon_status.text()
+        assert win._recon_lines == []
+    finally:
+        win.close()
+
+
+def test_the_size_on_disk_follows_a_run_the_status_never_reports(
+        tmp_path, monkeypatch) -> None:
+    """Nothing pairs while a reconstruction runs, so no `ScanStatus` is
+    published — and what COLMAP writes never passes the writer's byte counter
+    anyway. Left to those two the size label would sit at the number the run
+    started with, which is exactly the number the operator is watching to see
+    the disk fill."""
+    win = _window(tmp_path, monkeypatch)
+    try:
+        from orbiter_native import recon as reconmod
+        from orbiter_native.app import _SIZE_TICKS
+        from orbiter_native.scanpanel import _size
+
+        started = threading.Event()
+        monkeypatch.setattr(reconmod, "run", _blocking_run(started))
+        _ready_session(win, monkeypatch)
+        assert "0 B" in win.scan.photo_stats.text()        # the status said nothing
+        win.scan.btn_recon.click()
+        assert started.wait(10.0)
+
+        session = win._session
+        assert session is not None
+        (session.path / "dense.bin").write_bytes(b"x" * 4_000_000)
+        for _ in range(_SIZE_TICKS):
+            win._recon_tick()
+        mid = sum(p.stat().st_size for p in session.path.rglob("*") if p.is_file())
+        assert _size(mid) in win.scan.photo_stats.text()
+
+        # And once more when the run ends, so the label settles on the truth.
+        (session.path / "meshed.ply").write_bytes(b"y" * 8_000_000)
+        win._recon_cancel.set()
+        thread = win._recon_thread
+        assert thread is not None
+        thread.join(10.0)
+        win._recon_tick()
+        end = sum(p.stat().st_size for p in session.path.rglob("*") if p.is_file())
+        assert end > mid
+        assert _size(end) in win.scan.photo_stats.text()
+    finally:
+        win.close()

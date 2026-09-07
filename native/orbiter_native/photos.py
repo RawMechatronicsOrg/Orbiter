@@ -24,7 +24,10 @@ stalling both cameras.
 scan, the smoother and the workers; a photo module underneath it would close a
 cycle. The price is the two stillness constants below, duplicated rather than
 imported — and `scanworker`'s `_still` is pairwise, over a batch, which is not
-the window the policy wants anyway.
+the window the policy wants anyway. `colmapio` is a different matter: it is
+numpy, scipy and nothing of ours, so the scalar-first quaternion comes from
+there rather than from a second copy here — that reorder is the one bug every
+COLMAP converter ships, and it is worth having in one place with one test.
 
 **The panel asks for the session's size on every tick.** A `du` over a
 directory with thousands of files is not something to do in a Qt timer, so
@@ -37,6 +40,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import queue
 import threading
@@ -47,8 +51,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from scipy.spatial.transform import Rotation
 
+from .colmapio import quat_wxyz
 from .laser import StripePixels
 from .scan import ScanVolume
 
@@ -141,11 +145,22 @@ def stripe_name(side: str, n: int) -> str:
     return f"{side}_{n:04d}.npz"
 
 
-def _quat_wxyz(R: np.ndarray) -> list[float]:
-    """A rotation as a Hamilton quaternion, scalar first — the order COLMAP's
-    `images.txt` uses, so the manifest and the model agree without a swap."""
-    q = Rotation.from_matrix(np.asarray(R, float)).as_quat(scalar_first=True)
-    return [float(v) for v in q]
+def _jsonable(value: Any) -> Any:
+    """The same object with every non-finite float replaced by None.
+
+    A pose solved by one eye alone has no gap between two eyes to report and
+    carries NaN; `json.dumps` writes that as a bare `NaN`, which is not JSON
+    and which a strict reader — `json.loads` with `parse_constant`, anything
+    outside Python — refuses. `null` is what "there is no number here" looks
+    like in JSON, so that is what the manifest says.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_jsonable(v) for v in value]
+    return value
 
 
 def _angle_deg(a: np.ndarray, b: np.ndarray) -> float:
@@ -438,7 +453,7 @@ class PhotoRecord:
             "wh": [int(self.wh[0]), int(self.wh[1])],
             "capture_mono": float(self.capture_mono),
             "pair_capture_mono": float(self.pair_capture_mono),
-            "pose": {"q_wxyz": _quat_wxyz(self.R),
+            "pose": {"q_wxyz": list(quat_wxyz(self.R)),
                      "t_mm": [float(v) for v in np.asarray(self.t_mm, float).ravel()],
                      "convention": POSE_CONVENTION},
             "pose_frame": self.side,
@@ -634,8 +649,12 @@ class PhotoSession:
         self.rig = rig or RigSnapshot()
         self.policy = policy or CapturePolicy()
         self.started = started
-        self.session_id = started.strftime("%Y%m%d-%H%M%S")
-        self.path = self._make_dir()
+        # The directory first, the name second: `_make_dir` may have to add a
+        # suffix, and an id that did not follow it would put a name in
+        # `session.json`, on the panel and in every `ScanStatus` that no
+        # directory on disk answers to.
+        self.path = self._make_dir(started.strftime("%Y%m%d-%H%M%S"))
+        self.session_id = self.path.name
         self.photos_dir = self.path / "photos"
         self.stripe_dir = self.path / "stripe"
         self.photos_dir.mkdir(exist_ok=True)
@@ -653,15 +672,16 @@ class PhotoSession:
         # filesystem again.
         self._bytes = self._walk()
 
-    def _make_dir(self) -> Path:
-        """The session's own directory. A second session inside the same
-        second gets a suffix rather than sharing — two sessions interleaved in
-        one manifest is not something a reconstruction can untangle."""
-        path = self.root / self.session_id
+    def _make_dir(self, stem: str) -> Path:
+        """The session's own directory, named for `stem`. A second session
+        inside the same second gets a suffix rather than sharing — two
+        sessions interleaved in one manifest is not something a reconstruction
+        can untangle. The caller takes the id from what comes back."""
+        path = self.root / stem
         for suffix in range(1, 100):
             if not path.exists():
                 break
-            path = self.root / f"{self.session_id}-{suffix}"
+            path = self.root / f"{stem}-{suffix}"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -749,6 +769,13 @@ class PhotoWriter:
     in that order, so a crash can leave a file the manifest does not mention —
     which a reconstruction ignores — and never a manifest line without its
     file, which it would try to open.
+
+    Nothing a record does can end the thread. A full disk raises `OSError`, a
+    pose that is not quite a rotation matrix raises `ValueError` out of
+    `manifest`, and either escaping would leave a writer that `start` refuses
+    to raise again — every photograph after it queued and then silently
+    dropped. So one photograph fails, is counted beside `dropped`, and the
+    next one is written.
     """
 
     def __init__(self, session: PhotoSession, depth: int = QUEUE_DEPTH) -> None:
@@ -759,6 +786,7 @@ class PhotoWriter:
         self._lock = threading.Lock()
         self._dropped = 0
         self._written = 0
+        self._failed = 0
 
     @property
     def dropped(self) -> int:
@@ -770,6 +798,15 @@ class PhotoWriter:
     def written(self) -> int:
         with self._lock:
             return self._written
+
+    @property
+    def failed(self) -> int:
+        """Photographs that reached the writer and did not survive it — a
+        full disk, a pose no quaternion comes out of. Counted apart from
+        `dropped`, which is the queue staying ahead of a slow disk: one says
+        the disk cannot keep up, the other that it cannot take the file."""
+        with self._lock:
+            return self._failed
 
     def start(self) -> None:
         if self._thread is not None:
@@ -811,9 +848,13 @@ class PhotoWriter:
                 return
         while True:                     # nothing is running now; finish by hand
             try:
-                self._write(self._q.get_nowait())
+                rec = self._q.get_nowait()
             except queue.Empty:
                 return
+            # Through the same guard the thread uses: this runs inside
+            # `closeEvent`, and a disk that filled on the last photograph of a
+            # session must not take every thread shutdown after it with it.
+            self._write_logged(rec)
 
     def _run(self) -> None:
         while True:
@@ -823,10 +864,22 @@ class PhotoWriter:
                 if self._stop.is_set():
                     return              # stopped AND drained
                 continue
-            try:
-                self._write(rec)
-            except OSError:
-                log.exception("could not write a %s photograph", rec.side)
+            self._write_logged(rec)
+
+    def _write_logged(self, rec: PhotoRecord) -> None:
+        """One photograph, with every way it can fail kept inside this call.
+
+        Broad on purpose. `OSError` is the expected one and was the only one
+        caught; `ValueError` out of `Rotation.from_matrix`, on a pose with a
+        NaN in it, is the one that killed the thread. Neither is worth a
+        photograph, and neither is worth the rest of the session.
+        """
+        try:
+            self._write(rec)
+        except Exception:                                       # noqa: BLE001
+            log.exception("could not write a %s photograph", rec.side)
+            with self._lock:
+                self._failed += 1
 
     def _write(self, rec: PhotoRecord) -> None:
         n = self.session.next_index(rec.side)
@@ -839,7 +892,8 @@ class PhotoWriter:
         # are a few tens of kilobytes of already-incompressible coordinates.
         with npz_path.open("wb") as fh:
             np.savez(fh, **rec.sidecar())
-        line = (json.dumps(rec.manifest(n), separators=(",", ":")) + "\n").encode("utf-8")
+        line = (json.dumps(_jsonable(rec.manifest(n)), separators=(",", ":"),
+                           allow_nan=False) + "\n").encode("utf-8")
         # Binary append, so Windows does not turn the newline into CRLF —
         # which would make the manifest disagree with its own byte count and
         # give every line a stray carriage return.

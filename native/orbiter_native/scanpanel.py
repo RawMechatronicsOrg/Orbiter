@@ -41,6 +41,9 @@ log = logging.getLogger("orbiter_native.scanpanel")
 _TITLE = "color:#7cc4ff; font-weight:600; letter-spacing:2px; font-size:12px;"
 #: The small monospace type the live numbers are shown in.
 _MONO = "color:#8b9aac; font-family:Consolas; font-size:11px;"
+#: The same type for the window's notices, in the colour of something that
+#: did not happen — these are refusals, not readings.
+_NOTICE = "color:#ffb454; font-family:Consolas; font-size:11px;"
 
 #: The reconstruction modes, in the order the operator meets them: texture-only
 #: is minutes and needs no GPU, dense is hours and does.
@@ -97,6 +100,11 @@ class ScanPanel(QFrame):
         #: While a reconstruction runs the one button is Abort, and the mode
         #: it was started in is not up for changing.
         self._reconstructing = False
+        #: The size on disk when the window measured it itself, which it does
+        #: around a reconstruction — where no status is published and the
+        #: writer's counter never saw a byte of what COLMAP wrote. None means
+        #: the status is the one to believe, which it is while a scan runs.
+        self._session_bytes: int | None = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 8, 10, 10)
@@ -298,6 +306,16 @@ class ScanPanel(QFrame):
         self.recon_status.setStyleSheet(_MONO)
         root.addWidget(self.recon_status)
 
+        # The window's own line, and nobody else's: the status bar is
+        # rewritten by the config poll every two seconds, and both labels
+        # above are rebuilt from every ScanStatus that arrives. A refusal the
+        # operator has to read must outlive all three.
+        self.notice = QLabel("")
+        self.notice.setWordWrap(True)
+        self.notice.setStyleSheet(_NOTICE)
+        self.notice.hide()
+        root.addWidget(self.notice)
+
         self.stats = QLabel("idle")
         self.stats.setWordWrap(True)
         self.stats.setStyleSheet(_MONO)
@@ -333,6 +351,9 @@ class ScanPanel(QFrame):
 
     def on_status(self, status: ScanStatus) -> None:
         self._status = status
+        # A status carries the writer's own byte counter, which is the truth
+        # again the moment a pair arrives: whoever spoke last is believed.
+        self._session_bytes = None
         self._refresh()
         self._refresh_photos()
 
@@ -345,6 +366,7 @@ class ScanPanel(QFrame):
         group would name the previous session until scanning started again.
         """
         self._session_id = session_id
+        self._session_bytes = None
         self._refresh_photos()
 
     def _refresh_photos(self) -> None:
@@ -365,10 +387,11 @@ class ScanPanel(QFrame):
         if st is None or st.session_id != self._session_id:
             # A status from the session before this one says nothing about it.
             st = ScanStatus(0, None, 0, session_id=self._session_id)
+        n_bytes = st.session_bytes if self._session_bytes is None else self._session_bytes
         self.photo_stats.setText(
-            f"session {st.session_id} · pass {st.pass_id} · {_size(st.session_bytes)}\n"
+            f"session {st.session_id} · pass {st.pass_id} · {_size(n_bytes)}\n"
             f"photos  L {st.photos_left} · R {st.photos_right} · "
-            f"dropped {st.photos_dropped}")
+            f"dropped {st.photos_dropped} · failed {st.photos_failed}")
         self.btn_folder.setEnabled(True)
         # Nothing to reconstruct from until a photograph exists; while one is
         # running the button is Abort, which is always live.
@@ -442,6 +465,28 @@ class ScanPanel(QFrame):
         self.btn_recon.setText("Abort" if on else "Reconstruct")
         self.mode.setEnabled(not on)
         self._refresh_photos()
+
+    def set_session_bytes(self, n_bytes: int) -> None:
+        """The size on disk as the window measured it.
+
+        `ScanStatus` carries the size too, but it is only published when a
+        pair, a batch or a clear happens — and a reconstruction writes tens of
+        gigabytes with the cameras idle and nothing pairing. Without this the
+        label would sit at the size the run started with until the operator
+        scanned again, which is exactly when the disk filling up matters.
+        """
+        self._session_bytes = int(n_bytes)
+        self._refresh_photos()
+
+    def set_notice(self, text: str) -> None:
+        """Something the window could not do, said where it stays said.
+
+        Empty clears it. This is the panel's one line the status objects do
+        not rewrite: a refused session or a failed export shown in the status
+        bar is gone at the next config poll, two seconds later.
+        """
+        self.notice.setText(text)
+        self.notice.setVisible(bool(text))
 
     def set_recon_status(self, step: str, line: str) -> None:
         """The one status line: which step is running, and the last thing the

@@ -16,6 +16,7 @@ import time
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from orbiter_native.colmapio import quat_wxyz
 from orbiter_native.laser import StripePixels
 from orbiter_native.photos import (
     QUEUE_DEPTH,
@@ -248,6 +249,16 @@ def test_two_sessions_in_one_second_do_not_share_a_directory(tmp_path) -> None:
     first = PhotoSession(tmp_path)
     second = PhotoSession(tmp_path, started=first.started)
     assert first.path != second.path
+    # And each is named for the directory it actually got: the id travels into
+    # session.json, onto the panel and through every ScanStatus, and one that
+    # named the directory the session did NOT get would send a reconstruction
+    # to the other session's files.
+    assert first.session_id == first.path.name
+    assert second.session_id == second.path.name
+    assert first.session_id != second.session_id
+    for session in (first, second):
+        data = json.loads(session.json_path.read_text(encoding="utf-8"))
+        assert data["session_id"] == session.path.name
 
 
 def test_a_new_pass_is_a_new_number(tmp_path) -> None:
@@ -374,3 +385,115 @@ def test_bytes_on_disk_tracks_what_the_writer_wrote(tmp_path) -> None:
     assert session.bytes_on_disk == walked
     assert session.bytes_on_disk > at_open
     assert session.rewalk() == walked
+
+
+def test_a_write_that_fails_does_not_escape_the_hand_drain(tmp_path, monkeypatch) -> None:
+    """`stop` finishes the queue by hand, from `closeEvent`.
+
+    The thread's loop has always caught what a write raises; the drain did
+    not, so a disk that filled up on the last photograph of a session took
+    every thread shutdown after it — the eye workers, the scan worker, the
+    exposure keeper — out through the same exception.
+    """
+    session = PhotoSession(tmp_path)
+    writer = PhotoWriter(session)                   # never started: drains by hand
+    real_write, refused = writer._write, []
+
+    def write(rec) -> None:
+        if not refused:
+            refused.append(rec.side)
+            raise OSError(28, "No space left on device")
+        real_write(rec)
+
+    monkeypatch.setattr(writer, "_write", write)
+    writer.put_nowait(_candidate(mono=1000.0).record("left"))
+    writer.put_nowait(_candidate(mono=1001.0).record("right"))
+    writer.stop()                                   # must return, not raise
+
+    assert refused == ["left"]
+    assert writer.failed == 1
+    # The one behind it went to disk all the same.
+    assert session.counts == {"left": 0, "right": 1}
+    assert (session.photos_dir / "right_0001.jpg").is_file()
+
+
+def test_a_record_that_raises_does_not_kill_the_writer_thread(tmp_path) -> None:
+    """A pose that is not a rotation matrix — one NaN is enough — raises
+    `ValueError` out of `Rotation.from_matrix`, not `OSError`.
+
+    Caught narrowly, that ended the thread; and `start` refuses to raise a
+    second one, so every photograph after it was queued and then dropped in a
+    session that went on looking healthy. One photograph is worth losing here,
+    the rest of the pass is not.
+    """
+    session = PhotoSession(tmp_path)
+    writer = PhotoWriter(session)
+    writer.start()
+    bad = _candidate().record("left")
+    bad.R = np.zeros((3, 3))                        # no quaternion comes out of this
+    writer.put_nowait(bad)
+    writer.put_nowait(_candidate(mono=1001.0).record("right"))
+
+    for _ in range(500):
+        if writer.failed and writer.written:
+            break
+        time.sleep(0.01)
+    assert writer._thread is not None and writer._thread.is_alive()
+    writer.stop()
+
+    assert writer.failed == 1 and writer.written == 1
+    assert session.counts["right"] == 1
+    assert [r["side"] for r in _rows(session)] == ["right"]
+
+
+def _no_constants(name: str):
+    raise AssertionError(f"the manifest is not JSON: it carries a bare {name}")
+
+
+def _rows(session: PhotoSession) -> list[dict]:
+    """Every manifest line, parsed by a reader that refuses JavaScript's
+    `NaN` and `Infinity` — which is what a reader outside Python is."""
+    if not session.manifest_path.exists():
+        return []
+    return [json.loads(line, parse_constant=_no_constants)
+            for line in session.manifest_path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_a_pose_gap_that_is_not_a_number_is_written_as_null(tmp_path) -> None:
+    """A pose one eye solved alone has no gap between two eyes to report, and
+    carries NaN. `json.dumps` writes that as a bare `NaN`, which is not JSON
+    and which every reader that is not Python's refuses — including the ones
+    that would read this manifest to build a model."""
+    session = PhotoSession(tmp_path)
+    writer = PhotoWriter(session)
+    cand = _candidate(source="left", corners=20, gap_deg=float("nan"),
+                      gap_mm=float("nan"))
+    cand.pose_rms_px = float("nan")
+    writer.put_nowait(cand.record("left"))
+    writer.stop()
+
+    assert "NaN" not in session.manifest_path.read_text(encoding="utf-8")
+    row = _rows(session)[0]
+    assert row["pose_gap_deg"] is None and row["pose_gap_mm"] is None
+    assert row["pose_rms_px"] is None
+    # The numbers that ARE numbers are untouched, nulls or no nulls.
+    assert row["pose_smooth_mm"] == 0.21
+    assert row["pose_corners"] == 20 and row["pose_source"] == "left"
+
+
+def test_the_manifest_quaternion_is_the_one_colmap_is_written_with(tmp_path) -> None:
+    """One function in this app turns a rotation into a scalar-first
+    quaternion, and it is `colmapio.quat_wxyz` — the one that canonicalises
+    the sign and has a golden test. A second copy here would be a second thing
+    to get wrong, and the two would disagree for exactly half the rotations."""
+    session = PhotoSession(tmp_path)
+    writer = PhotoWriter(session)
+    # Past a half turn, where q and -q are both the rotation and only one of
+    # them is what gets written.
+    pose = _pose_at([0.0, 0.0, -500.0], 200.0)
+    writer.put_nowait(_candidate(pose).record("left"))
+    writer.stop()
+
+    q = _rows(session)[0]["pose"]["q_wxyz"]
+    assert q == list(quat_wxyz(pose[0]))
+    assert q[0] >= 0.0

@@ -81,6 +81,11 @@ _GUIDE_MS = 250
 #: How often the recon thread's lines are drained into the panel's one status
 #: line. Faster than a person reads them; slower than any step takes.
 _RECON_MS = 250
+#: Recon ticks between two walks of the session directory while a run is
+#: going. At `_RECON_MS` that is two and a half seconds — often enough that
+#: an operator watching the disk fill sees it move, rare enough that a walk
+#: over a dense run's thousands of files is not what the GUI thread does.
+_SIZE_TICKS = 10
 #: How long `closeEvent` waits for the recon thread once it has been asked to
 #: stop. It stops at its child's next line of output, and every step it did
 #: finish is in `recon-state.json`, so a run that outlasts this is resumed.
@@ -238,6 +243,9 @@ class MainWindow(QMainWindow):
         self._recon_lines: list[str] = []
         self._recon_step = ""
         self._recon_last = ""
+        #: Ticks the recon timer has fired, so the size walk can be one in
+        #: `_SIZE_TICKS` of them rather than one per tick.
+        self._recon_ticks = 0
 
         # The guide: which stage, what to do, where to bring the board.
         self.guide = Guide()
@@ -570,18 +578,31 @@ class MainWindow(QMainWindow):
             return self._session
         cfg = self._config
         if cfg is None:
-            self.statusBar().showMessage(
+            # The panel, not the status bar: `_poll_config` rewrites that
+            # every two seconds, and this is a refusal the operator has to
+            # read before understanding why the checkbox came back up.
+            self.scan.set_notice(
                 "no rig config yet — the server has not answered, so a session "
                 "would carry no intrinsics, no pair and no board. Photographs "
                 "stay off until it does.")
             return None
-        session = PhotoSession(
-            rig=rig_snapshot(cfg, self.scan.params().volume, self._wh))
-        writer = PhotoWriter(session)
-        writer.start()
+        try:
+            session = PhotoSession(
+                rig=rig_snapshot(cfg, self.scan.params().volume, self._wh))
+            writer = PhotoWriter(session)
+            writer.start()
+        except Exception as exc:                              # noqa: BLE001
+            # A read-only sessions root, a disk with nothing left on it, a
+            # thread the OS refused: raising out of a Qt slot would take the
+            # toggle with it and leave the window running with no session and
+            # no word about why.
+            log.exception("the photo session could not be opened")
+            self.scan.set_notice(f"could not open a photo session — {exc}")
+            return None
         self.scanner.set_session(session, writer)
         self._session, self._writer = session, writer
         self.scan.set_session(session.session_id)
+        self.scan.set_notice("")
         log.info("photo session %s in %s", session.session_id, session.path)
         self.statusBar().showMessage(f"photo session {session.session_id} — {session.path}")
         return session
@@ -644,14 +665,20 @@ class MainWindow(QMainWindow):
             return
         session = self._session
         if session is None:
-            self.statusBar().showMessage(
+            self.scan.set_notice(
                 "no session yet — take some photographs before reconstructing")
             return
         try:
             n = self.scanner.export(str(session.path / "laser.ply"))
-        except OSError as exc:
-            self.statusBar().showMessage(f"could not write laser.ply — {exc}")
+        except Exception as exc:                              # noqa: BLE001
+            # Not just `OSError`: `export` walks the cloud and writes a PLY,
+            # and anything it raises out of this slot would skip `closeEvent`
+            # on the way out. The panel keeps the sentence; the status bar
+            # would lose it at the next config poll.
+            log.exception("laser.ply could not be written")
+            self.scan.set_notice(f"could not write laser.ply — {exc}")
             return
+        self.scan.set_notice("")
         self._recon_cancel = threading.Event()
         self._recon_step, self._recon_last = "", f"laser.ply: {n} points"
         with self._recon_lock:
@@ -668,8 +695,12 @@ class MainWindow(QMainWindow):
                 log.exception("the reconstruction raised")
                 self._recon_line(f"{exc.__class__.__name__}: {exc}")
 
-        self._recon_thread = threading.Thread(target=work, name="recon", daemon=True)
-        self._recon_thread.start()
+        # Started first, assigned second: `start` can raise, and a
+        # `_recon_thread` holding a thread that never ran would wedge the
+        # double-start guard above for the rest of the session.
+        thread = threading.Thread(target=work, name="recon", daemon=True)
+        thread.start()
+        self._recon_thread = thread
         self.scan.set_reconstructing(True)
         self.scan.set_recon_status(self._recon_step, self._recon_last)
         self._recon_timer.start(_RECON_MS)
@@ -685,8 +716,40 @@ class MainWindow(QMainWindow):
             self._recon_lines.append(line)
 
     def _recon_tick(self) -> None:
-        """Swap the accumulated lines out and show the last one, beside the
-        step that is running. `recon.log` keeps every one of them."""
+        """Show what the run has said, how much of the disk it has taken, and
+        — once it has ended — hand the button back.
+
+        The order matters at the end. The lines are drained, the thread is
+        asked whether it is still running, and if it is not they are drained
+        once more: this is the tick that stops the timer, so a line written
+        between the first drain and the question has nobody left to take it.
+        """
+        self._recon_ticks += 1
+        self._drain_recon_lines()
+        thread = self._recon_thread
+        if thread is None:
+            return
+        if thread.is_alive():
+            # A dense run fills the disk for an hour with the cameras idle:
+            # nothing pairs, so no `ScanStatus` is published and the size
+            # label would sit at what the run started with. The walk is not
+            # free, which is why it is one tick in `_SIZE_TICKS` and not this
+            # one.
+            if self._recon_ticks % _SIZE_TICKS == 0:
+                self._show_session_size()
+            return
+        self._recon_thread = None
+        # Once more, now the thread has ended: whatever it wrote between the
+        # swap above and its last breath is still in the list, and the timer
+        # that would have taken it is about to stop.
+        self._drain_recon_lines()
+        self._recon_timer.stop()
+        self.scan.set_reconstructing(False)
+        self._show_session_size()
+
+    def _drain_recon_lines(self) -> None:
+        """Take every line the recon thread has written since the last call,
+        and show the newest of them beside the step it belongs to."""
         with self._recon_lock:
             lines, self._recon_lines = self._recon_lines, []
         for line in lines:
@@ -696,16 +759,24 @@ class MainWindow(QMainWindow):
         if lines:
             self._recon_last = lines[-1]
             self.scan.set_recon_status(self._recon_step, self._recon_last)
-        thread = self._recon_thread
-        if thread is not None and not thread.is_alive():
-            self._recon_thread = None
-            self._recon_timer.stop()
-            self.scan.set_reconstructing(False)
-            if self._session is not None:
-                # The run wrote gigabytes through paths the writer's byte
-                # counter never saw, so the size label is re-measured once —
-                # here, and not on any tick.
-                self._session.rewalk()
+
+    def _show_session_size(self) -> None:
+        """Measure the session again and put the number on the panel.
+
+        A reconstruction writes gigabytes through paths the writer's byte
+        counter never sees, so the counter has to be replaced by a walk rather
+        than added to. Called from a Qt timer, so what the walk can raise —
+        a file that vanished between `rglob` and `stat`, a directory that went
+        away — is caught here and not out of the slot.
+        """
+        session = self._session
+        if session is None:
+            return
+        try:
+            self.scan.set_session_bytes(session.rewalk())
+        except Exception as exc:                              # noqa: BLE001
+            log.exception("the session could not be measured")
+            self.scan.set_notice(f"could not measure {session.path} — {exc}")
 
     def _abort_recon(self) -> None:
         """Abort is the cancel Event, and nothing else: the chain stops at its

@@ -29,6 +29,7 @@ from orbiter_native import scanworker
 from orbiter_native.detect import BoardHit
 from orbiter_native.laser import StripePixels
 from orbiter_native.photos import (
+    STILL_HISTORY,
     CapturePolicy,
     EyeSnapshot,
     PhotoSession,
@@ -442,6 +443,7 @@ class _Watchful:
         self.decisions = 0
         self.records: list = []
         self.dropped = 0
+        self.failed = 0
 
     def decide(self, *a, **kw):
         self.decisions += 1
@@ -570,6 +572,75 @@ def test_status_carries_the_sessions_counters(tmp_path, board) -> None:
 
     status = sw.status.take()
     assert (status.photos_left, status.photos_right) == (1, 1)
-    assert status.photos_dropped == 0
+    # Both writer faults travel, and they are not the same fault: a full queue
+    # means the disk is behind the cameras, a failed write means it would not
+    # take the file at all.
+    assert status.photos_dropped == 0 and status.photos_failed == 0
     assert status.session_id == session.session_id
     assert status.session_bytes == session.bytes_on_disk > 0
+
+
+class _SwapAtTheDoor:
+    """The photo lock, with a session swap wired to the moment it is taken.
+
+    That moment is the seam this is about: "Clear cloud" closes one session
+    and opens the next between the instant `_photos` settles which writer it
+    is talking to and the instant it settles which session it is judging
+    against. The swap assigns rather than calling `set_session`, because it
+    runs inside the very lock `set_session` would take.
+    """
+
+    def __init__(self, lock, swap) -> None:
+        self._lock, self._swap = lock, swap
+        self.swapped = False
+
+    def __enter__(self) -> _SwapAtTheDoor:
+        self._lock.acquire()
+        if not self.swapped:
+            self.swapped = True
+            self._swap()
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        self._lock.release()
+        return False
+
+
+def test_a_session_swapped_mid_decision_takes_the_photograph_with_it(
+        tmp_path, board) -> None:
+    """The session and the writer are one thing and have to be read as one.
+
+    Read apart, a candidate is judged against the session "Clear cloud" has
+    just opened and handed to the writer it has just stopped: the photograph
+    never reaches a disk, nothing says so, and `_kept` records it as taken —
+    so the policy refuses the retake as a repeat viewpoint. The operator loses
+    a photograph and a reason at the same time.
+    """
+    first, second = _session(tmp_path), _session(tmp_path)
+    old_writer, new_writer = PhotoWriter(first), PhotoWriter(second)
+    sw = _worker(first, old_writer)
+    sw.set_active(True)
+
+    def swap() -> None:
+        sw._session, sw._writer = second, new_writer
+
+    # Up to the pair before the first photograph. The smoother hands poses
+    # over late and the policy wants `STILL_HISTORY` of them, so the pair that
+    # earns the first file is counted to rather than written down.
+    li, ri, ids, R, t = _board_in_both_eyes(board)
+    i = 0
+    while len(sw._pose_hist) < STILL_HISTORY - 1:
+        assert i < 40, "no photograph was ever going to be taken"
+        _pair(sw, i, R=R, t=t, li=li, ri=ri, ids=ids)
+        i += 1
+    assert old_writer._q.qsize() == 0 and new_writer._q.qsize() == 0
+
+    sw._photo_lock = _SwapAtTheDoor(sw._photo_lock, swap)
+    _pair(sw, i, R=R, t=t, li=li, ri=ri, ids=ids)
+
+    old_writer.stop()                                      # neither was started:
+    new_writer.stop()                                      # both drain by hand
+    assert sw._photo_lock.swapped
+    assert first.counts == {"left": 0, "right": 0}, "the stopped writer took it"
+    assert second.counts == {"left": 1, "right": 1}
+    assert [m["side"] for m in _manifest(second)] == ["left", "right"]

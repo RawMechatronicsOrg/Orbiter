@@ -299,11 +299,14 @@ class ScanStatus:
     n_confident: int = -1
     n_lonely: int = 0
     n_flicker: int = 0
-    #: Photographs written this session, per side, and how many the writer
-    #: threw away because the disk fell behind the cameras.
+    #: Photographs written this session, per side; how many the writer threw
+    #: away because the disk fell behind the cameras; and how many it took and
+    #: could not put down. The last two are different faults with different
+    #: fixes, so they are counted apart and shown apart.
     photos_left: int = 0
     photos_right: int = 0
     photos_dropped: int = 0
+    photos_failed: int = 0
     #: The session's directory name, the pass the operator is on, and what
     #: the session occupies on disk — all empty or zero without a session.
     session_id: str = ""
@@ -535,6 +538,19 @@ class ScanWorker:
             self._publish(None, None)
 
     def clear(self) -> None:
+        """Empty the cloud, and let the photographs riding the pending frames
+        out rather than into the bin.
+
+        One thing about those photographs is worth knowing before their
+        sidecars are read. Their frames are emitted without `_place`, because
+        the cloud their points would be cropped into is being emptied in the
+        same call — so their `kept_xyz_board` stand where the frame's OWN
+        pose put them, while the manifest line beside them carries the
+        smoothed pose, as every other photograph's does. The two differ by
+        `pose_smooth_mm`, which is sub-millimetre on a rig standing still, and
+        it can only ever affect the frames the smoother was holding: at most
+        six, and three in steady state.
+        """
         emitted: list[tuple] = []
         with self._lock:
             self._batch.clear()
@@ -845,12 +861,16 @@ class ScanWorker:
         carried across the pair, because the two cameras stand 200 mm apart
         and one pose written to both would be wrong by the baseline.
         """
-        writer = self._writer
-        if writer is None or not emitted:
+        if not emitted:
             return
+        # Both under the one lock, and never one outside it: "Clear cloud"
+        # swaps the pair mid-pair, and a candidate judged against the new
+        # session but handed to the old, stopped writer is lost without a
+        # word — and `_kept` then says it was taken, which suppresses the
+        # retake.
         with self._photo_lock:
-            session = self._session
-            if session is None:
+            session, writer = self._session, self._writer
+            if session is None or writer is None:
                 return
             policy = session.policy
             for (f, _motion, own_t, cand), r_s, t_s in emitted:
@@ -1066,6 +1086,7 @@ class ScanWorker:
         st.photos_left = counts.get("left", 0)
         st.photos_right = counts.get("right", 0)
         st.photos_dropped = 0 if writer is None else writer.dropped
+        st.photos_failed = 0 if writer is None else writer.failed
         if session is not None:
             st.session_id = session.session_id
             st.pass_id = session.pass_id
