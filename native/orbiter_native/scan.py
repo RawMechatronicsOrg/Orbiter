@@ -72,6 +72,7 @@ from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
+from scipy.spatial import cKDTree
 
 from .laser import BLOB_GAP_PX, StripePixels, stripe_centroids
 from .laserplane import LaserPlane, rays
@@ -1019,23 +1020,103 @@ class PointCloud:
         return write_ply(path, self.points(), self.colors())
 
 
-def write_ply(path: str, points: np.ndarray, rgb: np.ndarray | None = None) -> int:
-    """Write (N, 3) points, and (N, 3) uint8 colours when given, as a binary
-    little-endian PLY. Returns the point count. Binary because an ASCII
-    writer loops in Python: a million points took seconds, on the GUI
-    thread, behind the Export button."""
+#: How many points are put through a `cKDTree` query at a time. A neighbour
+#: table is (chunk, k, 3) float64, so a million-point cloud queried whole
+#: would ask for gigabytes for nothing; a chunk of this size holds tens of
+#: megabytes and the tree is queried once per chunk, not once per point.
+KD_CHUNK = 100_000
+
+
+def normals_pca(points: np.ndarray, k: int = 16) -> np.ndarray:
+    """A unit normal per (N, 3) point, from the plane its `k` nearest
+    neighbours lie in.
+
+    The neighbourhood's covariance has its smallest eigenvalue across the
+    surface and the other two along it, so the matching eigenvector is the
+    normal — a plane fit that needs no orientation, no grid and no ordering,
+    which is what a scan cloud is. `k` is 16 rather than 6 or 8 because the
+    laser cloud carries about a millimetre of noise and a small
+    neighbourhood fits the noise instead of the surface.
+
+    The SIGN is arbitrary here — a plane has two normals and PCA cannot
+    choose between them. `orient_normals` is what makes them a surface's
+    outward normals, and Poisson needs that.
+    """
+    pts = np.asarray(points, np.float64).reshape(-1, 3)
+    if not len(pts):
+        return np.empty((0, 3))
+    k = int(min(max(k, 3), len(pts)))
+    tree = cKDTree(pts)
+    out = np.empty_like(pts)
+    for lo in range(0, len(pts), KD_CHUNK):
+        hi = min(lo + KD_CHUNK, len(pts))
+        _, idx = tree.query(pts[lo:hi], k=k, workers=-1)
+        nb = pts[idx.reshape(hi - lo, -1)]
+        nb = nb - nb.mean(axis=1, keepdims=True)
+        cov = np.einsum("nki,nkj->nij", nb, nb)
+        # `eigh` returns eigenvalues ascending, so column 0 is the direction
+        # the neighbourhood spreads least in: across the surface.
+        out[lo:hi] = np.linalg.eigh(cov)[1][:, :, 0]
+    norm = np.linalg.norm(out, axis=1, keepdims=True)
+    return np.divide(out, norm, out=np.zeros_like(out), where=norm > 1e-12)
+
+
+def orient_normals(normals: np.ndarray, points: np.ndarray,
+                   camera_centres: np.ndarray) -> np.ndarray:
+    """Flip each normal to face the camera centre nearest its point.
+
+    PCA gives a normal's line, not its direction, and Poisson reconstructs
+    the wrong side of the surface — or nothing at all — from normals that
+    disagree with their neighbours. A scanned surface was seen from
+    somewhere, so "outward" is "toward whichever camera saw it": the
+    nearest centre is the best guess available, and on a convex sweep it is
+    the right one everywhere. Returns a new array; the input is untouched.
+    """
+    n = np.asarray(normals, np.float64).reshape(-1, 3).copy()
+    pts = np.asarray(points, np.float64).reshape(-1, 3)
+    cams = np.asarray(camera_centres, np.float64).reshape(-1, 3)
+    if not len(n) or not len(cams):
+        return n
+    _, j = cKDTree(cams).query(pts, k=1, workers=-1)
+    toward = cams[np.atleast_1d(j)] - pts
+    flip = np.einsum("ij,ij->i", n, toward) < 0.0
+    n[flip] *= -1.0
+    return n
+
+
+def write_ply(path: str, points: np.ndarray, rgb: np.ndarray | None = None,
+              normals: np.ndarray | None = None) -> int:
+    """Write (N, 3) points, their (N, 3) uint8 colours and their (N, 3)
+    normals when given, as a binary little-endian PLY. Returns the point
+    count. Binary because an ASCII writer loops in Python: a million points
+    took seconds, on the GUI thread, behind the Export button.
+
+    Property order is `x y z nx ny nz red green blue` — COLMAP's own order
+    in `fused.ply`, so a file we write and a file we read look alike.
+    """
     p = np.ascontiguousarray(np.asarray(points, np.float64).reshape(-1, 3).astype("<f4"))
     props = "property float x\nproperty float y\nproperty float z\n"
-    if rgb is None:
-        body = p.tobytes()
-    else:
+    fields: list[tuple[str, str]] = [("x", "<f4"), ("y", "<f4"), ("z", "<f4")]
+    columns = [p[:, 0], p[:, 1], p[:, 2]]
+    if normals is not None:
+        # float32 like the coordinates: a normal is a direction, and the
+        # eighth digit of one has never told anybody anything.
+        props += "property float nx\nproperty float ny\nproperty float nz\n"
+        nrm = np.asarray(normals, np.float64).reshape(-1, 3).astype("<f4")
+        fields += [("nx", "<f4"), ("ny", "<f4"), ("nz", "<f4")]
+        columns += [nrm[:, 0], nrm[:, 1], nrm[:, 2]]
+    if rgb is not None:
         # red/green/blue as uchar: what every viewer, and `read_ply`, expects.
         props += "property uchar red\nproperty uchar green\nproperty uchar blue\n"
-        rgb = np.asarray(rgb, np.uint8).reshape(-1, 3)
-        rec = np.empty(len(p), dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
-                                      ("red", "u1"), ("green", "u1"), ("blue", "u1")])
-        rec["x"], rec["y"], rec["z"] = p[:, 0], p[:, 1], p[:, 2]
-        rec["red"], rec["green"], rec["blue"] = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+        col = np.asarray(rgb, np.uint8).reshape(-1, 3)
+        fields += [("red", "u1"), ("green", "u1"), ("blue", "u1")]
+        columns += [col[:, 0], col[:, 1], col[:, 2]]
+    if len(fields) == 3:
+        body = p.tobytes()
+    else:
+        rec = np.empty(len(p), dtype=fields)
+        for (name, _), column in zip(fields, columns):
+            rec[name] = column
         body = rec.tobytes()
     header = ("ply\nformat binary_little_endian 1.0\n"
               f"element vertex {len(p)}\n" + props + "end_header\n")
@@ -1154,8 +1235,23 @@ _PLY_TYPES = {
 
 def read_ply(path: str) -> tuple[np.ndarray, np.ndarray | None]:
     """A PLY's vertices as (N, 3) float64 x/y/z and, when it carries them,
-    (N, 3) uint8 colours. Binary little-endian (what `write_ply` writes) and
-    ASCII; other elements and properties are skipped, not refused."""
+    (N, 3) uint8 colours — `read_ply_full` without the normals, for the
+    callers that never wanted them."""
+    xyz, rgb, _ = read_ply_full(path)
+    return xyz, rgb
+
+
+def read_ply_full(path: str) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+    """A PLY's vertices as (N, 3) float64 x/y/z and, when it carries them,
+    (N, 3) uint8 colours and (N, 3) float64 normals. Binary little-endian
+    (what `write_ply` writes, and what COLMAP's `fused.ply` is) and ASCII;
+    other elements and properties are skipped, not refused.
+
+    **Its scope is point clouds** — `fused.ply` and `merged.ply`. It does
+    not read `mesh_texturer`'s output: that PLY carries faces and per-face
+    texcoords, and the GLB step reads it with trimesh. Two files, two
+    readers, said plainly so nobody widens this one into a mesh parser.
+    """
     with open(path, "rb") as f:
         head = b""
         while True:
@@ -1180,7 +1276,7 @@ def read_ply(path: str) -> tuple[np.ndarray, np.ndarray | None]:
                 else:
                     elements[-1][2].append((words[2], words[1]))
         body = f.read()
-    xyz = rgb = None
+    xyz = rgb = nrm = None
     offset = 0
     for name, count, props in elements:
         if any(t.startswith("list") for _, t in props):
@@ -1212,9 +1308,458 @@ def read_ply(path: str) -> tuple[np.ndarray, np.ndarray | None]:
             xyz = np.column_stack([arr["x"], arr["y"], arr["z"]]).astype(np.float64)
             if {"red", "green", "blue"} <= names:
                 rgb = np.column_stack([arr["red"], arr["green"], arr["blue"]]).astype(np.uint8)
+            if {"nx", "ny", "nz"} <= names:
+                nrm = np.column_stack([arr["nx"], arr["ny"], arr["nz"]]).astype(np.float64)
     if xyz is None:
         raise ValueError("no vertex element")
-    return xyz, rgb
+    return xyz, rgb, nrm
+
+
+@dataclass
+class MergeParams:
+    """The ten thresholds the laser/dense merge is decided by.
+
+    One dataclass so a threshold cannot be passed to one place and not
+    another, and so `session.json` can carry the whole set verbatim and a
+    run be reproduced from it. The candidate radius is deliberately NOT an
+    eleventh field: it is `hypot(support_mm, max_normal_mm)` and would
+    otherwise be settable inconsistently with the two numbers that define
+    it.
+    """
+
+    #: The lateral radius support is counted in — the plane perpendicular
+    #: to the local laser normal. It is what decides how wide a hole dense
+    #: may fill: a gap narrower than about twice this is supported from
+    #: both edges at once, so the laser keeps it.
+    support_mm: float = 3.0
+    #: Laser neighbours needed within `support_mm` laterally for the laser
+    #: to count as having covered the surface under a dense point.
+    support_min: int = 5
+    #: How far along the normal a supported dense point may sit and still
+    #: be a plausible measurement of the same surface. Beyond it the point
+    #: hovers, and is a floater rather than hole fill. Also half the height
+    #: of the support cylinder the candidate ball circumscribes.
+    max_normal_mm: float = 10.0
+    #: An unsupported dense point this close to the nearest laser point is
+    #: on the rim of a hole — no lateral coverage, but the laser surface
+    #: stops right here — and is kept.
+    outlier_mm: float = 4.0
+    #: The radius the dense cloud's own local density is counted in.
+    density_mm: float = 1.5
+    #: An unsupported dense point away from any rim is kept when its dense
+    #: neighbour count is at least this fraction of the MEASURED median —
+    #: a bar relative to what this dense cloud actually is, because an
+    #: absolute one sat an order of magnitude below real dense density and
+    #: admitted every speck it was written to reject.
+    patch_frac: float = 0.3
+    #: G1: the largest signed-residual median a gated cell may carry.
+    #: 1.5 rather than 1.0 because PatchMatch itself carries a sub-mm
+    #: systematic offset, and a limit tighter than the tool's own bias
+    #: refuses correct runs.
+    agree_mm: float = 1.5
+    #: Supported points a cell needs before its median is gated at all.
+    band_min: int = 500
+    #: G1b: below this many supported points there is nothing to measure a
+    #: bias over, and the merge refuses.
+    min_supported: int = 2000
+    #: The fraction G2 (overlap) and G3 (floaters) warn at. Both are
+    #: warnings: dark and specular objects legitimately give the laser very
+    #: little coverage, and refusing there would refuse the case dense
+    #: exists to rescue.
+    warn_frac: float = 0.25
+
+    @property
+    def candidate_radius_mm(self) -> float:
+        """The smallest ball containing the support cylinder of radius
+        `support_mm` and half-height `max_normal_mm` — the query radius,
+        ≈ 10.44 mm at the defaults. Wide on purpose: a ball of `support_mm`
+        makes the lateral test a no-op, since lateral distance never
+        exceeds Euclidean distance."""
+        return float(np.hypot(self.support_mm, self.max_normal_mm))
+
+
+#: Candidates kept per dense point, nearest first. A point sitting in a
+#: thicket of laser returns must not drag the whole thicket into its normal
+#: estimate, and 64 is far past what `support_min` (5) ever needs.
+CANDIDATE_CAP = 64
+#: G1's z slabs: equal-HEIGHT quarters of the volume's z range, not count
+#: quartiles — a count quartile moves with the cloud, and two runs are then
+#: not comparable.
+Z_SLABS = 4
+#: G4 warns below this keep fraction: dense added nothing. The run is not
+#: wrong, it is pointless, and the operator should know before spending
+#: another hour.
+KEEP_FLOOR = 0.01
+#: The eight normal-direction octants, indexed by `(x >= 0) << 2 | (y >= 0)
+#: << 1 | (z >= 0)`. The deadband at zero — `sign(x) = +` when `x` is
+#: exactly 0 — keeps an axis-aligned face in one octant instead of
+#: scattering it across two at the mercy of the last bit.
+_OCTANTS = tuple(("+" if x else "-") + ("+" if y else "-") + ("+" if z else "-")
+                 for x in (0, 1) for y in (0, 1) for z in (0, 1))
+_CELL_KEYS = tuple(f"z{b + 1}:{o}" for b in range(Z_SLABS) for o in _OCTANTS)
+
+
+@dataclass
+class MergeCells:
+    """G1's evidence: the signed residual's median per z-slab × normal-octant
+    cell, and which cells were too thin to gate."""
+
+    #: z slabs by normal octants.
+    grid: tuple[int, int] = (Z_SLABS, 8)
+    #: Cells holding at least `band_min` supported points, and therefore
+    #: able to refuse the run.
+    gated: int = 0
+    #: The gated cell with the largest `|median|` — the one a refusal names
+    #: first. Its median and count are `medians_mm[worst]` and
+    #: `counts[worst]`; None when nothing was gated.
+    worst: str | None = None
+    #: One entry per GATED cell, keyed `z<band>:<sign pattern of n>`.
+    medians_mm: dict[str, float] = field(default_factory=dict)
+    counts: dict[str, int] = field(default_factory=dict)
+    #: Cells that held points but fewer than `band_min` of them. They carry
+    #: no median and cannot refuse the run however far off they are.
+    skipped: list[str] = field(default_factory=list)
+
+
+@dataclass
+class MergeStats:
+    """Everything the merge measured, reported whether or not it refused."""
+
+    params: MergeParams
+    #: `hypot(support_mm, max_normal_mm)`, so a reader never has to
+    #: recompute it.
+    candidate_radius_mm: float
+    laser_points: int
+    #: The POST-CROP dense count — the points inside the `ScanVolume` — and
+    #: the denominator of every fraction below.
+    dense_points: int
+    #: Dense points the laser laterally supports, with a residual inside
+    #: `max_normal_mm`: dropped, and the population G1 measures.
+    dense_supported: int
+    #: Dense points kept as hole fill, by the rim rule or the patch rule.
+    dense_kept: int
+    #: Dropped as noise: supported but hovering past `max_normal_mm`, or
+    #: unsupported, away from any rim and in no coherent dense patch.
+    floaters: int
+    #: `dense_supported / dense_points` and `dense_kept / dense_points`.
+    #: Two DIFFERENT numbers, not one seen from two sides — they differ by
+    #: the floater fraction, and the kept set is defined by absent support
+    #: rather than by distance.
+    agree_frac: float
+    keep_frac: float
+    cells: MergeCells
+    #: The noise figure beside the cells: the 90th percentile of the
+    #: supported points' unsigned residual. Reported, never gated on.
+    p90_abs_residual_mm: float
+    #: The kept set's own median distance to the laser cloud.
+    kept_median_mm: float
+    #: The density the patch bar was measured against: the median dense
+    #: neighbour count within `density_mm` over the supported points.
+    median_dense_neighbours: float
+    refused: bool = False
+    #: Which gate fired: "G1" (registration) or "G1b" (support population).
+    refused_by: str | None = None
+    #: The refusal, in full, naming the working escape.
+    message: str | None = None
+    #: G2, G3 and G4, which warn and never refuse.
+    warnings: list[str] = field(default_factory=list)
+
+
+def _grouped(n: int) -> str:
+    """`2914501` as `2 914 501` — the refusal messages quote counts in the
+    millions, and a wall of digits hides an order of magnitude."""
+    return f"{int(n):,}".replace(",", " ")
+
+
+def _neighbour_counts(pts: np.ndarray, radius: float) -> np.ndarray:
+    """How many points of `pts` lie within `radius` of each — itself
+    included, which cancels between the per-point count and the median it
+    is compared against."""
+    if not len(pts):
+        return np.empty(0, np.int64)
+    tree = cKDTree(pts)
+    out = np.empty(len(pts), np.int64)
+    for lo in range(0, len(pts), KD_CHUNK):
+        hi = min(lo + KD_CHUNK, len(pts))
+        out[lo:hi] = tree.query_ball_point(pts[lo:hi], radius, workers=-1,
+                                           return_length=True)
+    return out
+
+
+def _support_and_residual(laser: np.ndarray, laser_n: np.ndarray, dense: np.ndarray,
+                          params: MergeParams
+                          ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Per dense point: is the laser under it, how far off the laser surface
+    it sits along that surface's normal, how far the nearest laser point is,
+    and the local laser normal — as `(supported, residual, nearest, normal)`.
+
+    The candidate ball is `hypot(support_mm, max_normal_mm)` wide, capped at
+    the `CANDIDATE_CAP` nearest, which is exactly `query(k=CANDIDATE_CAP,
+    distance_upper_bound=r)`. Support is then counted LATERALLY — in the
+    plane perpendicular to the mean neighbour normal — whatever the
+    neighbours' offset along it. That last clause is the whole rule: it is
+    what lets a point 4 mm above covered surface be recognised as sitting
+    over covered surface, which no ball of `support_mm` could ever do.
+    """
+    n = len(dense)
+    supported = np.zeros(n, bool)
+    resid = np.zeros(n)
+    nearest = np.full(n, np.inf)
+    normal = np.zeros((n, 3))
+    if not len(laser) or not n:
+        return supported, resid, nearest, normal
+    tree = cKDTree(laser)
+    k = min(CANDIDATE_CAP, len(laser))
+    for lo in range(0, n, KD_CHUNK):
+        hi = min(lo + KD_CHUNK, n)
+        p = dense[lo:hi]
+        dist, idx = tree.query(p, k=k, distance_upper_bound=params.candidate_radius_mm,
+                               workers=-1)
+        dist = dist.reshape(len(p), -1)
+        idx = idx.reshape(len(p), -1)
+        hit = np.isfinite(dist)
+        # A miss comes back as `len(laser)`, which would index out of range.
+        idx = np.where(hit, idx, 0)
+        m = hit.sum(axis=1)
+        nearest[lo:hi] = dist[:, 0]              # inf when the ball is empty
+        d = np.where(hit, dist, 0.0)
+        q = laser[idx]                           # (chunk, k, 3)
+        seen = hit[..., None]
+        centroid = (q * seen).sum(axis=1) / np.maximum(m, 1)[:, None]
+        nsum = (laser_n[idx] * seen).sum(axis=1)
+        length = np.linalg.norm(nsum, axis=1, keepdims=True)
+        # Opposing normals inside one ball cancel — two faces of a thin
+        # wall, say. The nearest neighbour's own normal is then the only
+        # honest local frame left.
+        nrm = np.where(length > 1e-9, nsum / np.maximum(length, 1e-12), laser_n[idx[:, 0]])
+        along = (np.einsum("ckj,cj->ck", q, nrm)
+                 - np.einsum("cj,cj->c", p, nrm)[:, None])
+        lateral_sq = np.maximum(d ** 2 - along ** 2, 0.0)
+        close = hit & (lateral_sq <= params.support_mm ** 2)
+        supported[lo:hi] = close.sum(axis=1) >= params.support_min
+        resid[lo:hi] = np.where(m > 0, np.einsum("cj,cj->c", p - centroid, nrm), 0.0)
+        normal[lo:hi] = nrm
+    return supported, resid, nearest, normal
+
+
+def _cells(z: np.ndarray, normal: np.ndarray, resid: np.ndarray, params: MergeParams,
+           volume: ScanVolume) -> tuple[MergeCells, list[str]]:
+    """G1's cells over the supported points, and the gated keys whose median
+    exceeds `agree_mm`, worst first.
+
+    Cells are z slab × normal octant. The octants are what make the gate
+    work on a closed object: normals point outward, so a translation reads
+    +δ on one side and −δ on the other, and z slabs alone average the two
+    halves to a median of zero — a misregistration the gate would wave
+    through. Split by normal direction and the halves land in different
+    cells with opposite signs, and both fail.
+    """
+    out = MergeCells()
+    if not len(z):
+        return out, []
+    step = (volume.height_mm - volume.floor_mm) / Z_SLABS
+    band = np.clip(((z - volume.floor_mm) / max(step, 1e-9)).astype(np.int64), 0, Z_SLABS - 1)
+    octant = (((normal[:, 0] >= 0).astype(np.int64) << 2)
+              | ((normal[:, 1] >= 0).astype(np.int64) << 1)
+              | (normal[:, 2] >= 0).astype(np.int64))
+    cell = band * 8 + octant
+    counts = np.bincount(cell, minlength=len(_CELL_KEYS))
+    order = np.argsort(cell, kind="stable")
+    start = np.concatenate([[0], np.cumsum(counts)])
+    for c in np.flatnonzero(counts):
+        key = _CELL_KEYS[c]
+        if counts[c] < params.band_min:
+            out.skipped.append(key)
+            continue
+        out.medians_mm[key] = float(np.median(resid[order[start[c]: start[c + 1]]]))
+        out.counts[key] = int(counts[c])
+    out.gated = len(out.medians_mm)
+    if out.medians_mm:
+        out.worst = max(out.medians_mm, key=lambda k: abs(out.medians_mm[k]))
+    failing = sorted((k for k, v in out.medians_mm.items() if abs(v) > params.agree_mm),
+                     key=lambda k: -abs(out.medians_mm[k]))
+    return out, failing
+
+
+#: How many failing cells a G1 refusal lists before saying how many more.
+_CELLS_LISTED = 4
+
+
+def _g1_message(cells: MergeCells, failing: list[str], p90: float,
+                params: MergeParams, volume: ScanVolume) -> str:
+    """The registration refusal, naming the cells and the working escape."""
+    step = (volume.height_mm - volume.floor_mm) / Z_SLABS
+    worst = failing[0]
+    band = int(worst[1]) - 1
+    lo = volume.floor_mm + band * step
+    axes = " ".join(s + a for s, a in zip(worst.split(":")[1], "xyz"))
+    lines = [
+        f"merge refused: the clouds disagree by {cells.medians_mm[worst]:+.2f} mm in cell "
+        f"{worst} (z {lo:.0f}-{lo + step:.0f} mm,",
+        f"  normals {axes}) — {len(failing)} of {cells.gated} gated cells exceed the "
+        f"{params.agree_mm:g} mm limit:",
+    ]
+    for key in failing[:_CELLS_LISTED]:
+        lines.append(f"    {key}  {cells.medians_mm[key]:+.2f} mm over "
+                     f"{_grouped(cells.counts[key])} points")
+    if len(failing) > _CELLS_LISTED:
+        lines[-1] += f"   … and {len(failing) - _CELLS_LISTED} more"
+    lines += [
+        "  Opposite normal octants disagreeing in SIGN at similar magnitude is a",
+        "  translation; a bias growing across the z slabs is a rotation or a scale",
+        f"  error. Neither is noise (p90 |residual| {p90:.1f} mm, which gates nothing).",
+        "  Check the board pose and which pass the photos came from.",
+        "  laser.ply and fused.ply are both intact.",
+        "  Fix and re-run with --restart, or run --mode texture-only to mesh and",
+        "  texture the laser cloud from what is already on disk.",
+    ]
+    return "\n".join(lines)
+
+
+def _g1b_message(dense_supported: int, dense_points: int, params: MergeParams) -> str:
+    """The support-population refusal. A uniform offset larger than the
+    candidate radius empties every ball and reads exactly like this; a
+    4-10 mm one does not, and G1 names its cells instead."""
+    r = params.candidate_radius_mm
+    return "\n".join([
+        "merge refused: no overlap between the laser cloud and the dense cloud",
+        f"  — only {_grouped(dense_supported)} dense points have lateral laser support "
+        f"(floor {_grouped(params.min_supported)}, of",
+        f"  {_grouped(dense_points)} in the volume). Every other point's {r:.1f} mm "
+        "candidate ball came",
+        "  back empty or too thin, so there is nothing to measure a bias over and",
+        "  nothing here can be trusted as hole fill.",
+        f"  A uniform offset LARGER than {r:.1f} mm looks exactly like this. A 4-10 mm",
+        "  one does not: G1 sees that one and names the cells.",
+        "  Same escape: --mode texture-only.",
+    ])
+
+
+def merge_clouds(laser_xyz: np.ndarray, laser_n: np.ndarray, dense_xyz: np.ndarray,
+                 dense_n: np.ndarray, params: MergeParams, volume: ScanVolume
+                 ) -> tuple[np.ndarray, np.ndarray, MergeStats]:
+    """The laser cloud, plus whatever of the dense cloud fills what the laser
+    never saw — as `(xyz, normals, MergeStats)`.
+
+    The two clouds are registered by construction: both are placed through
+    the same board poses, so no ICP is needed. But registration is not
+    accuracy. The laser carries sub-millimetre points and the dense cloud
+    1-2 mm ones, ten to a hundred times more of them, so an unweighted
+    Poisson over the union would yield the DENSE surface wherever dense
+    exists. **The laser wins**, and dense is admitted only where the laser
+    has nothing to say. What "nothing to say" means is §2.7's rule, and it
+    is the one thing three earlier designs got wrong:
+
+      * a candidate ball of `hypot(support_mm, max_normal_mm)` — the
+        smallest ball containing the support cylinder — capped at the
+        `CANDIDATE_CAP` nearest;
+      * **supported** = at least `support_min` of those neighbours within
+        `support_mm` LATERALLY, in the plane perpendicular to the local
+        laser normal, whatever their offset along it. Supported means the
+        laser covered this surface, and the point is dropped: 0.2 mm off it
+        or 4 mm above it, the laser says it better. Past `max_normal_mm`
+        along the normal it is dropped as a floater instead, and never
+        enters G1's statistics;
+      * **unsupported** is a hole. Within `outlier_mm` of the nearest laser
+        point it is the hole's rim and is kept; farther out it is kept when
+        it sits in a coherent dense patch and dropped as a floater when it
+        does not.
+
+    Two gates refuse and three warn, and every number is reported either
+    way. G1 gates the SIGNED residual median per z-slab × normal-octant
+    cell, so zero-mean noise passes and a bias — a translation, a scale
+    error, a rotation — does not. G1b refuses when almost nothing is
+    supported, because then there is no bias to measure. On a refusal the
+    laser cloud comes back untouched, which is what `--mode texture-only`
+    would have produced anyway; the caller reads `stats.refused` and stops.
+
+    `dense_xyz` is cropped to `volume` here — the same volume D1b cropped
+    with, so this is a no-op on an already-cropped cloud and makes
+    `dense_points` the post-crop count by construction. `volume` also fixes
+    G1's four z slabs to equal quarters of `[floor_mm, height_mm]`, never
+    the cloud's own extent, so two runs are comparable.
+    """
+    laser = np.asarray(laser_xyz, np.float64).reshape(-1, 3)
+    ln = np.asarray(laser_n, np.float64).reshape(-1, 3)
+    dense = np.asarray(dense_xyz, np.float64).reshape(-1, 3)
+    dn = np.asarray(dense_n, np.float64).reshape(-1, 3)
+    inside = volume.contains(dense)
+    dense, dn = dense[inside], dn[inside]
+    n_dense = len(dense)
+
+    supported, resid, nearest, normal = _support_and_residual(laser, ln, dense, params)
+    # The G1 population: supported AND a plausible measurement of the
+    # surface it is supported by. A supported point hovering past
+    # `max_normal_mm` is a floater and must not colour the bias.
+    measured = supported & (np.abs(resid) <= params.max_normal_mm)
+    dense_supported = int(measured.sum())
+    floater = supported & ~measured
+    p90 = (float(np.percentile(np.abs(resid[measured]), 90)) if dense_supported
+           else float("nan"))
+
+    def _stats(n_kept: int, n_float: int, cells: MergeCells, median_nb: float,
+               kept_median: float) -> MergeStats:
+        return MergeStats(
+            params=params, candidate_radius_mm=params.candidate_radius_mm,
+            laser_points=len(laser), dense_points=n_dense,
+            dense_supported=dense_supported, dense_kept=n_kept, floaters=n_float,
+            agree_frac=dense_supported / n_dense if n_dense else 0.0,
+            keep_frac=n_kept / n_dense if n_dense else 0.0,
+            cells=cells, p90_abs_residual_mm=p90, kept_median_mm=kept_median,
+            median_dense_neighbours=median_nb)
+
+    # G1b before the patch rule: the patch bar is a median over the
+    # supported set, and there is no such median when that set is empty.
+    # Nothing is classified beyond the support test on this path, so
+    # `floaters` counts only the hovering points the test itself named and
+    # the three-way sum is short by the unjudged remainder — which is the
+    # honest report of a merge that stopped before judging them.
+    if dense_supported < params.min_supported:
+        stats = _stats(0, int(floater.sum()), MergeCells(), float("nan"), float("nan"))
+        stats.refused, stats.refused_by = True, "G1b"
+        stats.message = _g1b_message(dense_supported, n_dense, params)
+        return laser, ln, stats
+
+    counts = _neighbour_counts(dense, params.density_mm)
+    median_nb = float(np.median(counts[measured]))
+    unsupported = ~supported
+    rim = unsupported & (nearest <= params.outlier_mm)
+    patch = unsupported & ~rim & (counts >= params.patch_frac * median_nb)
+    kept = rim | patch
+
+    kept_median = float("nan")
+    if kept.any() and len(laser):
+        kept_median = float(np.median(cKDTree(laser).query(dense[kept], k=1,
+                                                           workers=-1)[0]))
+    cells, failing = _cells(dense[measured][:, 2], normal[measured], resid[measured],
+                            params, volume)
+    # Every dense point is now judged, so the three-way sum closes:
+    # supported + kept + floaters == dense_points.
+    stats = _stats(int(kept.sum()), int((floater | (unsupported & ~kept)).sum()),
+                   cells, median_nb, kept_median)
+    # The three warnings are collected before G1 decides, because they say
+    # something about a refused run too — and none of them can refuse it.
+    if stats.agree_frac < params.warn_frac:
+        stats.warnings.append(
+            f"low overlap: {stats.agree_frac:.0%} of the dense cloud has lateral laser "
+            f"support (under {params.warn_frac:.0%}) — a dark or specular object gives "
+            "the laser little to work with, and the merge is not refused for it")
+    floater_frac = stats.floaters / n_dense if n_dense else 0.0
+    if floater_frac > params.warn_frac:
+        stats.warnings.append(
+            f"noisy dense cloud: {floater_frac:.0%} of it is floaters (over "
+            f"{params.warn_frac:.0%}) — a quality signal, not a correctness one")
+    if stats.keep_frac < KEEP_FLOOR:
+        stats.warnings.append(
+            f"dense added nothing: it filled {stats.keep_frac:.2%} of itself into the "
+            f"laser cloud (under {KEEP_FLOOR:.0%}) — the run is not wrong, it is "
+            "pointless")
+
+    if failing:
+        stats.refused, stats.refused_by = True, "G1"
+        stats.message = _g1_message(cells, failing, p90, params, volume)
+        return laser, ln, stats
+    return (np.vstack([laser, dense[kept]]), np.vstack([ln, dn[kept]]), stats)
 
 
 class CloudOverlay:
