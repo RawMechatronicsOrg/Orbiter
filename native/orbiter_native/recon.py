@@ -209,7 +209,8 @@ JIT_CACHE_BYTES = 1 << 30
 #: Which card PatchMatch is to run on: a UUID, or a case-insensitive substring
 #: of the card's name. The default names the RTX 5060 Ti, which is the card
 #: this rig wants put to work; when nothing matches, the first card listed is
-#: used and the log says so.
+#: used and the log says so. `orbiter-recon --check` reads the same variable
+#: through the same `gpu_choice`, so it reports the card this step would pin.
 COLMAP_GPU_ENV = "ORBITER_COLMAP_GPU"
 DEFAULT_GPU_MATCH = "5060"
 #: The `GpuSpec.uuid` that means "every device". Only the listing probe uses
@@ -285,6 +286,77 @@ class StepFailed(RuntimeError):
 class ReconCancelled(RuntimeError):
     """The operator pressed Abort. Whatever finished stays recorded, so the
     next run resumes rather than starts over."""
+
+
+# ── the cards ────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class GpuEntry:
+    """One card, as `nvidia-smi -L` names it.
+
+    Two callers read that listing: `patch_match_stereo` resolves the UUID it is
+    about to pin, and `orbiter-recon --check` prints the same decision before a
+    run starts. A check that named one card while the run pinned another would
+    be worse than no check at all, so the parsing and the tie-break below are
+    theirs jointly and belong to neither.
+    """
+
+    #: The slot `nvidia-smi` printed. Kept for the order it implies and for
+    #: nothing else: slot order is precisely what this module refuses to select
+    #: by, because `--gpus all` plus `CUDA_DEVICE_ORDER=PCI_BUS_ID` does not
+    #: make a chosen card device 0.
+    index: int
+    #: The card's name, for the log, for `--check` and for `session.json`.
+    name: str
+    #: `GPU-<uuid>`, the one handle a container can be pinned to.
+    uuid: str
+
+    def names(self, wanted: str) -> bool:
+        """Whether `wanted` names this card: its UUID, or a case-insensitive
+        substring of its name.
+
+        An empty needle names nothing rather than everything — a cleared
+        `ORBITER_COLMAP_GPU` then falls to the first card listed and the log
+        says it fell, instead of quietly matching whichever card came first.
+        """
+        needle = wanted.strip().lower()
+        return bool(needle) and (needle in self.uuid.lower()
+                                 or needle in self.name.lower())
+
+
+def gpu_entries(text: str) -> list[GpuEntry]:
+    """Every card `nvidia-smi -L` listed, in the order it listed them.
+
+    A line it does not recognise is ignored rather than refused: the image's
+    entrypoint prints a CUDA banner before the command it was given, and a MIG
+    listing indents its sub-devices under their parent.
+    """
+    out: list[GpuEntry] = []
+    for line in text.splitlines():
+        found = _GPU_LINE_RE.match(line)
+        if found:
+            out.append(GpuEntry(index=int(found.group(1)),
+                                name=found.group(2), uuid=found.group(3)))
+    return out
+
+
+def gpu_choice(entries: Sequence[GpuEntry], wanted: str
+               ) -> tuple[GpuEntry | None, GpuEntry | None]:
+    """The card to run on and the card to retry on, by the one rule.
+
+    The primary is the first entry `wanted` names, and entry 0 when it names
+    none — a machine whose only card is called something unexpected still gets
+    a run. The fallback is the first entry with a different UUID, and is None
+    when there is only one card, which is what makes "retry on the other one" a
+    decision rather than a hope. Both are None for an empty listing, which is a
+    refusal each caller words for itself.
+    """
+    if not entries:
+        return None, None
+    primary = next((e for e in entries if e.names(wanted)), entries[0])
+    fallback = next((e for e in entries if e.uuid != primary.uuid), None)
+    return primary, fallback
 
 
 # ── the backend seam ─────────────────────────────────────────────────────
@@ -1818,6 +1890,11 @@ def _resolve_gpus(run: Run) -> tuple[GpuSpec | None, GpuSpec | None]:
     be resolvable at all. It runs here and nowhere earlier: a texture-only run
     must not be able to die on a broken nvidia runtime it never needed.
 
+    What that listing says is read by `gpu_entries` and decided by `gpu_choice`
+    — the pair `--check` reads and decides by too, so the card the check names
+    is the card this step pins, rather than two rules that agree right up until
+    one of them is edited.
+
     Selection is by identity because slot order decides device 0 and nothing
     else does: `--gpus all` plus `CUDA_DEVICE_ORDER=PCI_BUS_ID` will not make a
     chosen card index 0.
@@ -1829,17 +1906,16 @@ def _resolve_gpus(run: Run) -> tuple[GpuSpec | None, GpuSpec | None]:
                      "gpu_index 0 is whichever card the host calls first")
         return None, None
 
-    entries: list[tuple[str, str]] = []
+    listed: list[str] = []
 
     def sink(line: str) -> None:
         run.log.line(line)
-        found = _GPU_LINE_RE.match(line)
-        if found:
-            entries.append((found.group(3), found.group(2)))
+        listed.append(line)
 
     code = run.backend.run(["nvidia-smi", "-L"], on_line=sink,
                            gpu=GpuSpec(uuid=ALL_DEVICES, name="every device"),
                            cancel=run.cancel)
+    entries = gpu_entries("\n".join(listed))
     if code != 0 or not entries:
         raise StepFailed(
             f"patch_match_stereo: `nvidia-smi -L` in the COLMAP image listed "
@@ -1849,17 +1925,14 @@ def _resolve_gpus(run: Run) -> tuple[GpuSpec | None, GpuSpec | None]:
             "which asks for no GPU at any step.")
 
     wanted = os.environ.get(COLMAP_GPU_ENV, DEFAULT_GPU_MATCH).strip()
-    needle = wanted.lower()
-    index = next((i for i, (uuid, name) in enumerate(entries)
-                  if needle in uuid.lower() or needle in name.lower()), None)
-    if index is None:
-        index = 0
+    chosen, spare = gpu_choice(entries, wanted)
+    assert chosen is not None                # the listing is not empty
+    if not chosen.names(wanted):
         run.log.line(f"patch_match_stereo: no card matches {COLMAP_GPU_ENV}="
-                     f"{wanted!r}; using the first one listed, "
-                     f"{entries[0][1]}")
-    primary = GpuSpec(uuid=entries[index][0], name=entries[index][1])
-    fallback = next((GpuSpec(uuid=uuid, name=name) for uuid, name in entries
-                     if uuid != primary.uuid), None)
+                     f"{wanted!r}; using the first one listed, {chosen.name}")
+    primary = GpuSpec(uuid=chosen.uuid, name=chosen.name)
+    fallback = (GpuSpec(uuid=spare.uuid, name=spare.name)
+                if spare is not None else None)
     run.log.line(
         f"patch_match_stereo: {primary.name} ({primary.uuid})"
         + (f", falling back to {fallback.name} if its kernel is missing"

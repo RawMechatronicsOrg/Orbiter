@@ -37,7 +37,7 @@ import cv2
 import numpy as np
 import pytest
 
-from orbiter_native import recon
+from orbiter_native import recon, reconcli
 from orbiter_native.laser import StripePixels
 from orbiter_native.photos import (
     BoardSnapshot,
@@ -778,6 +778,58 @@ def test_gpu_is_resolved_by_uuid_lazily_before_patch_match(
     _, backend = _run(none)
     assert _gpu_of(backend, "patch_match_stereo").uuid == GPU_5060
     assert "no card matches ORBITER_COLMAP_GPU='Quadro'" in _log(none)
+
+
+def test_the_check_and_the_runner_read_one_listing_the_same_way(
+        tmp_path, monkeypatch, capsys) -> None:
+    """`--check` names the card the run will pin, because both ask the same
+    two functions.
+
+    The two readers carried a pattern and a tie-break each until they were
+    folded into `recon.gpu_entries` and `recon.gpu_choice`, and two copies of a
+    rule agree only for as long as nobody edits one of them — a check that
+    named a different card than the run pinned would be worse than no check at
+    all. So one text goes through `_resolve_gpus`, which is what
+    `patch_match_stereo` resolves a UUID with, and through `_probe_gpu`, which
+    is what `--check` prints, and the two answers are compared card for card.
+
+    The text is the awkward one on purpose. The image's entrypoint prints a
+    CUDA banner before the command it was given, and `nvidia-smi -L` indents a
+    MIG device under its parent: both readers have to step over both, and a
+    reader that took the MIG line for a card would name a device no container
+    can be pinned to.
+    """
+    banner = "==========\n== CUDA ==\n==========\n\nCUDA Version 12.9.1\n\n"
+    mig = ("  MIG 1g.10gb    Device  0: "
+           "(UUID: MIG-11112222-3333-4444-5555-666677778888)")
+
+    for wanted, cards in ((recon.DEFAULT_GPU_MATCH, GPU_LIST),
+                          ("1650", GPU_LIST),
+                          (GPU_1650, GPU_LIST),
+                          ("Quadro", GPU_LIST),       # nothing matches
+                          # ...and a machine with one card in it.
+                          (recon.DEFAULT_GPU_MATCH, GPU_LIST[1:])):
+        monkeypatch.setenv(recon.COLMAP_GPU_ENV, wanted)
+        text = banner + "\n".join([*cards, mig]) + "\n"
+
+        pinned, spare = recon._resolve_gpus(recon.Run(
+            session_dir=tmp_path, mode="dense", params=ReconParams(),
+            backend=FakeBackend(output={GPU_TOOL: text.splitlines()}),
+            log=recon.RunLog(tmp_path), state=State()))
+        reconcli._probe_gpu(lambda argv: (0, text), "docker", "image",
+                            "dense", [])
+        said = capsys.readouterr().out
+
+        assert pinned is not None
+        assert f"primary is {pinned.name} ({pinned.uuid})" in said, \
+            f"{wanted!r}: the check named a card the run would not pin\n{said}"
+        # ...and the MIG line was counted as a card by neither of them.
+        assert f"{len(cards)} card(s)" in said
+        if spare is None:
+            assert "no fallback card" in said
+        else:
+            assert f"fallback is {spare.name} ({spare.uuid})" in said, \
+                f"{wanted!r}: the check named the wrong retry card\n{said}"
 
 
 # ── the fallback ─────────────────────────────────────────────────────────

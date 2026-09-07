@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -40,9 +39,11 @@ from typing import Callable, Sequence
 from . import recon
 from .photos import sessions_root
 from .recon import (
+    COLMAP_GPU_ENV,
     COLMAP_IMAGE_ENV,
     COLMAP_LOCAL_ENV,
     DEFAULT_COLMAP_IMAGE,
+    DEFAULT_GPU_MATCH,
     MODE_STEPS,
     ReconCancelled,
     ReconRefused,
@@ -50,6 +51,8 @@ from .recon import (
     _VERSION_RE,
     _shown,
     disk_estimate_bytes,
+    gpu_choice,
+    gpu_entries,
     undistorted_wh_for,
 )
 from .views import SelectParams, load_session
@@ -59,16 +62,11 @@ from .views import SelectParams, load_session
 #: a step rejects an option, so it is said out loud.
 EXPECTED_COLMAP = "4.2.0"
 
-#: Which card `patch_match_stereo` asks for: a UUID, or a case-insensitive
-#: substring of the name. The default names the RTX 5060 Ti, which is the card
-#: this rig is meant to put to work.
-COLMAP_GPU_ENV = "ORBITER_COLMAP_GPU"
-DEFAULT_GPU_MATCH = "5060"
-
-#: `nvidia-smi -L` prints one line per card. The UUID is the only stable handle:
-#: `--gpus all` plus `CUDA_DEVICE_ORDER=PCI_BUS_ID` does not make a chosen card
-#: device 0 — slot order does — so the runner selects by identity.
-_SMI_LINE = re.compile(r"^GPU\s+(\d+):\s*(.+?)\s*\(UUID:\s*(GPU-[0-9a-fA-F-]+)\)")
+# Which card `patch_match_stereo` asks for, how `nvidia-smi -L` is parsed and
+# which of its entries wins are all `recon`'s, imported above rather than
+# restated here. This module's whole claim is that it reports the decision the
+# runner will make, and the only way to keep that claim true is to make it with
+# the runner's own code.
 
 #: What the dense estimate is evaluated at when there is no session to measure:
 #: a full capture at the selection's cap, at the size this rig's sensors shoot.
@@ -149,39 +147,6 @@ def _capture(argv: Sequence[str], timeout: float = 120.0) -> tuple[int, str]:
     return done.returncode, done.stdout or ""
 
 
-# ── the GPU listing ──────────────────────────────────────────────────────
-
-
-def gpu_entries(text: str) -> list[tuple[str, str]]:
-    """`(name, uuid)` for every card `nvidia-smi -L` listed, in its order."""
-    out: list[tuple[str, str]] = []
-    for line in text.splitlines():
-        found = _SMI_LINE.match(line.strip())
-        if found:
-            out.append((found.group(2), found.group(3)))
-    return out
-
-
-def gpu_choice(entries: list[tuple[str, str]], want: str
-               ) -> tuple[tuple[str, str] | None, tuple[str, str] | None]:
-    """The primary card and the fallback, by the rule the runner applies.
-
-    The primary is the first entry whose UUID or name contains `want`, and entry
-    0 when nothing matches — a machine with one unnamed card still gets a run.
-    The fallback is the first entry with a different UUID, and is None when
-    there is only one card, which is what makes "retry on the other one" a
-    decision rather than a hope.
-    """
-    if not entries:
-        return None, None
-    needle = want.strip().lower()
-    primary = next((e for e in entries
-                    if needle and (needle in e[1].lower()
-                                   or needle in e[0].lower())), entries[0])
-    fallback = next((e for e in entries if e[1] != primary[1]), None)
-    return primary, fallback
-
-
 # ── the probes ───────────────────────────────────────────────────────────
 
 
@@ -232,6 +197,11 @@ def _probe_gpu(runner: Runner, docker: str, image: str, mode: str,
     to resolve a UUID before `patch_match_stereo`, so a listing that works is
     the call that has to work. Addressing one card by UUID afterwards only
     confirms what the listing already said, and is skipped.
+
+    The answer is parsed by `recon.gpu_entries` and decided by
+    `recon.gpu_choice` — the same two the runner calls — so the card named
+    here is the card the run will pin, rather than the card a second copy of
+    the rule would have picked.
     """
     if mode != "dense":
         say(OK, "gpu: skipped — no texture-only step is given --gpus, so the "
@@ -251,14 +221,14 @@ def _probe_gpu(runner: Runner, docker: str, image: str, mode: str,
     want = os.environ.get(COLMAP_GPU_ENV, DEFAULT_GPU_MATCH)
     primary, fallback = gpu_choice(entries, want)
     say(OK, f"gpu: {len(entries)} card(s) — "
-            + "; ".join(f"{name} ({uuid})" for name, uuid in entries))
-    say(OK, f"gpu: primary is {primary[0]} ({primary[1]}), chosen on "
+            + "; ".join(f"{card.name} ({card.uuid})" for card in entries))
+    say(OK, f"gpu: primary is {primary.name} ({primary.uuid}), chosen on "
             f"{COLMAP_GPU_ENV}={want}")
     if fallback is None:
         say(WARN, "gpu: no fallback card — a missing kernel aborts instead of "
                   "retrying, and the remedy is native/docker/colmap-cuda128")
     else:
-        say(OK, f"gpu: fallback is {fallback[0]} ({fallback[1]}) — "
+        say(OK, f"gpu: fallback is {fallback.name} ({fallback.uuid}) — "
                 "patch_match_stereo retries there once")
     say(WARN, "gpu: whether the primary runs PatchMatch cannot be probed from "
               "here — the image carries SASS to sm_90 and PTX for compute_90 "
