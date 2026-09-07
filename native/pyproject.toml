@@ -26,6 +26,13 @@ dependencies = [
     # install the same `cv2` module and clobber each other when both are
     # present; the server pins headless, so this does too.
     "opencv-python-headless>=4.7",
+    # Imported at module scope by colmapio, photos, rolling, scan, scanworker
+    # and views — the KD trees the selection and the merge are built on, and the
+    # quaternions the COLMAP model is written in — and inside a function by
+    # cvcore. It was reaching this venv only through orbiter-server and
+    # pytransform3d, neither of which is declared here, so installing this
+    # package alone failed on the first import of any of those six.
+    "scipy>=1.11",
     "httpx>=0.27",
 ]
 
@@ -41,6 +48,7 @@ gpu = ["torch>=2.6", "torchvision>=0.21"]
 [project.scripts]
 orbiter-native = "orbiter_native.__main__:main"
 orbiter-rigcheck = "orbiter_native.rigcheck:main"
+orbiter-recon = "orbiter_native.reconcli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
