@@ -38,9 +38,7 @@ from orbiter_native.views import (
     CfgParams,
     SelectParams,
     depth_range_fallback,
-    observation_counts,
     plan_patch_match_cfg,
-    rewrite_patch_match_cfg,
     seed_points,
     tracks,
 )
@@ -171,7 +169,7 @@ def test_sources_never_name_an_image_outside_the_cfg() -> None:
                              32.0, 38.0, -31.0])
     registered = sel.names[:6]          # the undistorter registered six
 
-    text = rewrite_patch_match_cfg(_cfg(registered), sel)
+    text = plan_patch_match_cfg(_cfg(registered), sel).text
 
     entries = _entries(text)
     assert list(entries) == registered
@@ -196,7 +194,7 @@ def test_sources_span_a_range_of_angles_not_just_the_nearest() -> None:
     photos, sel = _selected(offsets)
     angle_of = {p.name: _angle(photos[0], p) for p in photos[1:]}
 
-    picked = _sources(rewrite_patch_match_cfg(_cfg(sel.names), sel),
+    picked = _sources(plan_patch_match_cfg(_cfg(sel.names), sel).text,
                       photos[0].name)
 
     assert len(picked) == 8 == CfgParams().n_sources
@@ -225,7 +223,7 @@ def test_a_short_bucket_is_filled_from_the_nearest_remaining() -> None:
     by_offset = {offset: photo.name
                  for offset, photo in zip(offsets, photos[1:])}
 
-    picked = _sources(rewrite_patch_match_cfg(_cfg(sel.names), sel),
+    picked = _sources(plan_patch_match_cfg(_cfg(sel.names), sel).text,
                       photos[0].name)
 
     assert len(picked) == 8
@@ -264,7 +262,7 @@ def test_depth_range_fallback_is_none_when_tracks_are_healthy() -> None:
     volume = sel.session.volume
     seeds, rgb, normals = seed_points(BOX_XYZ, None, BOX_N)
     _, points2d = tracks(sel, seeds, normals, rgb)
-    counts = observation_counts(points2d)
+    counts = {i: len(seen) for i, seen in points2d.items()}
 
     assert len(sel.accepted) == 10
     assert min(counts.values()) > 50

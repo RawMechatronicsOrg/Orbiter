@@ -23,7 +23,9 @@ import json
 import os
 import shutil
 import struct
+import sys
 import threading
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -315,7 +317,12 @@ def test_write_sparse_creates_the_output_directories(tmp_path) -> None:
 def test_write_sparse_adds_normals_when_the_cloud_has_none(tmp_path) -> None:
     """Poisson is undefined without normals, and a cloud exported straight off
     the scan carries none — so step one writes them, oriented toward the
-    nearest camera that was actually selected."""
+    nearest camera that was actually selected.
+
+    Through a temporary file, and the temporary file does not survive. This is
+    the only copy of the confident cloud: a rewrite interrupted in place would
+    leave a truncated PLY where a scan that took minutes to make used to be.
+    """
     session_dir = _session(tmp_path)
     _run(session_dir, only="write_sparse")
 
@@ -326,6 +333,9 @@ def test_write_sparse_adds_normals_when_the_cloud_has_none(tmp_path) -> None:
     # from the axis rather than into it.
     wall = np.abs(xyz[:, 0]) > 109.0
     assert float(np.mean(np.sign(xyz[wall, 0]) * normals[wall, 0])) > 0.8
+
+    assert list(session_dir.glob("*.tmp")) == []
+    assert not (session_dir / f"{recon.LASER_PLY}.tmp").exists()
 
 
 # ── refusals ─────────────────────────────────────────────────────────────
@@ -490,6 +500,102 @@ def test_texture_workspace_postcondition_catches_renamed_images(tmp_path) -> Non
 
     with pytest.raises(StepFailed, match="not the 24 that were listed"):
         _run(session_dir, backend)
+
+
+def test_a_host_step_error_surfaces_as_a_named_step_failure(tmp_path) -> None:
+    """A host step reads files COLMAP and the app wrote, and its readers say
+    what is wrong with a file in a sentence — `no end_header` for a PLY that
+    was truncated mid-write.
+
+    `reconcli` and the panel catch the chain's three exceptions by name, so
+    anything else reaches an operator as a traceback with the sentence buried
+    in it. Every step's own exception is therefore turned into a `StepFailed`
+    that keeps the sentence and puts the step's name in front of it.
+    """
+    session_dir = _session(tmp_path)
+    (session_dir / recon.LASER_PLY).write_bytes(
+        b"ply\nformat binary_little_endian 1.0\nelement vertex 4000\n")
+
+    with pytest.raises(StepFailed) as caught:
+        _run(session_dir)
+    assert str(caught.value) == "write_sparse: no end_header"
+
+    block = json.loads((session_dir / "session.json")
+                       .read_text(encoding="utf-8"))["reconstruct"]
+    assert block["status"] == "failed"
+    assert block["message"] == "write_sparse: no end_header"
+
+
+def test_a_photograph_of_another_size_than_the_solve_is_refused_by_name(
+        tmp_path) -> None:
+    """A camera matrix is only valid at the resolution it was solved at, and
+    `write_cameras` refuses a rig whose photographs are not that size —
+    otherwise the whole model is built around a principal point in the wrong
+    place.
+
+    It refuses with a `ValueError`, because `colmapio` knows nothing about
+    chains. That is an operator's problem, so the step raises it as one: a
+    refusal carrying the sentence and the way out, not a traceback.
+    """
+    session_dir = _session(tmp_path)
+    manifest = session_dir / "photos.jsonl"
+    rows = [json.loads(line) for line
+            in manifest.read_text(encoding="utf-8").splitlines() if line.strip()]
+    # A clean-pass left photograph, because the selection prefers those and a
+    # size nobody selected is a size the guard is right to say nothing about.
+    row = next(r for r in rows if r["side"] == "left" and r["pass_id"] == 1)
+    row["wh"] = [row["wh"][0] - 1, row["wh"][1]]
+    manifest.write_text("".join(f"{json.dumps(r)}\n" for r in rows),
+                        encoding="utf-8")
+
+    with pytest.raises(ReconRefused) as caught:
+        _run(session_dir, only="write_sparse")
+    message = str(caught.value)
+    assert message.startswith("write_sparse: left: intrinsics were solved at")
+    assert "a camera matrix is only valid at the resolution it was solved at" \
+        in message
+    assert "Re-solve the rig" in message
+
+
+def test_a_failed_run_still_writes_the_reconstruct_block(tmp_path) -> None:
+    """`write_sparse` measures the disk it checked, what it selected, which
+    buckets the clean set covers and where the atlas comes from — once, and
+    never again, because a resumed run skips the step that measured them.
+
+    A run that then failed four steps later used to write no `reconstruct`
+    block at all, so exactly the run whose numbers an operator needs to read
+    was the run that reported none. The block is written on every ending now,
+    as far as the run got, with a `status` saying which ending it was.
+    """
+    session_dir = _session(tmp_path)
+    every = [f"{side}_{n:04d}.jpg" for n in range(1, 25) for side in ("left", "right")]
+
+    with pytest.raises(StepFailed) as caught:
+        _run(session_dir, _fake(session_dir, texture_names=every))
+
+    block = json.loads((session_dir / "session.json")
+                       .read_text(encoding="utf-8"))["reconstruct"]
+    assert block["status"] == "failed"
+    assert block["message"] == str(caught.value)
+    assert block["mode"] == "texture-only"
+    assert block["finished_utc"] >= block["started_utc"]
+    # write_sparse's numbers, which nothing measures a second time.
+    assert block["disk"]["estimate_inputs"]["n_selected"] == 24
+    assert block["selected"]["clean"] == 24
+    assert block["texture_source"] == "clean"
+    assert block["buckets"]["covered_by_selection"] > 0
+    assert block["passes"]
+
+    # A cancelled run says so under its own name.
+    stopped = _session(tmp_path / "stopped")
+    stop = threading.Event()
+    stop.set()
+    with pytest.raises(ReconCancelled):
+        _run(stopped, cancel=stop)
+    block = json.loads((stopped / "session.json")
+                       .read_text(encoding="utf-8"))["reconstruct"]
+    assert block["status"] == "cancelled"
+    assert "cancelled before write_sparse" in block["message"]
 
 
 # ── no GPU anywhere in Milestone 1 ───────────────────────────────────────
@@ -749,6 +855,12 @@ def test_local_backend_only_runs_what_orbiter_colmap_names(tmp_path) -> None:
                    "--input_path", str(session_dir / "laser.ply"),
                    "--PoissonMeshing.trim", "7"]
 
+    # The mount itself unwinds; a path that merely starts with those five
+    # characters does not. Under a prefix test `/database.db` would have come
+    # out as `<session>/base.db`, a file beside the scan that nobody named.
+    assert backend.command(["colmap", "x", "/data", "/database.db"]) == \
+        [str(exe), "x", str(session_dir), "/database.db"]
+
 
 # ── the log, and stopping ────────────────────────────────────────────────
 
@@ -801,7 +913,57 @@ def test_cancel_stops_between_steps(tmp_path) -> None:
     assert not state.finished("texture_workspace")
 
 
-# ── the GLB, which is allowed to fail ────────────────────────────────────
+@pytest.mark.skipif(not sys.executable,
+                    reason="no interpreter to run as a silent child")
+def test_abort_stops_a_step_that_has_printed_nothing(tmp_path) -> None:
+    """Abort reaches a container that is not talking.
+
+    `mesh_texturer` packs the atlas and `stereo_fusion` fuses the depth maps
+    without a line of output for minutes at a time. Reading and cancelling in
+    one loop tied the terminate to the child's next line, so closing the window
+    during either left a container running with nobody watching it — an hour of
+    a card, and a `--rm` that never came. The output is read on its own thread
+    now and the wait is polled, so the flag is seen within
+    `CANCEL_POLL_SECONDS` whatever the child is doing.
+
+    A real child, because `FakeBackend` never opens a process and this is a
+    fact about `subprocess`. It sleeps for half a minute and says nothing.
+    """
+    session_dir = tmp_path / "20260906-213500"
+    session_dir.mkdir()
+    backend = recon.LocalBackend(session_dir, executable=sys.executable)
+    stop = threading.Event()
+    seen: list[str] = []
+
+    threading.Timer(0.3, stop.set).start()
+    started = time.monotonic()
+    code = backend.run(["colmap", "-c", "import time; time.sleep(30)"],
+                       on_line=seen.append, cancel=stop)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 2.0, f"the child outlived the abort by {elapsed:.1f} s"
+    assert code != 0
+    # The command line still goes to the log, which is the one line this step
+    # did produce.
+    assert seen and seen[0].startswith("$ ")
+
+
+def test_the_lines_a_step_printed_reach_the_log_in_order(tmp_path) -> None:
+    """Moving the reading onto a thread must not reorder it. The queue is
+    drained in the order the child wrote, and the last lines before it exits
+    are in the log before `_spawn` returns — a failure's diagnosis is always in
+    the tail, and dropping it would leave `recon.log` ending mid-sentence."""
+    session_dir = tmp_path / "20260906-213500"
+    session_dir.mkdir()
+    backend = recon.LocalBackend(session_dir, executable=sys.executable)
+    seen: list[str] = []
+
+    code = backend.run(
+        ["colmap", "-c", "[print(f'line {i}') for i in range(200)]"],
+        on_line=seen.append, cancel=None)
+
+    assert code == 0
+    assert seen[1:] == [f"line {i}" for i in range(200)]
 
 
 def test_glb_packing_is_best_effort(tmp_path) -> None:

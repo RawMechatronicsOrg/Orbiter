@@ -52,6 +52,7 @@ import collections
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -268,6 +269,13 @@ CONTAINER_ROOT = "/data"
 #: about itself, so the version is found by pattern rather than by line number.
 _VERSION_RE = re.compile(r"\bCOLMAP\s+(\d+\.\d+(?:\.\d+)?)")
 
+#: How often a running step is asked whether Abort has been pressed. It is a
+#: poll rather than a wait on the output because two steps go quiet for
+#: minutes at a time — `mesh_texturer` while it packs the atlas, and
+#: `stereo_fusion` while it fuses — and a container that outlives the window
+#: that started it has to be killed by hand.
+CANCEL_POLL_SECONDS = 0.2
+
 
 # ── failures ─────────────────────────────────────────────────────────────
 
@@ -453,6 +461,14 @@ def _spawn(cmd: Sequence[str], on_line: Callable[[str], None],
     its glog lines to the other, and two streams read separately interleave by
     luck. `text=True` with an explicit encoding keeps a stray byte in a file
     name from killing an hour-long run.
+
+    **The output is read on its own thread and the child is waited on here.**
+    Reading and cancelling in one loop ties Abort to the child's next line, and
+    `mesh_texturer` and `stereo_fusion` both go quiet for minutes — long enough
+    that closing the window left a container running with nobody watching it.
+    Polling `wait` instead means the terminate lands within
+    `CANCEL_POLL_SECONDS` whatever the child is or is not printing, and the
+    queue keeps the lines in the order they arrived.
     """
     kwargs: dict[str, Any] = {}
     if hasattr(subprocess, "CREATE_NO_WINDOW"):
@@ -461,13 +477,37 @@ def _spawn(cmd: Sequence[str], on_line: Callable[[str], None],
     proc = subprocess.Popen(
         list(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1, encoding="utf-8", errors="replace", **kwargs)
-    try:
+    lines: queue.Queue[str] = queue.Queue()
+
+    def pump() -> None:
         assert proc.stdout is not None
         for line in proc.stdout:
-            on_line(line.rstrip("\r\n"))
+            lines.put(line.rstrip("\r\n"))
+
+    def drain() -> None:
+        while True:
+            try:
+                on_line(lines.get_nowait())
+            except queue.Empty:
+                return
+
+    reader = threading.Thread(target=pump, name="recon-output", daemon=True)
+    reader.start()
+    try:
+        while True:
+            drain()
             if cancel is not None and cancel.is_set():
                 proc.terminate()
                 break
+            try:
+                proc.wait(timeout=CANCEL_POLL_SECONDS)
+            except subprocess.TimeoutExpired:
+                continue
+            break
+        # The pipe closes when the child goes, so the reader ends on its own;
+        # the join is what puts its last lines in the log before this returns.
+        reader.join(timeout=CANCEL_POLL_SECONDS * 25)
+        drain()
         return proc.wait()
     finally:
         if proc.poll() is None:
@@ -551,6 +591,11 @@ class LocalBackend:
     directly, so the `/data/...` prefix every step writes is simply unwound back
     to the session directory on the way out. Every step therefore builds one
     argv and neither knows nor cares which backend runs it.
+
+    The unwinding matches `/data` and `/data/...` and nothing else. A prefix
+    test would also match `/database.db` — not a path this chain writes, but
+    the failure it would cause is a file quietly created beside the session
+    under a name nobody typed, which is not a failure worth leaving available.
     """
 
     def __init__(self, session_dir: str | Path,
@@ -561,7 +606,7 @@ class LocalBackend:
     def command(self, argv: Sequence[str]) -> list[str]:
         out = [self.executable]
         for part in list(argv)[1:]:
-            if part.startswith(CONTAINER_ROOT):
+            if part == CONTAINER_ROOT or part.startswith(CONTAINER_ROOT + "/"):
                 rel = part[len(CONTAINER_ROOT):].lstrip("/")
                 out.append(str(self.session_dir / rel) if rel
                            else str(self.session_dir))
@@ -775,10 +820,12 @@ def colmap_version(backend: Backend) -> str | None:
 class State:
     """`recon-state.json` — what has finished, and under what conditions.
 
-    `mode` is the only field that drives invalidation. `colmap_version` and
-    `max_image_size` are recorded and read back into the log for the same
-    reason a run's parameters go into `session.json`: so a result that changed
-    can be explained by something other than luck.
+    `mode` is the only field that drives invalidation. `max_image_size` is the
+    one a resume reads back and obeys — the GPU fallback lowers it, and the
+    workspace on disk was built at whatever it says. `colmap_version` is
+    recorded and read back into the log for the same reason a run's parameters
+    go into `session.json`: so a result that changed can be explained by
+    something other than luck.
     """
 
     mode: str = ""
@@ -1038,7 +1085,12 @@ def _write_sparse(run: Run) -> None:
         cloud_normals = orient_normals(
             raw, xyz,
             np.array([v.photo.centre_mm for v in selection.accepted], float))
-        write_ply(str(laser), xyz, rgb, cloud_normals)
+        # Through a temporary file: this is the only copy of the confident
+        # cloud, an export takes minutes to repeat, and a write interrupted in
+        # place leaves a truncated PLY where the scan used to be.
+        tmp = laser.with_name(laser.name + ".tmp")
+        write_ply(str(tmp), xyz, rgb, cloud_normals)
+        os.replace(tmp, laser)
         run.log.line(f"write_sparse: {laser.name} carried no normals — wrote "
                      f"PCA normals for {len(xyz)} points, oriented toward the "
                      "nearest selected camera")
@@ -1063,7 +1115,15 @@ def _write_sparse(run: Run) -> None:
     eyes = session.cameras(selection)
 
     sparse = run.path("colmap", "sparse")
-    colmapio.write_cameras(sparse / "cameras.txt", eyes)
+    try:
+        # `write_cameras` refuses a rig whose photographs are not the size its
+        # intrinsics were solved at. That is an operator's problem and not a
+        # step's, so it is raised as one rather than escaping as a traceback.
+        colmapio.write_cameras(sparse / "cameras.txt", eyes)
+    except ValueError as exc:
+        raise ReconRefused(f"write_sparse: {exc}. Re-solve the rig at the size "
+                           "these photographs were taken at, or scan again at "
+                           "the size it was solved at.") from exc
     colmapio.write_images(sparse / "images.txt", images)
     colmapio.write_points3d(sparse / "points3D.txt", points3d)
     colmapio.write_rigs(sparse / "rigs.txt", eyes)
@@ -1450,8 +1510,19 @@ def _clean_images(run: Run) -> None:
             projected = stripemask.project_points(
                 kept_xyz, photo.R, photo.t_mm, _eye_matrix(eye),
                 np.asarray(eye.dist, float))
-        mask, clean = stripemask.build(source.read_bytes(), stripe, projected,
-                                       run.params.mask)
+        try:
+            # `build` refuses a sidecar written against a frame of another
+            # size, for the same reason `write_cameras` refuses the intrinsics:
+            # the resolution changed between capture and reconstruct. It is an
+            # operator's problem, and it is raised as one.
+            mask, clean = stripemask.build(source.read_bytes(), stripe,
+                                           projected, run.params.mask)
+        except ValueError as exc:
+            raise ReconRefused(
+                f"clean_images: {photo.name}: {exc}. This session was "
+                "photographed at one size and its stripe sidecars written at "
+                "another; scan it again, or run --mode texture-only, which "
+                "reads no sidecars.") from exc
         stripemask.write_mask(
             run.path("colmap", "_masks_raw", f"{photo.name}.png"), mask)
         stripemask.write_clean(
@@ -2131,9 +2202,10 @@ def _merge(run: Run) -> None:
     poisson_mesher`, which in this mode would run the merge again and refuse
     again.
 
-    The report is written **before** the refusal is raised. The numbers are the
-    point of a refused merge as much as of a passing one, and a `session.json`
-    that lost them would leave an operator with nothing to tune from.
+    Every number is in `run.report` **before** the refusal is raised. The
+    numbers are the point of a refused merge as much as of a passing one, and
+    `run` writes the block it has on every ending, so a session that refused
+    here is one an operator can tune from.
     """
     model = _dense_model(run)
     fused = run.path("colmap", "dense", "fused.ply")
@@ -2142,16 +2214,21 @@ def _merge(run: Run) -> None:
             f"merge: {fused} does not exist — stereo_fusion writes it, and "
             "there is nothing to merge the laser cloud with until it does.")
 
+    # PCA gives a normal's line and not its direction, and the merge compares
+    # the two clouds' normals to each other — so whichever cloud arrives
+    # without them is oriented toward the same selected camera centres the
+    # other one was. A cloud left unoriented reads as half agreeing and half
+    # facing away, which is a refusal for a reason that is not the object's.
+    centres = np.array([v.photo.centre_mm for v in model.selection.accepted],
+                       float)
     dense_xyz, _, dense_n = read_ply_full(str(fused))
     if dense_n is None:
         # COLMAP writes normals into `fused.ply`; a cloud without them still
         # has to be judged, and PCA is the same estimate the laser cloud gets.
-        dense_n = normals_pca(dense_xyz)
+        dense_n = orient_normals(normals_pca(dense_xyz), dense_xyz, centres)
     laser_xyz, _, laser_n = read_ply_full(str(run.path(LASER_PLY)))
     if laser_n is None:
-        laser_n = orient_normals(
-            normals_pca(laser_xyz), laser_xyz,
-            np.array([v.photo.centre_mm for v in model.selection.accepted], float))
+        laser_n = orient_normals(normals_pca(laser_xyz), laser_xyz, centres)
 
     volume = model.selection.session.volume
     xyz, normals, stats = merge_clouds(laser_xyz, laser_n, dense_xyz, dense_n,
@@ -2163,12 +2240,6 @@ def _merge(run: Run) -> None:
         run.warn(warning)
 
     if stats.refused:
-        # `run` adds the `reconstruct` block only when the chain finishes, and
-        # a refusal never gets there — so the block is completed and written
-        # here, with the warnings this run had collected by now.
-        run.report["warnings"] = list(run.warnings)
-        run.report["degraded"] = list(run.degraded)
-        _write_report(run)
         raise ReconRefused(stats.message or "merge refused")
 
     write_ply(str(run.path("colmap", "dense", "merged.ply")), xyz, None, normals)
@@ -2362,7 +2433,8 @@ def _atlas_for(ply: Path) -> Path:
     """
     if not ply.is_file():
         raise FileNotFoundError(f"{ply} does not exist")
-    head = ply.open("rb").read(4096)
+    with ply.open("rb") as fh:
+        head = fh.read(4096)
     cut = head.find(b"end_header")
     text = head[: cut if cut >= 0 else len(head)].decode("ascii", "replace")
     match = re.search(r"comment\s+TextureFile\s+(.+)", text)
@@ -2505,13 +2577,25 @@ def _run_step(run: Run, name: str) -> float:
     Factored out of `run`'s loop because the GPU fallback runs three of these
     again from inside `patch_match_stereo`, and a step that skipped its own
     `mkdir` there would fail on the retry in a way it never fails in the chain.
+
+    **Anything a step raises leaves here as one of the chain's three.** The
+    host steps read files COLMAP and the app wrote, and a truncated PLY or a
+    sidecar of the wrong size comes back from those readers as a `ValueError`
+    naming exactly what is wrong — which `reconcli` and the panel would have
+    shown as a traceback, because they catch the three by name. Wrapping it
+    keeps that sentence and puts the step's name in front of it.
     """
     for relative in DIRS_CREATED.get(name, ()):
         run.session_dir.joinpath(*relative.split("/")).mkdir(
             parents=True, exist_ok=True)
     run.log.line(f"{name}: running")
     started = time.monotonic()
-    STEPS[name](run)
+    try:
+        STEPS[name](run)
+    except (ReconRefused, StepFailed, ReconCancelled):
+        raise
+    except Exception as exc:
+        raise StepFailed(f"{name}: {exc}") from exc
     seconds = time.monotonic() - started
     run.state.done(name, seconds)
     run.state.write(run.session_dir)
@@ -2536,7 +2620,10 @@ def run(session_dir: str | Path, mode: str = "texture-only", *,
 
     Raises `ReconRefused` for anything an operator can fix before a container
     starts, `StepFailed` when a step ran and did not succeed, and
-    `ReconCancelled` when Abort was pressed. All three carry a full sentence.
+    `ReconCancelled` when Abort was pressed. All three carry a full sentence,
+    and all three leave `session.json`'s `reconstruct` block behind with a
+    `status` saying which — the block is written on every ending, not only on
+    the happy one.
     """
     session_dir = Path(session_dir)
     if not session_dir.is_dir():
@@ -2566,9 +2653,27 @@ def run(session_dir: str | Path, mode: str = "texture-only", *,
         state = State()
         logger.line("--restart: the state file was cleared; every step will run")
 
+    # `--max_image_size` is the one number that can have been changed behind
+    # the operator's back: a previous run whose card had no kernel rebuilt the
+    # dense workspace at 1000, and a resume that went back to the default would
+    # report a size nothing on disk was written at. The stored value therefore
+    # wins over the default — and loses to a number the caller actually named,
+    # because `--max-image-size 1600` is an instruction and not an omission.
+    size = params.max_image_size
+    if state.max_image_size and state.max_image_size != size:
+        if size != ReconParams.max_image_size:
+            logger.line(f"--max_image_size {size}: the caller's, replacing the "
+                        f"{state.max_image_size} {STATE_NAME} recorded")
+        else:
+            logger.line(f"--max_image_size {state.max_image_size}: kept from "
+                        f"{STATE_NAME}, where an earlier run recorded it; the "
+                        f"default {size} would not describe the workspace on "
+                        "disk. Pass --max-image-size, or --restart, to change it.")
+            size = state.max_image_size
+
     ctx = Run(session_dir=session_dir, mode=mode, backend=backend, log=logger,
               params=params, state=state, force=force, cancel=cancel,
-              max_image_size=params.max_image_size)
+              max_image_size=size)
     ctx.report["started_utc"] = _utc_now()
 
     chosen = _chain(mode, from_step, to_step, only)
@@ -2583,7 +2688,7 @@ def run(session_dir: str | Path, mode: str = "texture-only", *,
         logger.line(f"COLMAP {version}")
     state.mode = mode
     state.colmap_version = version
-    state.max_image_size = params.max_image_size
+    state.max_image_size = ctx.max_image_size
 
     # The floor every run needs, before a single container starts. Dense's own
     # estimate cannot be computed until `write_sparse` knows how many
@@ -2595,6 +2700,7 @@ def run(session_dir: str | Path, mode: str = "texture-only", *,
     logger.line(f"run: {mode}, steps {' -> '.join(chosen)}")
     ran: list[str] = []
     skipped: list[str] = []
+    status, message = "ok", ""
     try:
         for name in chosen:
             if cancel is not None and cancel.is_set():
@@ -2608,16 +2714,40 @@ def run(session_dir: str | Path, mode: str = "texture-only", *,
                 continue
             _run_step(ctx, name)
             ran.append(name)
+    except ReconRefused as exc:
+        status, message = "refused", str(exc)
+        raise
+    except ReconCancelled as exc:
+        status, message = "cancelled", str(exc)
+        raise
+    except BaseException as exc:
+        # `StepFailed` lands here, and so does anything `_run_step` could not
+        # have wrapped — an interrupt, or a failure of the bookkeeping around
+        # a step. All of them are a run that did not finish.
+        status, message = "failed", str(exc)
+        raise
     finally:
         state.write(session_dir)
         backend.close()
-
-    ctx.report["finished_utc"] = _utc_now()
-    ctx.report.setdefault("mode", mode)
-    ctx.report["colmap_version"] = version
-    ctx.report["degraded"] = list(ctx.degraded)
-    ctx.report["warnings"] = list(ctx.warnings)
-    _write_report(ctx)
+        # In the `finally` because the numbers `write_sparse` measured — the
+        # disk it checked, what it selected, which buckets the clean set
+        # covers, where the atlas comes from — are measured once and never
+        # again by a resumed run. A run that failed, refused or was cancelled
+        # is exactly the run whose numbers an operator needs, so the block is
+        # written on every ending, as far as it got.
+        ctx.report["finished_utc"] = _utc_now()
+        ctx.report.setdefault("mode", mode)
+        ctx.report["colmap_version"] = version
+        ctx.report["degraded"] = list(ctx.degraded)
+        ctx.report["warnings"] = list(ctx.warnings)
+        ctx.report["status"] = status
+        ctx.report["message"] = message
+        try:
+            _write_report(ctx)
+        except Exception:
+            # Never the reason a run's own failure goes unseen: the log has
+            # every number this block would have carried.
+            log.exception("the reconstruct block could not be written")
 
     logger.line(f"run: finished — ran {len(ran)}, skipped {len(skipped)}"
                 + (f", {len(ctx.warnings)} warnings" if ctx.warnings else ""))
@@ -2634,7 +2764,9 @@ def _write_report(ctx: Run) -> None:
 
     A run that resumed past `write_sparse` has no selection to report, so it
     merges what it does know into the block that is already there rather than
-    replacing it with a thinner one.
+    replacing it with a thinner one. That is also what makes it safe to call
+    from a failed run: the numbers a passing run measured survive, and
+    `status` and `message` say what became of the run that wrote them last.
     """
     path = ctx.session_dir / "session.json"
     if not path.exists():

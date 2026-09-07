@@ -272,18 +272,24 @@ _FILL = np.stack(np.meshgrid(np.linspace(140.0, 160.0, 25),
 
 
 def _fused(session_dir: Path, xyz: np.ndarray | None = None,
-           normals: np.ndarray | None = None) -> None:
-    """`fused.ply`, binary and with normals, which is what COLMAP writes."""
+           normals: np.ndarray | None = None, *, bare: bool = False) -> None:
+    """`fused.ply`, binary and with normals, which is what COLMAP writes.
+
+    `bare` writes the same points with no normals at all — the file a fusion
+    that was told not to keep them leaves behind, and the one the merge has to
+    estimate and orient for itself.
+    """
     if xyz is None:
         xyz = np.vstack([BOX_XYZ, _FILL])
         normals = np.vstack([BOX_N, np.tile([1.0, 0.0, 0.0], (len(_FILL), 1))])
+    if normals is None:
+        normals = np.tile([0.0, 0.0, 1.0], (len(xyz), 1))
     write_ply(str(session_dir / "colmap" / "dense" / "fused.ply"), xyz, None,
-              normals if normals is not None else np.tile([0.0, 0.0, 1.0],
-                                                          (len(xyz), 1)))
+              None if bare else normals)
 
 
 def _effects(session_dir: Path, *, fused: np.ndarray | None = None,
-             fused_normals: np.ndarray | None = None,
+             fused_normals: np.ndarray | None = None, bare_fused: bool = False,
              ) -> dict[str, Callable[[list[str]], None]]:
     """The files each COLMAP tool leaves behind, keyed by tool.
 
@@ -305,7 +311,8 @@ def _effects(session_dir: Path, *, fused: np.ndarray | None = None,
         "image_undistorter": undistort,
         "patch_match_stereo": lambda argv: _depth_maps(
             session_dir, _selected(session_dir)),
-        "stereo_fusion": lambda argv: _fused(session_dir, fused, fused_normals),
+        "stereo_fusion": lambda argv: _fused(session_dir, fused, fused_normals,
+                                             bare=bare_fused),
         "poisson_mesher": lambda argv: (
             session_dir / "mesh" / "meshed-poisson.ply").write_bytes(b"ply\n"),
         "mesh_texturer": lambda argv: _textured_ply(session_dir),
@@ -515,6 +522,34 @@ def test_clean_images_never_touches_colmap_images(tmp_path) -> None:
 
     clean = session_dir / "colmap" / "images_clean"
     assert sorted(p.name for p in clean.iterdir()) == sorted(before)
+
+
+def test_a_sidecar_written_at_another_size_is_refused_by_name(tmp_path) -> None:
+    """The stripe sidecar was written against one frame size and the intrinsics
+    were solved at that size too, so a sidecar that does not match the
+    photograph beside it means the resolution changed between capture and
+    reconstruct — the case `Eye.intrinsics_for` refuses live rather than
+    silently rescaling.
+
+    `stripemask.build` says so as a `ValueError`, knowing nothing about chains.
+    The step turns it into the refusal an operator reads, naming the
+    photograph, because `build` sees only pixels and does not know which one it
+    was handed.
+    """
+    session_dir = _session(tmp_path)
+    _run(session_dir, to_step="validate_sparse")
+    name = next(n for n in _selected(session_dir) if _meta(session_dir, n).laser_on)
+    npz = session_dir / _meta(session_dir, name).stripe
+    data = dict(np.load(npz))
+    data["wh"] = np.asarray([WH_D[0] - 2, WH_D[1]], np.int32)
+    np.savez(npz, **data)
+
+    with pytest.raises(ReconRefused) as caught:
+        _run(session_dir, only="clean_images")
+    message = str(caught.value)
+    assert message.startswith(f"clean_images: {name}: the sidecar's stripe is")
+    assert f"but the photograph is {WH_D}" in message
+    assert "--mode texture-only" in message
 
 
 def test_clean_photos_are_copied_verbatim_into_images_clean(tmp_path) -> None:
@@ -1020,6 +1055,38 @@ def test_only_one_fallback_attempt(tmp_path) -> None:
             / "patch-match.cfg").is_file()
 
 
+def test_a_resume_keeps_the_size_the_workspace_was_actually_built_at(
+        tmp_path) -> None:
+    """`--max_image_size` is the one number a run can have changed behind the
+    operator's back, and the state file is where it said so.
+
+    The fallback lowered it to 1000 and rebuilt `colmap/dense/` at that size.
+    A resume that quietly went back to the 1600 default would report a size no
+    file on disk was written at — and the report is the only place the number
+    survives. So the stored value wins over the default, loses to a number the
+    caller actually named, and `--restart` puts the default back because it
+    threw the workspace's record away with everything else.
+    """
+    session_dir = _session(tmp_path)
+    State(mode="dense", max_image_size=FALLBACK_MAX_IMAGE_SIZE).write(session_dir)
+
+    _run(session_dir, to_step="write_sparse")
+    assert State.read(session_dir).max_image_size == FALLBACK_MAX_IMAGE_SIZE
+    assert f"--max_image_size {FALLBACK_MAX_IMAGE_SIZE}: kept from" \
+        in _log(session_dir)
+
+    # A number the caller typed is an instruction, not an omission.
+    _run(session_dir, to_step="write_sparse", params=_params(max_image_size=1200))
+    assert State.read(session_dir).max_image_size == 1200
+    assert ("--max_image_size 1200: the caller's, replacing the "
+            f"{FALLBACK_MAX_IMAGE_SIZE}") in _log(session_dir)
+
+    # And --restart, which cleared the record along with the steps.
+    State(mode="dense", max_image_size=FALLBACK_MAX_IMAGE_SIZE).write(session_dir)
+    _run(session_dir, to_step="write_sparse", restart=True)
+    assert State.read(session_dir).max_image_size == ReconParams().max_image_size
+
+
 def test_single_gpu_kernel_error_aborts_naming_the_local_dockerfile(
         tmp_path) -> None:
     """One card and no kernel for it: the run stops and names the fix.
@@ -1174,6 +1241,65 @@ def test_merge_stats_and_gpu_land_in_session_json(tmp_path) -> None:
                 if "merge: supported" in ln)
     assert "candidate radius 12.81 mm" in line
     assert result.degraded == []
+
+
+#: Hole fill in a full ring round the object, 65 mm clear of the nearest wall
+#: and well outside the box's own corner radius of 156 mm, inside a volume of
+#: 200. A ring rather than `_FILL`'s flat patch because a patch's PCA normals
+#: all come out of `eigh` with one sign and that sign can be the right one by
+#: luck; round a ring the sign has to flip somewhere, so exactly half of an
+#: unoriented estimate faces into the object.
+_RING = np.concatenate([
+    np.stack([175.0 * np.cos(np.radians(np.arange(0.0, 360.0, 2.0))),
+              175.0 * np.sin(np.radians(np.arange(0.0, 360.0, 2.0))),
+              np.full(180, z)], axis=1)
+    for z in (40.0, 45.0, 50.0, 55.0, 60.0)])
+
+
+def test_a_fused_cloud_without_normals_is_oriented_like_the_laser_one(
+        tmp_path) -> None:
+    """PCA gives a normal's line, not its direction, and Poisson meshes the
+    wrong side of a surface — or nothing at all — from normals that disagree
+    with their neighbours.
+
+    Either cloud can arrive without them: the laser one when it was exported
+    before `write_sparse` wrote them, the dense one when the fusion did not
+    keep them. Both estimates are therefore turned toward the cameras that were
+    actually selected, which is where the surface was seen from. Only the laser
+    branch did that, so a fused cloud with no normals put half its hole fill
+    into `merged.ply` facing inward — and `merged.ply` is what Milestone 2
+    meshes.
+    """
+    session_dir = _session(tmp_path)
+    backend = _fake(session_dir, fused=np.vstack([BOX_XYZ, _RING]),
+                    bare_fused=True)
+    result, _ = _run(session_dir, backend)
+
+    fused = session_dir / "colmap" / "dense" / "fused.ply"
+    assert recon.read_ply_full(str(fused))[2] is None, "the fixture must be bare"
+
+    merge = _block(session_dir)["merge"]
+    assert merge["refused"] is False
+    assert merge["dense_kept"] == len(_RING)     # the ring is what dense adds
+    assert merge["agree_frac"] > 0.85
+    assert result.degraded == []
+
+    # Every normal in `merged.ply` faces the nearest camera that was selected —
+    # the laser half because `write_sparse` oriented it, the ring because the
+    # merge does. Unoriented, the ring alone lands at half of that.
+    _, photos = load_session(session_dir)
+    names = set(_selected(session_dir))
+    centres = np.array([p.centre_mm for p in photos if p.name in names], float)
+    xyz, _, normals = recon.read_ply_full(
+        str(session_dir / "colmap" / "dense" / "merged.ply"))
+    nearest = centres[np.argmin(
+        np.linalg.norm(xyz[:, None, :] - centres[None, :, :], axis=2), axis=1)]
+    facing = np.einsum("ij,ij->i", normals, nearest - xyz) >= 0.0
+
+    ring = np.linalg.norm(xyz[:, :2], axis=1) > 165.0
+    assert int(ring.sum()) == len(_RING)
+    assert facing[ring].all()
+    assert facing.all()
 
 
 # ── switching modes, with the real steps behind it ───────────────────────

@@ -48,7 +48,6 @@ from orbiter_native.views import (
     buckets,
     image_list_text,
     load_session,
-    observation_counts,
     seed_points,
     select,
     texture_set,
@@ -393,6 +392,15 @@ def test_texture_set_falls_back_when_clean_photos_miss_a_region() -> None:
         named.update(range(int(float(lo) // 15.0), int(float(hi) // 15.0)))
     assert named == {az for az, _ in missing}
 
+    # And it says which end of the sightline those azimuths are. A bucket is a
+    # LOOKING direction: the hole is where the laser-only half of the orbit
+    # looks, which is half a turn from where that half stands. Read as standing
+    # places, every hint here would send the operator back to the covered side.
+    assert "missing cameras looking toward az" in warning
+    laser_stands = {int(az // 15.0) for az in np.linspace(187.5, 352.5, 12)}
+    assert named == {(bin_ + 12) % 24 for bin_ in laser_stands}
+    assert named.isdisjoint(laser_stands)
+
 
 def test_texture_set_source_depends_on_the_mode() -> None:
     """The same failing clean set is `raw` in texture-only and `inpainted` in
@@ -511,14 +519,13 @@ def test_tracks_use_each_eyes_own_camera_and_stay_inside_its_frame() -> None:
             assert 0.0 <= x < w and 0.0 <= y < h
 
 
-def test_tracks_report_per_image_observation_counts() -> None:
-    """The number C2b's depth-range fallback reads, and the number that says
-    whether the 30 k seed cap was generous enough for this object."""
+def test_every_accepted_image_gets_a_points2d_list_of_its_own() -> None:
+    """The number C2b's depth-range fallback reads is `len(points2d[id])`, and
+    the fallback asks it of every selected image — so every one of them has a
+    list, and none of them is empty for this object at the 30 k seed cap."""
     sel, _, _, points2d = _tracked()
-    counts = observation_counts(points2d)
-    assert set(counts) == {v.image_id for v in sel.accepted}
-    assert all(n > 0 for n in counts.values())
-    assert counts == {i: len(seen) for i, seen in points2d.items()}
+    assert set(points2d) == {v.image_id for v in sel.accepted}
+    assert all(seen for seen in points2d.values())
 
 
 # ── the session, read back ───────────────────────────────────────────────
@@ -630,3 +637,25 @@ def test_a_loaded_session_selects_and_names_its_own_cameras(tmp_path) -> None:
     assert left.photo_wh == right.photo_wh == (WH,)
     assert (left.width, left.height) == WH
     assert left.fx == KL.fx and right.fx == KR.fx
+
+
+def test_load_session_reads_a_null_measurement_as_nan(tmp_path) -> None:
+    """A one-eyed pose has no gap between the eyes and a disarmed eye has no
+    sharpness; the writer puts `null` there because JSON has no NaN. The
+    reader must take those rows, not refuse the session over them."""
+    written = _written_session(tmp_path)
+    lines = written.manifest_path.read_bytes().decode("utf-8").splitlines()
+    row = json.loads(lines[0])
+    for key in ("pose_rms_px", "pose_gap_deg", "pose_gap_mm",
+                "pose_smooth_mm", "sharpness"):
+        row[key] = None
+    lines[0] = json.dumps(row)
+    written.manifest_path.write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
+
+    _, photos = load_session(written.path)
+
+    first = photos[0]
+    assert all(np.isnan(v) for v in (first.pose_rms_px, first.pose_gap_deg,
+                                     first.pose_gap_mm, first.pose_smooth_mm,
+                                     first.sharpness))
+    assert len(photos) == 6

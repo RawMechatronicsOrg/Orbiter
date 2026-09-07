@@ -295,6 +295,13 @@ def load_session(session_dir: str | Path) -> tuple[SessionInfo, list[PhotoMeta]]
     return info, photos
 
 
+def _number(value: Any) -> float:
+    """A manifest number, or NaN for the `null` the writer puts where a
+    measurement was not finite — a one-eyed pose has no gap between the eyes,
+    a disarmed eye has no sharpness — because JSON has no NaN of its own."""
+    return float("nan") if value is None else float(value)
+
+
 def _photo_from_row(row: dict[str, Any], manifest: Path) -> PhotoMeta:
     pose = row.get("pose") or {}
     if pose.get("convention") != POSE_CONVENTION:
@@ -318,12 +325,12 @@ def _photo_from_row(row: dict[str, Any], manifest: Path) -> PhotoMeta:
         t_mm=np.asarray(pose["t_mm"], float).ravel(),
         pose_source=str(row.get("pose_source", "")),
         pose_composed=bool(row.get("pose_composed", False)),
-        pose_rms_px=float(row.get("pose_rms_px", float("nan"))),
-        pose_gap_deg=float(row.get("pose_gap_deg", float("nan"))),
-        pose_gap_mm=float(row.get("pose_gap_mm", float("nan"))),
+        pose_rms_px=_number(row.get("pose_rms_px")),
+        pose_gap_deg=_number(row.get("pose_gap_deg")),
+        pose_gap_mm=_number(row.get("pose_gap_mm")),
         pose_corners=int(row.get("pose_corners", 0)),
-        pose_smooth_mm=float(row.get("pose_smooth_mm", float("nan"))),
-        sharpness=float(row.get("sharpness", float("nan"))),
+        pose_smooth_mm=_number(row.get("pose_smooth_mm")),
+        sharpness=_number(row.get("sharpness")),
         pass_id=int(row.get("pass_id", 0)),
         laser_on=bool(row.get("laser_on", True)),
         stripe_pixels=int(row.get("stripe_pixels", 0)),
@@ -690,8 +697,17 @@ def texture_set(session: SessionInfo, selection: Selection,
 
 def _name_buckets(missing: set[tuple[int, int]],
                   grid: tuple[int, int]) -> str:
-    """The uncovered buckets as something an operator can act on — `az 120-180
-    at all elevations` rather than a list of index pairs.
+    """The uncovered buckets as something an operator can act on — `cameras
+    looking toward az 120-180 at all elevations` rather than a list of index
+    pairs.
+
+    **The arcs are directions cameras look along, not places they stand.** A
+    bucket is `PhotoMeta.direction`'s bin, so a photograph taken from az 0 is
+    in the az-180 bucket and an operator filling a named hole walks to the
+    opposite azimuth — and, for a named elevation band, to the opposite side of
+    the board plane. Naming the sense is the whole point of the phrase: read as
+    a standing place, every one of these hints sends the camera exactly the
+    wrong way round the turntable.
 
     Runs of neighbouring azimuth bins that miss the same elevation bands are
     collapsed, because that is how a coverage hole actually looks: one arc of
@@ -720,7 +736,7 @@ def _name_buckets(missing: set[tuple[int, int]],
             run_start = None
         if els is not None and run_start is None:
             run_start = ia
-    return "; ".join(parts)
+    return "cameras looking toward " + "; ".join(parts)
 
 
 def image_list_text(names: list[str]) -> str:
@@ -893,20 +909,6 @@ def tracks(selection: Selection, seeds: np.ndarray, seed_normals: np.ndarray,
     return points3d, points2d
 
 
-def observation_counts(
-        points2d_per_image: dict[int, list[tuple[float, float, int]]]
-) -> dict[int, int]:
-    """How many seed points each image observes.
-
-    The number the seed cap is judged by: `patch_match_stereo` takes an
-    image's depth range from the points it observes, so an image with a
-    handful has no range worth the name. C2b's depth-range fallback reads
-    this, and the first run reports it rather than assuming the cap was
-    generous enough (§7 assumption 2).
-    """
-    return {image_id: len(seen) for image_id, seen in points2d_per_image.items()}
-
-
 # ── the cfg the undistorter wrote, rewritten ─────────────────────────────
 
 
@@ -1054,14 +1056,6 @@ def plan_patch_match_cfg(cfg_text: str, selection: Selection,
         missing=tuple(v.photo.name for v in selection.accepted
                       if v.photo.name not in known),
     )
-
-
-def rewrite_patch_match_cfg(cfg_text: str, selection: Selection,
-                            params: CfgParams = CfgParams()) -> str:
-    """The rewritten `dense/stereo/patch-match.cfg` as text — what
-    `plan_patch_match_cfg` produces, for a caller that wants the file and
-    none of the bookkeeping."""
-    return plan_patch_match_cfg(cfg_text, selection, params).text
 
 
 def _cfg_pairs(lines: list[str]) -> list[tuple[int, int | None]]:
