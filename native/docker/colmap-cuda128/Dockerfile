@@ -78,8 +78,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libboost-graph-dev \
         libboost-system-dev \
         libeigen3-dev \
-        libflann-dev \
-        libfreeimage-dev \
+        libopenimageio-dev \
+        openimageio-tools \
         libmetis-dev \
         libgoogle-glog-dev \
         libgflags-dev \
@@ -94,6 +94,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libcurl4-openssl-dev \
         libssl-dev \
  && rm -rf /var/lib/apt/lists/*
+
+# Ubuntu's OpenImageIO CMake config insists on OpenCV's include directory
+# existing even though nothing here uses OIIO's OpenCV bridge — the same
+# one-line workaround COLMAP's own docker/Dockerfile carries for 24.04.
+RUN mkdir -p /usr/include/opencv4
 
 # Shallow, tag-only clone — this is a build input pinned by COLMAP_TAG, not
 # a working checkout anyone here edits, so there is no reason to fetch
@@ -113,6 +118,8 @@ RUN cmake -S /colmap-src -B /colmap-build -GNinja \
         -DCMAKE_CUDA_ARCHITECTURES="75;89;120" \
         -DCUDA_ENABLED=ON \
         -DGUI_ENABLED=OFF \
+        -DOPENGL_ENABLED=OFF \
+        -DONNX_ENABLED=OFF \
         -DTESTS_ENABLED=OFF \
         -DCMAKE_INSTALL_PREFIX=/colmap-installed \
  && cmake --build /colmap-build \
@@ -142,7 +149,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libboost-filesystem-dev \
         libboost-graph-dev \
         libboost-system-dev \
-        libfreeimage-dev \
+        libopenimageio-dev \
         libmetis-dev \
         libgoogle-glog-dev \
         libgflags-dev \
