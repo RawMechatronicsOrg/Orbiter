@@ -330,8 +330,20 @@ def estimate_board_pose_disambiguated(
     cands = []
     for rv, tv in zip(rvecs, tvecs):
         R, _ = cv2.Rodrigues(rv)
-        score = float(np.linalg.norm(matrix_to_rotvec(R_predicted.T @ R)))
-        cands.append((score, R, tv.flatten() * 1000.0))
+        t = tv.flatten() * 1000.0
+        # IPPE hands back NaN for a degenerate corner set - a few nearly
+        # collinear corners at the edge of a partly visible board. Scoring
+        # that raised inside scipy's SVD and cost the frame; it is simply not
+        # a candidate.
+        if not (np.isfinite(R).all() and np.isfinite(t).all()):
+            continue
+        try:
+            score = float(np.linalg.norm(matrix_to_rotvec(R_predicted.T @ R)))
+        except (np.linalg.LinAlgError, ValueError):
+            continue
+        cands.append((score, R, t))
+    if not cands:
+        return None
     cands.sort(key=lambda c: c[0])
     ambiguity_deg = (
         float(np.degrees(np.linalg.norm(

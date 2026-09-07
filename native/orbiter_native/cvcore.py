@@ -121,6 +121,8 @@ def estimate_pose(corners, ids, board, intrinsics: Intrinsics,
     # logged as a detector error and blanked the eye's view as "offline".
     if corners is None or len(corners) < 6:
         return None
+    if R_predicted is not None and not _is_rotation(R_predicted):
+        R_predicted = None                  # a poisoned prior is not a prior
     if R_predicted is None:
         out = estimate_board_pose(corners, ids, board, intrinsics)
         if out is None:
@@ -134,7 +136,92 @@ def estimate_pose(corners, ids, board, intrinsics: Intrinsics,
             return None
         R, t, ambiguity = out
     R, t = _facing(board, R, t)
+    if not _is_rotation(R) or not np.isfinite(t).all():
+        return None                         # not a pose; do not hand it out
     return R, t, ambiguity
+
+
+def refine_pose_pair(board, geom, left_k: Intrinsics | None, right_k: Intrinsics | None,
+                     left, right, R0: np.ndarray, t0: np.ndarray,
+                     ) -> tuple[np.ndarray, np.ndarray, float] | None:
+    """One board pose from BOTH eyes' corners, in this app's board frame and
+    the LEFT camera's coordinates: `(R, t_mm, rms_px)`, or None.
+
+    `left` and `right` are `(corners, ids)` as the detectors hand them over,
+    either of them None; `geom` is the pair (X_right = R X_left + T). The
+    pose that minimises the reprojection error in every image at once is
+    found from `(R0, t0)` by Levenberg–Marquardt over six parameters, each
+    eye weighted by the corners it saw.
+
+    Why both eyes and not the left's PnP: a planar board seen by one camera
+    is weakly constrained in exactly the ways a scan feels — the tilt about
+    the baseline and the depth — and admits a second pose that reprojects
+    almost as well. The right eye sees the same board 146 mm away, and the
+    two views together pin down what neither does alone; the flipped branch
+    fits one image and not the other. The frame here is `estimate_pose`'s:
+    origin at the board's centre, z out of the printed face.
+    """
+    import cv2
+    from scipy.optimize import least_squares
+
+    sx, sy = board.getChessboardSize()
+    sq = float(board.getSquareLength()) * 1000.0     # the board is built in metres
+    centre = np.array([sx * sq / 2.0, sy * sq / 2.0, 0.0])
+    eyes = []
+    pairs = ((left, left_k, np.eye(3), np.zeros(3)),
+             (right, right_k, np.asarray(geom.R, float), np.asarray(geom.T, float).ravel()))
+    for view, k, Re, te in pairs:
+        if view is None or k is None:
+            continue
+        corners, ids = view
+        if corners is None or ids is None or len(corners) < 4:
+            continue
+        obj, img = board.matchImagePoints(corners, ids)
+        if obj is None or len(obj) < 4:
+            continue
+        # OpenCV's board points into this app's frame: p' = FACE_OUT (p − centre).
+        obj_app = (np.asarray(obj, float).reshape(-1, 3) * 1000.0 - centre) @ _FACE_OUT
+        eyes.append((obj_app, np.asarray(img, float).reshape(-1, 2), k, Re, te))
+    if not eyes:
+        return None
+
+    def residuals(x):
+        R = cv2.Rodrigues(x[:3])[0]
+        t = x[3:]
+        out = []
+        for obj, img, k, Re, te in eyes:
+            proj, _ = cv2.projectPoints(obj, cv2.Rodrigues(Re @ R)[0],
+                                        (Re @ t + te).reshape(3, 1), k.K, k.D)
+            out.append((proj.reshape(-1, 2) - img).ravel())
+        return np.concatenate(out)
+
+    x0 = np.concatenate([cv2.Rodrigues(np.asarray(R0, float))[0].ravel(),
+                         np.asarray(t0, float).ravel()])
+    try:
+        sol = least_squares(residuals, x0, method="lm", max_nfev=200)
+    except (ValueError, np.linalg.LinAlgError):
+        return None
+    R = cv2.Rodrigues(sol.x[:3])[0]
+    t = np.asarray(sol.x[3:], float)
+    if not (_is_rotation(R) and np.isfinite(t).all()):
+        return None
+    return R, t, float(np.sqrt(np.mean(sol.fun ** 2)))
+
+
+def _is_rotation(R) -> bool:
+    """Is this a rotation matrix, and not a hole where one should be?
+
+    A degenerate corner set can come back from solvePnP as NaN. Handed out,
+    it puts a NaN pose into the calibration sets; kept by the caller as the
+    next frame's prior, it raises inside the disambiguating solve — and then
+    every frame after it, because the caller keeps the prior it was given and
+    never sees a pose again. Both ends are checked here: nothing that is not
+    a rotation is returned, and nothing that is not a rotation is believed.
+    """
+    R = np.asarray(R, dtype=float)
+    if R.shape != (3, 3) or not np.isfinite(R).all():
+        return False
+    return abs(float(np.linalg.det(R)) - 1.0) < 1e-3
 
 
 def board_spec_from_config(cfg: dict[str, Any]) -> BoardSpec | None:
@@ -169,12 +256,14 @@ def intrinsics_from_eye(
     answer, and the UI says so.
 
     `frame_wh` guards the same failure one step further on. A camera matrix is
-    only valid at the resolution it was solved at, and camserver can be
-    reconfigured between runs; 1280x720 intrinsics applied to a 1080p frame
-    put the principal point in the wrong place and scale the focal length by
-    two thirds, which again yields a plausible, wrong pose. When the size does
-    not match, this returns None rather than rescaling — rescaling would be a
-    guess about the sensor's crop-vs-scale behaviour that nobody has verified.
+    only valid at the resolution it was solved at, and the frame size is not
+    fixed for good — camserver 2.0 pins the capture format per server start,
+    and a stream URL can ask for another size; 1280x720 intrinsics applied to
+    a 1080p frame put the principal point in the wrong place and scale the
+    focal length by two thirds, which again yields a plausible, wrong pose.
+    When the size does not match, this returns None rather than rescaling —
+    rescaling would be a guess about the sensor's crop-vs-scale behaviour that
+    nobody has verified.
     """
     if not eye:
         return None

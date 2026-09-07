@@ -1,0 +1,1181 @@
+"""Continuous calibration: the operator moves the board; this decides what
+each frame is good for, solves in the background as the sets grow, and says
+what to push to the server when a solve improved.
+
+**One activity, four measurements.** Each frame that shows the board serves
+whichever of these it can:
+
+  * a STILL board showing the solve something new — a new place in the frame,
+    a new distance, a new tilt — is a view (per-eye intrinsics), and both eyes
+    seeing it at the same instant makes it a pair (the stereo geometry);
+  * a still board with the stripe straight across it and a pose is a
+    laser-plane frame;
+  * a board moving BRISKLY is a readout frame — the rolling shutter's time is
+    measured from the motion that ruins a view.
+
+**Raw observations, redone solves.** Every set keeps what was observed —
+corners, IDs, stripe pixels, capture instants — never what was derived from
+it. Each cycle solves the intrinsics from all views, then the pair, the plane
+and the readout from *their* raw sets through the intrinsics just solved: the
+plane's points and the readout's poses are recomputed, not accumulated, so
+they improve with the camera matrix that places them. Twenty near-duplicate
+views are worth less than six different ones, so views are gated on novelty
+(`intrinsics.SampleSet`), and the guidance names what is still missing.
+
+**Cycles run on a thread.** `due` says when a cycle is worth starting,
+`snapshot` copies the inputs, `run` does the solves (nothing else touches
+the flow's state), `finish` adopts the outcome and returns what to save. A
+result replaces the previous when it is better — more data at a residual no
+worse than a little, or a lower residual — and only then goes to the server,
+so a bad early solve is never written over a good stored one.
+
+The pairing of the two eyes' results by camserver's capture clock lives here
+too, moved from the panel: it is a decision about frames, not about widgets,
+and it wants tests.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+import numpy as np
+
+from .intrinsics import (
+    MIN_TILT_SPREAD,
+    MIN_VIEWS,
+    EyeView,
+    PairSample,
+    SampleSet,
+)
+from .intrinsics import solve as solve_intrinsics
+from .laserplane import LaserPlane, PlaneCollector
+from .scan import ScanVolume
+from .rolling import MotionCollector, MotionView, solve_readout
+from .stereo import calibrate as solve_stereo
+from .intrinsics import describe as _describe
+from .timealign import interpolate_corners
+
+log = logging.getLogger("orbiter_native.calibflow")
+
+#: What makes two frames one view is not the clock but the board: how far it
+#: moved between the two exposures, in px, at the speed the corners were last
+#: measured moving. The cameras free-run — camserver times both from one clock
+#: to about 0.05 ms, but nothing holds them in phase, so the offset between the
+#: eyes sits wherever it lands and walks slowly. Measured on this rig at 29
+#: fps: 11 ms for fourteen seconds at a stretch, then 3-7 ms for the next
+#: twelve. A fixed few-millisecond window pairs 3-8% of frames through the bad
+#: half of that walk and 40-57% through the good half; this gate instead widens
+#: as the board is held steadier, which is exactly when a wider one is safe.
+#: 0.3 px against a stereo residual of ~2 px adds nothing that can be measured.
+PAIR_MOVE_PX = 0.3
+#: ...and never further apart than half a frame interval, past which the
+#: nearest frame in the other eye is a different moment, not this one.
+PAIR_MAX_GAP_S = 0.016
+
+#: In a lens stage (`CalibrationFlow.solo`), how much older than this eye's
+#: newest frame the other eye's newest board frame may be for the two to
+#: count as a pair in the making: two frames at 30 fps. Beyond it the other
+#: eye's stream has stopped, or it lost the board, and this eye takes its
+#: views alone rather than wait for a pair that cannot form.
+PARTNER_FRESH_S = 4 * PAIR_MAX_GAP_S
+
+#: Recent results kept per eye while looking for a partner frame. Detection
+#: takes 5-20 ms and the two threads drift independently; measured over 269
+#: attempts the newest left and right results were a median 144 ms apart, so
+#: comparing only the newest two captured nothing. This spans about half a
+#: second at 30 fps.
+PAIR_HISTORY = 16
+
+#: The board must be this still before a view or a plane frame is taken,
+#: as median corner movement since the previous detection. Motion blur rounds
+#: corners off and quietly biases the solve.
+STILL_PX = 1.0
+#: ...and this brisk before a frame is worth the readout solve: ~4 px per
+#: frame is 120 px/s, a couple of pixels of skew over a 20 ms readout. The
+#: solve measures the skew itself and refuses too little.
+FAST_PX = 4.0
+#: A frame feeds the readout solve from this many corners: the pose has to be
+#: sound before its slide across the rows can be measured.
+READOUT_MIN_CORNERS = 12
+
+#: Views held at most. calibrateCamera's cost grows with the set and past a
+#: hundred-odd genuinely different views nothing improves; the novelty gate
+#: keeps the set that size on its own, this is the ceiling.
+MAX_VIEWS = 160
+
+#: A cycle starts no sooner than this after the previous one ended, and only
+#: when a set grew. Solves are seconds each; the loop paces itself on them.
+CYCLE_MIN_S = 4.0
+
+#: A new result replaces a stored one when it has more data and a residual no
+#: more than this much worse, or a lower residual outright.
+WORSE_TOLERANCE = 1.15
+
+#: A new pair or sheet that differs from the server's by more than this is
+#: not a worse solve of the same rig, it is a solve of another rig — the
+#: cameras were re-aimed, the laser was moved — and it replaces the stored
+#: one whatever the counts, the way 'Rig moved' would have let it. The
+#: pair's residual accounts for ~0.3° / 2 mm at the working distance; a
+#: re-aim is degrees. Below `MOVED_MIN_*` of data the new solve is too thin
+#: to be believed over the old on its own word.
+PAIR_MOVED_DEG = 1.0
+PAIR_MOVED_MM = 5.0
+PLANE_MOVED_DEG = 1.0
+PLANE_MOVED_MM = 3.0
+MOVED_MIN_VIEWS = 10
+MOVED_MIN_FRAMES = 6
+
+SOLVES = ("intrinsics:left", "intrinsics:right", "stereo", "plane",
+          "readout:left", "readout:right")
+
+#: What the error budget assumes when it has not been told better: the
+#: subject's distance, the stripe centroid's noise across the stripe (0.6-0.7
+#: px measured on this rig's line fits), the focal length's uncertainty for
+#: intrinsics that came without one, and a hand's speed for an uncorrected
+#: rolling shutter with a typical readout.
+ASSUMED_Z_MM = 500.0
+ASSUMED_STRIPE_PX = 0.6
+ASSUMED_FOCAL_REL = 0.005
+ASSUMED_HAND_MM_S = 30.0
+ASSUMED_READOUT_S = 0.02
+
+
+@dataclass(frozen=True)
+class ErrorBudget:
+    """Expected one-sigma error of a scanned point, in mm, at a working
+    distance — what the calibration so far buys, term by term.
+
+    The scan places a stripe centroid on the laser sheet, so its error is
+    the centroid's pixel noise carried through the sheet's geometry
+    (`stripe_mm`: dZ/dpx = Z² / (f · d) for a sheet `d` from the camera
+    containing the optical axis, which is this rig), plus how well the
+    sheet itself is known (`sheet_mm`, the plane fit's residual), plus the
+    scale the focal length's uncertainty puts on the volume (`scale_mm`),
+    plus the rolling shutter while it is uncorrected (`shutter_mm`). The
+    terms are independent, so they add in quadrature.
+    """
+
+    z_mm: float
+    stripe_px: float
+    stripe_mm: float
+    sheet_mm: float
+    scale_mm: float
+    shutter_mm: float
+    assumed: tuple[str, ...] = ()
+
+    @property
+    def total_mm(self) -> float:
+        return float(np.sqrt(self.stripe_mm ** 2 + self.sheet_mm ** 2
+                             + self.scale_mm ** 2 + self.shutter_mm ** 2))
+
+
+@dataclass
+class Job:
+    """One cycle's inputs, copied off the flow so the thread owns them."""
+
+    board: Any
+    wh: tuple[int, int]
+    views: dict[str, list[EyeView]]
+    tilt: dict[str, float]
+    pairs: list[PairSample]
+    plane_frames: int
+    plane: PlaneCollector
+    motion: dict[str, list[MotionView]]
+    known_k: dict[str, Any]
+    laser_active: bool
+    #: Solves whose inputs have not changed since they last ran — the same
+    #: data gives the same answer, and a cycle that re-solves a hundred
+    #: views and three hundred readout frames every four seconds starves
+    #: the detector threads. Dependants of a lens that is re-solved this
+    #: cycle are never skipped: they must be re-fitted through it.
+    skip: set[str] = field(default_factory=set)
+
+
+@dataclass
+class Outcome:
+    """What a cycle produced: a result or a reason per solve."""
+
+    results: dict[str, Any] = field(default_factory=dict)
+    reasons: dict[str, str] = field(default_factory=dict)
+    seconds: float = 0.0
+    #: Seconds per solve that ran, and the solves that did not.
+    timings: dict[str, float] = field(default_factory=dict)
+    skipped: set[str] = field(default_factory=set)
+
+
+@dataclass(frozen=True)
+class Saved:
+    """What the server holds for one solve, enough to judge a challenger.
+
+    `floor` is the best residual this solve has ever reached. It is what
+    the tolerance below is measured against — never the residual in hand,
+    which would let a run of within-tolerance regressions walk the
+    calibration away from its best one cycle at a time.
+    """
+
+    count: int
+    residual: float
+    floor: float
+
+    @staticmethod
+    def first(count: int, residual: float) -> "Saved":
+        """The first thing known for a solve: it is its own floor."""
+        return Saved(int(count), float(residual), float(residual))
+
+    def adopt(self, count: int, residual: float) -> "Saved":
+        """This solve once `count`/`residual` has been saved over it."""
+        floor = self.floor
+        if not np.isfinite(floor) or (np.isfinite(residual) and residual < floor):
+            floor = residual
+        return Saved(int(count), float(residual), float(floor))
+
+
+def _better(new_count: int, new_res: float, old: Saved | None) -> bool:
+    """Should this solve replace what is saved?
+
+    Never on less data. Every residual here is measured on the very data
+    that was fitted, and such a residual falls as data is taken away: a
+    calibration from thirteen views reports a smaller reprojection error
+    than the same rig from a hundred and ninety-six, and preferring it
+    walks the calibration to its most overfit point and freezes there.
+    So more data first, and only then the residual — lower wins, or a
+    little worse against `old.floor`, the best this solve has reached, so
+    the tolerance cannot be spent again every cycle and ratchet upward.
+    """
+    if old is None:
+        return True
+    if new_count < old.count:
+        return False
+    if not np.isfinite(old.residual):
+        return True
+    if new_res < old.residual:
+        return True
+    return new_count > old.count and new_res <= old.floor * WORSE_TOLERANCE
+
+
+@dataclass
+class _Corners:
+    corners: np.ndarray
+    ids: np.ndarray
+
+
+@dataclass
+class _Synthetic:
+    """A right-eye result made at the left's instant by `timealign` — the
+    fields `_capture` reads from a real one."""
+
+    side: str
+    board: _Corners
+    descriptor: Any
+    wh: tuple[int, int]
+    capture_mono: float
+
+
+class CalibrationFlow:
+    """The sets, the pairing, the schedule, and the verdicts."""
+
+    def __init__(self, solvers: dict[str, Callable] | None = None) -> None:
+        self.samples = SampleSet()
+        self.plane = PlaneCollector()
+        self.motion = MotionCollector()
+        self.board = None
+        self.board_spec = None
+        #: Best intrinsics known per eye: the server's, then each better solve.
+        self.known_k: dict[str, Any] = {}
+        self.laser_active = False
+        #: The eye whose lens is being calibrated on its own — "left",
+        #: "right" or None. The guide sets it for its per-eye stages: a
+        #: still board that only this eye sees becomes a view, where the pair
+        #: rule would wait for the other eye. A lens is measured at the
+        #: frame's own corners and edges, and the other eye does not see
+        #: those places at all.
+        self.solo: str | None = None
+        #: Latest result and latest refusal per solve, for the scoreboard.
+        self.results: dict[str, Any] = {}
+        self.reasons: dict[str, str] = {}
+        #: What the server holds, per solve, as far as this flow knows.
+        self.saved: dict[str, Saved] = {}
+        #: The focal length's one-sigma uncertainty per eye, px, when known.
+        self.sigma_f: dict[str, float] = {}
+        #: The plane the server holds, until a solve here is accepted.
+        self.stored_plane: LaserPlane | None = None
+        #: The pair the server holds, (R, T), for the same comparison.
+        self.stored_pair: tuple[np.ndarray, np.ndarray] | None = None
+        #: What the last cycle had to say beyond its solves — a rig move
+        #: told by the geometry — for the panel; read once and cleared.
+        self.last_note: str | None = None
+        #: The best sheet solved here, the counterpart of `known_k`.
+        self.solved_plane: LaserPlane | None = None
+        self.solvers = solvers or {
+            "intrinsics": solve_intrinsics, "stereo": solve_stereo,
+            "plane": None, "readout": solve_readout}
+        self._recent: dict[str, deque] = {"left": deque(maxlen=PAIR_HISTORY),
+                                          "right": deque(maxlen=PAIR_HISTORY)}
+        self._last_corners: dict[str, tuple[np.ndarray, np.ndarray, float | None] | None] = {}
+        self._moved: dict[str, float | None] = {"left": None, "right": None}
+        #: What each eye's newest frame showed, for the guide: the board's
+        #: place in the frame and whether the stripe fit across it.
+        self._last_desc: dict[str, Any] = {"left": None, "right": None}
+        self._last_stripe_ok: dict[str, bool] = {"left": False, "right": False}
+        #: Corner speed per eye, px/s, for what a pair's gap costs.
+        self._speed: dict[str, float | None] = {"left": None, "right": None}
+        self._running = False
+        self._last_cycle_end = -1e9
+        self._seen = self._counts()
+        #: Per solve, the data count it last ran on; a solve runs again only
+        #: when its count moved, its lens was re-solved, or the operator asked.
+        self._ran: dict[str, int] = {}
+        self._force = False
+
+    # ── configuration ─────────────────────────────────────────────────────
+
+    def set_board(self, spec, board) -> bool:
+        """Adopt a board. Returns True if the sets were dropped: views measured
+        against a different board must not mix with these."""
+        if spec == self.board_spec:
+            return False
+        had = len(self.samples) or self.plane.frames or self.motion.total
+        self.board_spec, self.board = spec, board
+        if had:
+            self.clear()
+        return bool(had)
+
+    def set_known_intrinsics(self, side: str, k, raw: dict | None = None) -> None:
+        """Intrinsics the server already holds. `raw` is the stored dict, whose
+        `views`/`rms_px` say how strong a challenger has to be."""
+        if k is None:
+            return
+        self.known_k.setdefault(side, k)
+        sf = (raw or {}).get("sigma_f")
+        if sf is not None and side not in self.sigma_f:
+            try:
+                self.sigma_f[side] = float(sf)
+            except (TypeError, ValueError):
+                pass
+        key = f"intrinsics:{side}"
+        if key not in self.saved:
+            n = int((raw or {}).get("views", 0) or 0)
+            # Stored before this app measured one: unknown, not zero. The
+            # view count still holds the bar until a challenger matches it.
+            self.saved[key] = Saved.first(n, self.sigma_f.get(side, float("nan")))
+
+    def set_stored(self, key: str, count: int, residual: float) -> None:
+        """A stereo / plane / readout figure the server holds."""
+        self.saved.setdefault(key, Saved.first(count, residual))
+
+    def set_stored_pair(self, raw: dict | None) -> None:
+        """The pair geometry the server holds, from its stored dict."""
+        if self.stored_pair is None and raw and "R" in raw and "T" in raw:
+            self.stored_pair = (np.asarray(raw["R"], float).reshape(3, 3),
+                                np.asarray(raw["T"], float).ravel())
+
+    def clear(self) -> None:
+        self.samples.clear()
+        self.plane.clear()
+        self.motion.clear()
+        self.results.clear()
+        self.reasons.clear()
+        self._ran.clear()
+        for q in self._recent.values():
+            q.clear()
+        self._last_corners.clear()
+
+    def rig_moved(self) -> int:
+        """The cameras were re-aimed, or moved against each other or the
+        laser. Returns how many pairs were split.
+
+        What that stales is the pair's geometry and the sheet — the sheet is
+        expressed in the left camera's frame — and every pair captured before
+        the move, AS a pair. Each eye's view of the board is as good as it
+        was, so the pairs are split into one-eyed samples and stay for the
+        intrinsics; the sheet's frames go; the readout is per eye and stays.
+
+        The server's stereo and plane stop being a bar to beat: the rule that
+        refuses a solve on less data is right while the rig stands still and
+        exactly wrong once it has moved — the stale solve would win on views
+        forever. A sentinel (no views, infinite residual) takes their place,
+        so the first new solve of each is accepted and saved, and the
+        scoreboard says the server's is stale until then.
+        """
+        split = 0
+        kept = []
+        for s in self.samples.samples:
+            if s.both:
+                kept.append(PairSample(left=s.left, right=None))
+                kept.append(PairSample(left=None, right=s.right))
+                split += 1
+            else:
+                kept.append(s)
+        self.samples.samples = kept
+        self.plane.clear()
+        for key in ("stereo", "plane"):
+            self.results.pop(key, None)
+            self.reasons.pop(key, None)
+            self.saved[key] = Saved.first(0, float("inf"))
+        self.stored_plane = None
+        self.solved_plane = None
+        self.request()
+        return split
+
+    def _stale(self, key: str) -> bool:
+        """Is what the server holds for `key` known to be from before a rig
+        move — the sentinel `rig_moved` leaves?"""
+        s = self.saved.get(key)
+        return s is not None and s.count == 0 and not np.isfinite(s.residual)
+
+    # ── the live feed ─────────────────────────────────────────────────────
+
+    def offer(self, res, auto: bool = True) -> str | None:
+        """Take one eye's result; returns a note when something was banked."""
+        moved = self._movement(res)
+        board = res.board
+        has_board = board is not None and board.corners is not None
+        self._last_desc[res.side] = res.descriptor if has_board else None
+        self._last_stripe_ok[res.side] = bool(res.laser is not None and res.laser.ok)
+        notes = []
+        if has_board:
+            self._recent[res.side].append(res)
+            # Brisk motion feeds the readout solve.
+            if (moved is not None and moved >= FAST_PX and board.count >= READOUT_MIN_CORNERS
+                    and res.capture_mono is not None):
+                self.motion.add(res.side, MotionView(
+                    np.array(board.corners, np.float32), np.array(board.ids, np.int32),
+                    res.capture_mono, res.wh))
+                notes.append(f"readout frame {self.motion.count(res.side)} ({res.side})")
+        if self._bank_plane(res, moved):
+            notes.append(f"plane frame {self.plane.frames}")
+        if auto and self.board is not None:
+            n = self._capture(force=False)
+            if n:
+                notes.append(f"view {n}")
+        return "; ".join(notes) if notes else None
+
+    def _movement(self, res) -> float | None:
+        """Median corner movement since this eye's previous detection, px, by
+        corner ID — the count flickers as marginal corners drop in and out."""
+        board = res.board
+        if board is None or board.corners is None or board.ids is None:
+            self._last_corners[res.side] = None
+            self._moved[res.side] = self._speed[res.side] = None
+            self._last_desc[res.side] = None
+            return None
+        cur = board.corners.reshape(-1, 2)
+        cur_ids = board.ids.ravel()
+        prev = self._last_corners.get(res.side)
+        self._last_corners[res.side] = (cur_ids, cur, res.capture_mono)
+        moved = speed = None
+        if prev is not None:
+            prev_ids, prev_pts, prev_t = prev
+            common = np.intersect1d(prev_ids, cur_ids)
+            if len(common) >= 4:
+                a = prev_pts[np.isin(prev_ids, common)]
+                b = cur[np.isin(cur_ids, common)]
+                moved = float(np.median(np.linalg.norm(b - a, axis=1)))
+                dt = (res.capture_mono - prev_t
+                      if prev_t is not None and res.capture_mono is not None else None)
+                if dt is not None and dt > 0:
+                    speed = moved / dt
+        self._moved[res.side] = moved
+        self._speed[res.side] = speed
+        return moved
+
+    def _bank_plane(self, res, moved: float | None) -> bool:
+        """Left eye, stripe straight across the board, pose known, still."""
+        k = self.known_k.get("left")
+        line, board = res.laser, res.board
+        if (res.side != "left" or k is None or line is None or not line.ok
+                or board is None or board.R is None or board.t is None
+                or board.corners is None or moved is None or moved > STILL_PX):
+            return False
+        return bool(self.plane.add_frame(
+            line.inlier_points, k, board.R, board.t, line.rms_px,
+            corners=board.corners, ids=board.ids, wh=res.wh))
+
+    def _best_pair(self):
+        """The closest left/right results in the capture clock, as
+        `(gap_s, left, right)`, or None while either eye has nothing recent.
+
+        When the closest real pair would be refused — too far apart in the
+        clock, or the board slid too far between the two exposures — the
+        right eye is instead brought to the newest left's instant by
+        interpolating between the two right frames that bracket it
+        (`timealign`), and that synthetic pair has no gap at all. What the
+        gates measure is the board's motion between the two exposures; a
+        view made AT the left's exposure has none.
+        """
+        left, right = self._recent["left"], self._recent["right"]
+        if not left or not right:
+            # Deliberately not "whichever eye has something": the history is
+            # cleared after every capture, so the next result would always find
+            # the other side empty and be stored one-eyed — and the stereo
+            # solve needs the paired ones.
+            return None
+        best = None
+        for a in left:
+            if a.capture_mono is None:
+                continue
+            for b in right:
+                if b.capture_mono is None:
+                    continue
+                gap = abs(a.capture_mono - b.capture_mono)
+                if best is None or gap < best[0]:
+                    best = (gap, a, b)
+        if (best is not None and best[0] <= PAIR_MAX_GAP_S
+                and self._drift_px(best[0]) <= PAIR_MOVE_PX):
+            return best
+        synthetic = self._bracketed_right(left[-1])
+        if synthetic is not None:
+            return (0.0, left[-1], synthetic)
+        return best
+
+    def _bracketed_right(self, a):
+        """The right eye at the left result `a`'s instant: its corners
+        interpolated between the two right results that bracket that instant,
+        both with the board in view. None when there is no such bracket."""
+        if a.capture_mono is None or self.board is None:
+            return None
+        rights = [r for r in self._recent["right"]
+                  if r.capture_mono is not None and r.board is not None
+                  and r.board.corners is not None]
+        before = [r for r in rights if r.capture_mono <= a.capture_mono]
+        after = [r for r in rights if r.capture_mono >= a.capture_mono]
+        if not before or not after:
+            return None
+        r0, r1 = before[-1], after[0]
+        fit = interpolate_corners(r0.board.corners, r0.board.ids, r0.capture_mono,
+                                  r1.board.corners, r1.board.ids, r1.capture_mono,
+                                  a.capture_mono)
+        if fit is None:
+            return None
+        corners, ids = fit
+        descriptor = _describe(corners, ids, self.board, r1.wh)
+        if descriptor is None:
+            return None
+        return _Synthetic("right", _Corners(corners, ids), descriptor, r1.wh, a.capture_mono)
+
+    def _find_pair(self):
+        best = self._best_pair()
+        if best is None or best[0] > PAIR_MAX_GAP_S:
+            return None, None
+        if self._drift_px(best[0]) > PAIR_MOVE_PX:
+            return None, None
+        return best[1], best[2]
+
+    def _drift_px(self, gap: float) -> float:
+        """How far the board moves between two exposures `gap` apart, px, at
+        the faster eye's measured corner speed. An unmeasured speed counts as
+        none: `_still` is what refuses a board that is moving, and it runs on
+        every automatic capture."""
+        speeds = [s for s in (self._speed.get("left"), self._speed.get("right"))
+                  if s is not None]
+        return max(speeds) * gap if speeds else 0.0
+
+    def _still(self, side: str) -> bool:
+        m = self._moved.get(side)
+        return m is not None and m <= STILL_PX
+
+    def gate(self, solo: str | None = "") -> tuple[str, str]:
+        """Why the automatic capture is not taking a view right now: the first
+        gate the current frames fail, in the order `_capture` applies them,
+        as `(key, why)`. The key is one word for the guide to act on, the
+        text is for the panel. `solo` overrides `self.solo` for the asking,
+        so the guide can read a stage's gate before it has switched to it.
+
+        From the outside every gate looks the same — the view count does not
+        move — and an operator waving the board sees nothing to correct. Which
+        eye, and by how many pixels, is the difference between "hold still"
+        and knowing that the right eye has never seen the board at all.
+        """
+        if solo == "":
+            solo = self.solo
+        if self.board is None:
+            return "spec", "no board spec from the server"
+        if len(self.samples) >= MAX_VIEWS:
+            return "ceiling", f"{MAX_VIEWS} views held, the ceiling"
+        if solo is not None:
+            own = self._solo_gate(solo)
+            one = self._recent[solo][-1] if self._recent[solo] else None
+            if own[0] != "ok" or one is None or not self._partner(solo, one):
+                return own
+            # A still partner in the picture: the pair's gates decide, as
+            # `_capture` waits for the pair in that case.
+        return self._pair_gate(solo)
+
+    def _pair_gate(self, solo: str | None) -> tuple[str, str]:
+        """The pair path's gates; with `solo`, novelty is that eye's own."""
+        absent = [s for s in ("left", "right") if self._last_corners.get(s) is None]
+        if absent:
+            return "board", ("no board in either eye" if len(absent) == 2
+                             else f"no board in the {absent[0]} eye: a view needs both")
+        if any(self._moved.get(s) is None for s in ("left", "right")):
+            return "settling", "settling: stillness is measured over two frames"
+        moving = [s for s in ("left", "right") if not self._still(s)]
+        if moving:
+            return "moving", ("moving " + ", ".join(f"{s} {self._moved[s]:.1f} px" for s in moving)
+                              + f": hold still, under {STILL_PX:g} px per frame")
+        best = self._best_pair()
+        if best is None:
+            return "wait", "waiting for the next frame of both eyes"
+        gap, a, b = best
+        if gap > PAIR_MAX_GAP_S:
+            return "gap", (f"eyes {gap * 1000:.0f} ms apart, over {PAIR_MAX_GAP_S * 1000:.0f}: "
+                           "waiting for a closer pair")
+        drift = self._drift_px(gap)
+        if drift > PAIR_MOVE_PX:
+            return "drift", (f"board slides {drift:.2f} px between the eyes' exposures, "
+                             f"over {PAIR_MOVE_PX:g}: hold stiller")
+        if solo is not None:
+            d = (a if solo == "left" else b).descriptor
+            if d is None:
+                # Too few corners to describe: not a duplicate, not a view yet.
+                return "wait", f"waiting for a fuller {solo} detection"
+            if self.samples.novelty(solo, d) < self.samples.novelty_threshold:
+                return "dup", (f"still, nothing new for the {solo} eye: a new place in the "
+                               "frame or a new tilt")
+        elif not self.samples.is_new(a.descriptor, b.descriptor):
+            return "dup", "still and paired, nothing new: a new place in the frame or a new tilt"
+        return "ok", "taking a view"
+
+    def _partner(self, solo: str, one) -> bool:
+        """Whether the other eye is in the pair right now: it delivered a
+        board within `PARTNER_FRESH_S` of this eye's newest frame `one`, and
+        holds still. Read from the eyes' newest frames, not from the pair
+        history — that is cleared at every capture, and an eye whose stream
+        has stopped leaves no frame to say so."""
+        other = "right" if solo == "left" else "left"
+        last = self._last_corners.get(other)
+        if last is None or last[2] is None or one.capture_mono is None:
+            return False
+        return abs(one.capture_mono - last[2]) <= PARTNER_FRESH_S and self._still(other)
+
+    def _solo_gate(self, side: str) -> tuple[str, str]:
+        """`gate` for one eye's own stage: the other eye is not asked."""
+        if self._last_corners.get(side) is None:
+            return "board", f"no board in the {side} eye"
+        if self._moved.get(side) is None:
+            return "settling", "settling: stillness is measured over two frames"
+        if not self._still(side):
+            return "moving", (f"moving {side} {self._moved[side]:.1f} px: hold still, "
+                              f"under {STILL_PX:g} px per frame")
+        if not self._recent[side]:
+            return "wait", f"waiting for the next {side} frame"
+        d = self._recent[side][-1].descriptor
+        if d is None:
+            return "wait", f"waiting for a fuller {side} detection"
+        if self.samples.novelty(side, d) < self.samples.novelty_threshold:
+            return "dup", (f"still, nothing new for the {side} eye: a new place in the frame "
+                           "or a new tilt")
+        return "ok", "taking a view"
+
+    def gate_report(self) -> str:
+        """`gate`'s text alone."""
+        return self.gate()[1]
+
+    # ── what the eyes see now, for the guide ────────────────────────────
+
+    def where(self, side: str) -> tuple[float, float] | None:
+        """The board's place in this eye's newest frame — its corners'
+        centroid as fractions of the frame, (x, y) in 0..1 — or None when
+        the eye does not see it."""
+        d = self._last_desc.get(side)
+        return None if d is None else (float(d.cx), float(d.cy))
+
+    def moved(self, side: str) -> float | None:
+        """How far this eye's board moved since its previous frame, px, or
+        None before a second frame."""
+        return self._moved.get(side)
+
+    def stripe_ok(self, side: str) -> bool:
+        """Whether the laser line fitted across the board in this eye's
+        newest frame."""
+        return bool(self._last_stripe_ok.get(side))
+
+    def is_saved(self, key: str) -> bool:
+        """Whether the server holds this solve's current result."""
+        res = self.results.get(key)
+        return res is not None and self._is_saved(key, res)
+
+    def held(self, key: str, at_least: int = 1) -> int:
+        """How much data the solve the server holds was made from, when it
+        holds one from at least `at_least` and the rig has not moved since
+        — else 0. A lens solved last week is a lens; a pair from before the
+        cameras were re-aimed is not."""
+        saved = self.saved.get(key)
+        if saved is None or saved.count < at_least or self._stale(key):
+            return 0
+        return int(saved.count)
+
+    def capture(self) -> int:
+        """Manual capture: whatever is there, still or not. Returns the count."""
+        return self._capture(force=True)
+
+    def _capture(self, force: bool) -> int:
+        if self.board is None or len(self.samples) >= MAX_VIEWS:
+            return 0
+        left, right = self._find_pair()
+        if force:
+            left = left or (self._recent["left"][-1] if self._recent["left"] else None)
+            right = right or (self._recent["right"][-1] if self._recent["right"] else None)
+        elif self.solo is not None:
+            # This eye's own stage. While the other eye delivered a still
+            # board within the last couple of frames, the pair is worth
+            # waiting for — its frame comes a few ms after this one.
+            # Otherwise this eye's newest frame stands alone, so an eye that
+            # is out of the picture, shaking, or whose stream has stopped
+            # cannot starve it. The stillness and novelty gates below apply.
+            one = self._recent[self.solo][-1] if self._recent[self.solo] else None
+            if one is None:
+                return 0
+            if not self._partner(self.solo, one):
+                left, right = (one, None) if self.solo == "left" else (None, one)
+            elif left is None or right is None:
+                return 0
+        elif left is None or right is None:
+            return 0
+        if left is None and right is None:
+            return 0
+        views = {"left": None, "right": None}
+        for side, r in (("left", left), ("right", right)):
+            if (r is None or r.board is None or r.board.corners is None
+                    or r.descriptor is None):
+                continue
+            if not force and not self._still(side):
+                return 0
+            views[side] = EyeView(r.board.corners, r.board.ids, r.wh,
+                                  r.descriptor, capture_mono=r.capture_mono)
+        if views["left"] is None and views["right"] is None:
+            return 0
+        if not force and self.solo is not None:
+            # A lens stage: new for THIS eye, or it is a duplicate for the
+            # solve the stage is for, whatever the other eye is seeing — and
+            # a frame of this eye too sparse to describe is no view of it.
+            own = views.get(self.solo)
+            if own is None or (self.samples.novelty(self.solo, own.descriptor)
+                               < self.samples.novelty_threshold):
+                return 0
+        elif not force and not self.samples.is_new(
+                views["left"].descriptor if views["left"] else None,
+                views["right"].descriptor if views["right"] else None):
+            return 0
+        self.samples.add(PairSample(left=views["left"], right=views["right"]))
+        # Consumed: the same frames must not be captured again while the
+        # operator holds the board still.
+        for q in self._recent.values():
+            q.clear()
+        return len(self.samples)
+
+    # ── the schedule ──────────────────────────────────────────────────────
+
+    def _counts(self) -> dict[str, int]:
+        return {
+            "left": len(self.samples.views("left")),
+            "right": len(self.samples.views("right")),
+            "pairs": len(self.samples.paired()),
+            "plane": self.plane.frames,
+            "motion:left": self.motion.count("left"),
+            "motion:right": self.motion.count("right"),
+        }
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    def request(self) -> None:
+        """Make the next `due` true regardless of pacing, and have it solve
+        everything: the operator asked."""
+        self._seen = {}
+        self._force = True
+        self._last_cycle_end = -1e9
+
+    def payload_current(self) -> dict[str, Any] | None:
+        """Every current result, in the save shape — the operator's 'save now',
+        which does not ask whether it beats what the server holds."""
+        payload: dict[str, Any] = {}
+        for key, res in self.results.items():
+            kind, _, side = key.partition(":")
+            if kind == "intrinsics":
+                payload.setdefault(side, {})["intrinsics"] = res.as_config()
+            elif kind == "stereo":
+                payload["_extrinsics"] = res.as_config()
+            elif kind == "plane":
+                payload["_laser_plane"] = res.as_config()
+            elif kind == "readout":
+                payload.setdefault(side, {})["readout"] = res.as_config()
+            # The server will hold this solve: record it the way an accepted
+            # cycle does, so the floor carries on (or starts here). Building
+            # Saved() by hand skipped the floor and raised on the button.
+            count, resid = _measure(key, res)
+            old = self.saved.get(key)
+            self.saved[key] = (old.adopt(count, resid) if old is not None
+                               else Saved.first(count, resid))
+        return payload or None
+
+    def due(self, now: float) -> bool:
+        if self._running or self.board is None:
+            return False
+        if now - self._last_cycle_end < CYCLE_MIN_S:
+            return False
+        return self._counts() != self._seen
+
+    def snapshot(self, now: float, wh: tuple[int, int] | None = None) -> Job:
+        """Copy the inputs for a cycle and mark it running."""
+        counts = self._counts()
+        self._seen = counts
+        self._running = True
+        skip = self._unchanged(counts)
+        views = {s: list(self.samples.views(s)) for s in ("left", "right")}
+        if wh is None:
+            for s in ("left", "right"):
+                if views[s]:
+                    wh = views[s][0].wh
+                    break
+        return Job(
+            board=self.board, wh=wh or (0, 0), views=views,
+            tilt={s: self.samples.tilt_spread(s) for s in ("left", "right")},
+            pairs=list(self.samples.paired()), plane_frames=self.plane.frames,
+            plane=self.plane.copy(),
+            motion={s: list(self.motion.views(s)) for s in ("left", "right")},
+            known_k=dict(self.known_k), laser_active=self.laser_active, skip=skip,
+        )
+
+    def _unchanged(self, counts: dict[str, int]) -> set[str]:
+        """The solves this cycle may skip, and the bookkeeping that says
+        which counts the ones that run are running on."""
+        by_key = {"intrinsics:left": counts["left"], "intrinsics:right": counts["right"],
+                  "stereo": counts["pairs"], "plane": counts["plane"],
+                  "readout:left": counts["motion:left"],
+                  "readout:right": counts["motion:right"]}
+        force, self._force = self._force, False
+        same = {key: (not force and self._ran.get(key) == n) for key, n in by_key.items()}
+        lens = {s: not same[f"intrinsics:{s}"] for s in ("left", "right")}
+        skip = {key for key in ("intrinsics:left", "intrinsics:right") if same[key]}
+        if same["stereo"] and not (lens["left"] or lens["right"]):
+            skip.add("stereo")
+        if same["plane"] and not lens["left"]:
+            skip.add("plane")
+        for s in ("left", "right"):
+            if same[f"readout:{s}"] and not lens[s]:
+                skip.add(f"readout:{s}")
+        for key, n in by_key.items():
+            if key not in skip:
+                self._ran[key] = n
+        return skip
+
+    def run(self, job: Job) -> Outcome:
+        """The solves, in dependency order, on the job's copies only."""
+        t0 = time.perf_counter()
+        out = Outcome(skipped=set(job.skip))
+        k = dict(job.known_k)
+        for side in ("left", "right"):
+            key = f"intrinsics:{side}"
+            if key in job.skip:
+                continue
+            views = job.views[side]
+            if len(views) < MIN_VIEWS:
+                out.reasons[key] = f"{len(views)} views, need {MIN_VIEWS}"
+                continue
+            t1 = time.perf_counter()
+            res, why = self.solvers["intrinsics"](views, job.board, tilt_spread=job.tilt[side])
+            out.timings[key] = time.perf_counter() - t1
+            if res is None:
+                out.reasons[key] = why
+                continue
+            out.results[key] = res
+            k[side] = res.intrinsics
+        if "stereo" in job.skip:
+            pass
+        elif "left" in k and "right" in k and job.pairs:
+            t1 = time.perf_counter()
+            res, why = self.solvers["stereo"](job.pairs, job.board, k["left"], k["right"],
+                                              job.pairs[0].left.wh)
+            out.timings["stereo"] = time.perf_counter() - t1
+            if res is None:
+                out.reasons["stereo"] = why
+            else:
+                out.results["stereo"] = res
+        elif not job.pairs:
+            out.reasons["stereo"] = "no views where both eyes saw the board at once"
+        else:
+            out.reasons["stereo"] = "needs intrinsics for both eyes"
+        if "plane" in job.skip:
+            pass
+        elif "left" in k and job.plane_frames:
+            t1 = time.perf_counter()
+            plane, why = job.plane.refit(job.board, k["left"], job.wh)
+            out.timings["plane"] = time.perf_counter() - t1
+            if plane is None:
+                out.reasons["plane"] = why
+            else:
+                out.results["plane"] = plane
+        elif not job.plane_frames:
+            out.reasons["plane"] = ("stripe detector is off" if not job.laser_active
+                                    else "no stripe across the board yet")
+        else:
+            out.reasons["plane"] = "needs left-eye intrinsics"
+        for side in ("left", "right"):
+            key = f"readout:{side}"
+            if key in job.skip:
+                continue
+            views = job.motion[side]
+            if side not in k:
+                out.reasons[key] = "needs intrinsics"
+                continue
+            if not views:
+                out.reasons[key] = "no brisk motion seen yet"
+                continue
+            t1 = time.perf_counter()
+            r, why = self.solvers["readout"](views, job.board, k[side])
+            out.timings[key] = time.perf_counter() - t1
+            if r is None:
+                out.reasons[key] = why
+            else:
+                out.results[key] = r
+        out.seconds = time.perf_counter() - t0
+        return out
+
+    def finish(self, out: Outcome, now: float) -> dict[str, Any] | None:
+        """Adopt a cycle's outcome. Returns the save payload for what
+        improved — in the shape `app._save_intrinsics` sends — or None."""
+        self._running = False
+        self._last_cycle_end = now
+        self.reasons.update(out.reasons)
+        for key in out.results:
+            self.reasons.pop(key, None)
+        payload: dict[str, Any] = {}
+        stale = self._stale_dependants(out)
+        for key, res in out.results.items():
+            self.results[key] = res
+            if key in stale:
+                continue
+            count, resid = _measure(key, res)
+            was = self.saved.get(key)
+            moved = self._of_another_rig(key, res)
+            if moved:
+                # The stored figure describes another rig: no bar to clear.
+                self.last_note = moved
+                was = None
+            if not _better(count, resid, was):
+                continue
+            self.saved[key] = (was.adopt(count, resid) if was is not None
+                               else Saved.first(count, resid))
+            kind, _, side = key.partition(":")
+            if kind == "intrinsics":
+                self.known_k[side] = res.intrinsics
+                self.sigma_f[side] = float(res.sigma_f_px)
+                payload.setdefault(side, {})["intrinsics"] = res.as_config()
+                self._retire_dependants(side)
+            elif kind == "stereo":
+                self.stored_pair = (np.asarray(res.R, float), np.asarray(res.T, float).ravel())
+                payload["_extrinsics"] = res.as_config()
+            elif kind == "plane":
+                self.solved_plane = res
+                self.stored_plane = res
+                payload["_laser_plane"] = res.as_config()
+            elif kind == "readout":
+                payload.setdefault(side, {})["readout"] = res.as_config()
+        return payload or None
+
+    def _of_another_rig(self, key: str, res) -> str | None:
+        """Why the server's solve for `key` is of another rig, told by the
+        geometry itself: a new pair or sheet from enough data that sits
+        farther from the stored one than calibration noise allows. None
+        when they agree, when nothing is stored, or when the new solve is
+        too thin to be believed over the old."""
+        if key == "stereo" and self.stored_pair is not None and res.n_views >= MOVED_MIN_VIEWS:
+            r0, t0 = self.stored_pair
+            cos = (np.trace(np.asarray(r0).T @ np.asarray(res.R, float)) - 1.0) / 2.0
+            ang = float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
+            dt = float(np.linalg.norm(np.asarray(res.T, float).ravel() - t0))
+            if ang > PAIR_MOVED_DEG or dt > PAIR_MOVED_MM:
+                return (f"the pair differs from the server's by {ang:.1f}° / {dt:.0f} mm: "
+                        "the rig moved — replacing it")
+        if key == "plane" and self.stored_plane is not None and res.n_frames >= MOVED_MIN_FRAMES:
+            n0 = np.asarray(self.stored_plane.normal, float)
+            n1 = np.asarray(res.normal, float)
+            cos = abs(float(n0 @ n1)) / max(np.linalg.norm(n0) * np.linalg.norm(n1), 1e-12)
+            ang = float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
+            dd = abs(float(res.d) - float(self.stored_plane.d))
+            if ang > PLANE_MOVED_DEG or dd > PLANE_MOVED_MM:
+                return (f"the sheet differs from the server's by {ang:.1f}° / {dd:.1f} mm: "
+                        "the laser moved — replacing it")
+        return None
+
+    def _stale_dependants(self, out: Outcome) -> set[str]:
+        """The cycle's solves that rest on intrinsics that will not be in force.
+
+        A cycle refits the sheet, the pair and the readouts through the
+        intrinsics it has just solved. Where those are refused and differ
+        from the ones in force, what was built on them describes a camera
+        the rig does not have — and saving it is how a calibration becomes a
+        mixture of generations that only the scan's veto ever notices. A
+        refused solve that repeats what is already in force changes nothing,
+        and what was built on it is as good as anything.
+        """
+        stale: set[str] = set()
+        for side in ("left", "right"):
+            key = f"intrinsics:{side}"
+            res = out.results.get(key)
+            if res is None:
+                continue
+            if (_better(*_measure(key, res), self.saved.get(key))
+                    or res.intrinsics == self.known_k.get(side)):
+                continue
+            stale.add(f"readout:{side}")
+            stale.add("stereo")
+            if side == "left":
+                stale.add("plane")
+        return stale
+
+    def _retire_dependants(self, side: str) -> None:
+        """New intrinsics for an eye retire what was solved through the old.
+
+        The sheet is coordinates in the left camera's frame, the pair
+        geometry relates the two cameras' models, and a readout is measured
+        through one of them. Replacing an eye's intrinsics changes what all
+        three mean, so their bars go with them: the next cycle's refit takes
+        their place instead of being refused for not beating a figure that
+        no longer describes the same thing.
+        """
+        self.saved.pop("stereo", None)
+        self.saved.pop(f"readout:{side}", None)
+        if side == "left":
+            self.saved.pop("plane", None)
+
+    # ── the number ────────────────────────────────────────────────────────
+
+    @property
+    def plane_known(self) -> LaserPlane | None:
+        """The sheet a scan would use: the best solve accepted here, else
+        the server's. Never the newest solve — a challenger the flow
+        refused must not move the number the panel shows."""
+        return self.solved_plane or self.stored_plane
+
+    def readout_known(self, side: str = "left") -> bool:
+        """Whether a readout is in force, for the same reason: a refused
+        readout solve does not zero the shutter term."""
+        return f"readout:{side}" in self.saved
+
+    def expected_error(self, z_mm: float | None = None,
+                       stripe_px: float | None = None) -> ErrorBudget | None:
+        """The budget at `z_mm` for a stripe `stripe_px` wide in noise, or
+        None until there is a left camera matrix and a laser sheet to scan
+        with. Whatever was not given or measured is assumed, and said."""
+        k = self.known_k.get("left")
+        plane = self.plane_known
+        if k is None or plane is None:
+            return None
+        assumed = []
+        if z_mm is None or not np.isfinite(z_mm) or z_mm <= 0:
+            z_mm, _ = ASSUMED_Z_MM, assumed.append(f"{ASSUMED_Z_MM:.0f} mm away")
+        if stripe_px is None or not np.isfinite(stripe_px) or stripe_px <= 0:
+            stripe_px, _ = ASSUMED_STRIPE_PX, assumed.append(f"stripe {ASSUMED_STRIPE_PX} px")
+        f = 0.5 * (float(k.fx) + float(k.fy))
+        d = max(float(plane.d), 1e-6)
+        stripe_mm = stripe_px * z_mm * z_mm / (f * d)
+        sheet_mm = float(plane.rms_mm) if np.isfinite(plane.rms_mm) else 0.0
+        sf = self.sigma_f.get("left")
+        radius = ScanVolume().radius_mm
+        if sf is None or not np.isfinite(sf):
+            scale_mm = ASSUMED_FOCAL_REL * radius
+            assumed.append(f"focal length ±{ASSUMED_FOCAL_REL * 100:.1f}%")
+        else:
+            scale_mm = sf / f * radius
+        if self.readout_known():
+            shutter_mm = 0.0
+        else:
+            shutter_mm = ASSUMED_HAND_MM_S * ASSUMED_READOUT_S * 0.5
+            assumed.append(f"shutter unmeasured, {ASSUMED_HAND_MM_S:.0f} mm/s")
+        return ErrorBudget(z_mm=float(z_mm), stripe_px=float(stripe_px),
+                           stripe_mm=float(stripe_mm), sheet_mm=sheet_mm,
+                           scale_mm=float(scale_mm), shutter_mm=float(shutter_mm),
+                           assumed=tuple(assumed))
+
+    # ── words ─────────────────────────────────────────────────────────────
+
+    def scoreboard(self) -> list[str]:
+        lines = []
+        for side in ("left", "right"):
+            key = f"intrinsics:{side}"
+            r = self.results.get(key)
+            if r is not None:
+                lines.append(f"K {side[0].upper()}   rms {r.rms_px:.2f} px / {r.n_views} views"
+                             f"{'  saved' if self._is_saved(key, r) else ''}")
+            else:
+                lines.append(f"K {side[0].upper()}   — {self.reasons.get(key, 'not yet')}")
+        stale = "  · the server's is stale: rig moved"
+        s = self.results.get("stereo")
+        lines.append((f"pair  baseline {s.baseline_mm:.1f} mm rms {s.rms_px:.2f} px / {s.n_views}"
+                      f"{'  saved' if self._is_saved('stereo', s) else ''}"
+                      if s is not None else f"pair  — {self.reasons.get('stereo', 'not yet')}")
+                     + (stale if self._stale("stereo") else ""))
+        p = self.results.get("plane")
+        lines.append((f"laser rms {p.rms_mm:.2f} mm / {p.n_frames} poses, {p.n_points} pts"
+                      f"{'  saved' if self._is_saved('plane', p) else ''}"
+                      if p is not None else f"laser — {self.reasons.get('plane', 'not yet')}")
+                     + (stale if self._stale("plane") else ""))
+        for side in ("left", "right"):
+            key = f"readout:{side}"
+            r = self.results.get(key)
+            lines.append(f"T {side[0].upper()}   {r.seconds * 1000:+.2f} ± {r.sigma_s * 1000:.2f} ms"
+                         f" / {r.views} frames{'  saved' if self._is_saved(key, r) else ''}"
+                         if r is not None else f"T {side[0].upper()}   — {self.reasons.get(key, 'not yet')}")
+        return lines
+
+    def _is_saved(self, key: str, res) -> bool:
+        saved = self.saved.get(key)
+        if saved is None:
+            return False
+        count, resid = _measure(key, res)
+        return saved.count == count and (saved.residual == resid
+                                         or (np.isnan(saved.residual) and np.isnan(resid)))
+
+    def advice(self) -> str:
+        """What to do with the board next: the weakest link first."""
+        c = self._counts()
+        for side in ("left", "right"):
+            if f"intrinsics:{side}" in self.results:
+                continue
+            tag = side[0].upper()
+            if c[side] < MIN_VIEWS:
+                return (f"move the board around for {tag}: hold it still in a new place "
+                        f"or at a new tilt for each view ({c[side]}/{MIN_VIEWS})")
+            if self.samples.tilt_spread(side) < MIN_TILT_SPREAD:
+                return f"tilt the board more for {tag} (spread {self.samples.tilt_spread(side):.1f} / {MIN_TILT_SPREAD:.0f})"
+            cov = int(self.samples.coverage(side).sum())
+            if cov < 12:
+                return f"bring the board to the edges and corners of {tag}'s frame ({cov}/36 cells)"
+            return f"a few more still views for {tag}"
+        if "stereo" not in self.results:
+            return (f"hold the board still where BOTH eyes see it ({c['pairs']} pairs)"
+                    if c["pairs"] < MIN_VIEWS else "more pairs, at other tilts and distances")
+        if "plane" not in self.results:
+            if not self.laser_active:
+                return "tick 'laser line' so the stripe is detected"
+            return ("bring the laser across the board, hold still, at several tilts "
+                    f"({c['plane']} frames)")
+        for side in ("left", "right"):
+            if f"readout:{side}" not in self.results:
+                return ("twist and tilt the board briskly in front of both eyes "
+                        f"({c['motion:left']} / {c['motion:right']} frames)")
+        return "everything solved — keep going to refine: new places, tilts, a brisk twist now and then"
+
+
+def _measure(key: str, res) -> tuple[int, float]:
+    """(how much data, how good) for a result, for `_better`."""
+    kind = key.partition(":")[0]
+    if kind == "intrinsics":
+        # Not the reprojection error: that is what was fitted, and it says
+        # more about how few views were used than about the camera. The
+        # focal length's own standard error is what the solve is for.
+        return int(res.n_views), float(res.sigma_f_px)
+    if kind == "stereo":
+        return int(res.n_views), float(res.rms_px)
+    if kind == "plane":
+        return int(res.n_frames), float(res.rms_mm)
+    if kind == "readout":
+        return int(res.views), float(res.sigma_s)
+    raise KeyError(key)

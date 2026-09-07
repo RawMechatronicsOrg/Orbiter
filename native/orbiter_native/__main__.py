@@ -8,6 +8,15 @@ import sys
 
 from .config import DEFAULT_SERVER
 
+#: Measured on this machine (8 cores / 16 threads) at 1080p, both eyes with
+#: the board tracked: OpenCV's default of 16 threads delivered 41 pairs/s at
+#: 5.6 cores busy, 4 threads 45 pairs/s at 3.0 cores, 2 threads 41 pairs/s
+#: at 2.4 cores, 1 thread 36 pairs/s at 1.9. The per-call work is a handful
+#: of milliseconds, and five threads of this app already call into OpenCV
+#: concurrently, so a wide pool only adds scheduling. Two keeps a pair well
+#: under the 33 ms frame with the least CPU; the stream is 30 fps anyway.
+DEFAULT_CV_THREADS = 2
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(
@@ -26,12 +35,37 @@ def main() -> int:
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="debug logging",
     )
+    parser.add_argument(
+        "--no-gpu", action="store_true",
+        help=("decode frames and score the laser stripe with OpenCV on the CPU "
+              "even when torch sees a CUDA device; the default is the GPU when "
+              "it is there (see gpu.py)"),
+    )
+    parser.add_argument(
+        "--cv-threads", type=int, default=DEFAULT_CV_THREADS, metavar="N",
+        help=(f"OpenCV worker threads for the whole process (default "
+              f"{DEFAULT_CV_THREADS}). Both eyes and the scan already run on "
+              "threads of their own; OpenCV's default of one per logical core "
+              "on top of that burns cores for no extra frames."),
+    )
     args = parser.parse_args()
+
+    import cv2
+
+    cv2.setNumThreads(max(0, args.cv_threads))
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    # Probed before the window exists: the CUDA context takes a moment to
+    # come up, and the log should say which path the frames will take.
+    from . import gpu
+
+    use_gpu = not args.no_gpu and gpu.available()
+    logging.getLogger("orbiter_native").info(
+        "frames: %s", "CPU (OpenCV), --no-gpu" if args.no_gpu else gpu.describe())
 
     # Imported here, not at module scope, so `--help` does not pay for Qt.
     from PySide6.QtWidgets import QApplication
@@ -41,7 +75,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Orbiter Native")
     _apply_dark_palette(app)
-    window = MainWindow(args.server)
+    window = MainWindow(args.server, gpu=use_gpu)
     window.show()
     return app.exec()
 

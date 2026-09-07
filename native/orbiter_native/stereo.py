@@ -278,6 +278,28 @@ def result_from_config(cfg: dict[str, Any] | None,
                         n_views=int(cfg.get("views", 0)), wh=wh)
 
 
+def compose_right_pose(R_left: np.ndarray, t_left: np.ndarray,
+                       geom: StereoResult) -> tuple[np.ndarray, np.ndarray]:
+    """The board's pose in the RIGHT camera's frame from its pose in the
+    left's, through the pair's geometry: X_r = R (R_l X_b + t_l) + T, so
+    R_r = R R_l and t_r = R t_l + T. Lets the right eye skip ChArUco while
+    scanning and still place the cloud on its frame."""
+    R = np.asarray(geom.R, float)
+    T = np.asarray(geom.T, float).ravel()
+    return R @ np.asarray(R_left, float), R @ np.asarray(t_left, float).ravel() + T
+
+
+def compose_left_pose(R_right: np.ndarray, t_right: np.ndarray,
+                      geom: StereoResult) -> tuple[np.ndarray, np.ndarray]:
+    """`compose_right_pose` the other way: the board's pose in the LEFT
+    camera's frame from its pose in the right's. X_l = Rᵀ (X_r − T), so
+    R_l = Rᵀ R_r and t_l = Rᵀ (t_r − T). What lets a scan carry on when only
+    the right eye sees the board."""
+    R = np.asarray(geom.R, float)
+    T = np.asarray(geom.T, float).ravel()
+    return R.T @ np.asarray(R_right, float), R.T @ (np.asarray(t_right, float).ravel() - T)
+
+
 class StereoRig:
     """The two eyes' intrinsics and mutual pose, ready to project.
 

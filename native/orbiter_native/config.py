@@ -45,6 +45,10 @@ class Eye:
     #: Kept raw because whether it is USABLE depends on the live frame size,
     #: which config parsing does not know — see `intrinsics_for`.
     intrinsics_raw: dict[str, Any] | None = None
+    #: The sensor's rolling-shutter readout time as stored, or None until
+    #: measured. Raw for the same reason: it belongs to one frame size —
+    #: see `rolling.Readout.from_config`.
+    readout_raw: dict[str, Any] | None = None
 
     @property
     def configured(self) -> bool:
@@ -58,8 +62,10 @@ class Eye:
         """Intrinsics usable at `frame_wh`, or None.
 
         Resolved per frame rather than once at parse time: a camera matrix is
-        only valid at the resolution it was solved at, and camserver can be
-        reconfigured under a running app.
+        only valid at the resolution it was solved at, and the frame size can
+        still change under a running app — camserver 2.0 pins the capture
+        format per server start rather than for good, and a stream URL can ask
+        for another size outright.
         """
         return intrinsics_from_eye({"intrinsics": self.intrinsics_raw}, frame_wh)
 
@@ -101,11 +107,13 @@ class RigConfig:
 def _eye_from(side: str, rig: dict[str, Any]) -> Eye:
     raw = rig.get(side) or {}
     k = raw.get("intrinsics")
+    r = raw.get("readout")
     return Eye(
         side=side,
         camera_id=str(raw.get("camera_id") or ""),
         orientation=Orientation.from_eye(raw),
         intrinsics_raw=k if isinstance(k, dict) else None,
+        readout_raw=r if isinstance(r, dict) else None,
     )
 
 

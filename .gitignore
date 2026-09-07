@@ -64,6 +64,14 @@ server/Orbiter.glb
 # Scan-session storage (manifests, captures, persisted ModelState).
 server/data/
 
+# ── native/ scanner (native/) ────────────────────────────────────────────
+# Clouds written by the scan panel — regenerable, never commit.
+scan.ply
+native/scan.ply
+
+# ── Agent/session state ──────────────────────────────────────────────────
+.omc/
+
 # ── IDE ──────────────────────────────────────────────────────────────────
 .idea/
 .vscode/
