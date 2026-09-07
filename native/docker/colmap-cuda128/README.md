@@ -1,16 +1,18 @@
 # `orbiter/colmap:cuda129-sm120` — COLMAP with real sm_120 kernels
 
-This is the **expected route to the RTX 5060 Ti**, not a contingency. The public
-`colmap/colmap:latest` image on this machine is COLMAP 4.2.0 built against CUDA
-12.9.1, but its CUDA binary embeds SASS only for sm_50/60/70/75/90, plus
-forward-compatible PTX for compute_90. The RTX 5060 Ti is **sm_120**, which did
-not exist when those kernels were compiled. Whether `patch_match_stereo` runs
-on it at all through the public image therefore depends on the driver
-JIT-compiling the compute_90 PTX forward to sm_120 the first time it launches —
-plausible, unverified, and slow on that first launch. This image removes the
-gamble: COLMAP is compiled from source with real machine code for sm_120,
+The public `colmap/colmap:latest` image on this machine is COLMAP 4.2.0 built
+against CUDA 12.9.1, but its CUDA binary embeds SASS only for
+sm_50/60/70/75/90, plus forward-compatible PTX for compute_90. The RTX 5060 Ti
+is **sm_120**, which did not exist when those kernels were compiled, so
+`patch_match_stereo` runs on it through the public image only by the driver
+JIT-compiling that PTX forward. **Measured 2026-09-08 with `tools/pm_probe.py`:
+the JIT does happen and the depths come out right** (188 s for eight 1920 px
+views), and this image gives the same result without depending on it (193 s,
+369 230 fused points, plane error 0.014 mm MAD). So this image is not a
+requirement; it is the build that carries real machine code for sm_120,
 alongside sm_75 (the GTX 1650 SUPER, the fallback card) and sm_89 (Ada, so a
-future Ada card needs no rebuild either).
+future Ada card needs no rebuild either), and it is what the runner should
+point at once built. It is CLI-only: no GUI, no Qt, no OpenGL, no ONNX.
 
 The directory is named `colmap-cuda128` for the *requirement* — CUDA >= 12.8 is
 the first toolkit whose `nvcc` knows sm_120 exists at all — not for the exact
@@ -23,10 +25,11 @@ image's CUDA (12.9.1) so the two builds stay comparable.
 docker build -t orbiter/colmap:cuda129-sm120 native/docker/colmap-cuda128
 ```
 
-Expect **40-60 minutes**. COLMAP and Ceres both compile from source, and `nvcc`
-compiles every CUDA kernel three times over (once per architecture: 75, 89,
-120). This is a background job the operator runs by hand — it is not part of
-any test or CI gate, and nothing in the runner requires this image to exist
+Measured on this machine (Docker Desktop, 7 vCPUs): **about 15 minutes end to
+end, 11 of them compiling**; the result is 2.9 GB. Ceres comes from apt, and
+`nvcc` compiles every CUDA kernel three times over (once per architecture: 75,
+89, 120). This is a background job the operator runs by hand — it is not part
+of any test or CI gate, and nothing in the runner requires this image to exist
 before Milestone 1 (which needs no GPU at all) or before a first Milestone 2
 run against the public image.
 

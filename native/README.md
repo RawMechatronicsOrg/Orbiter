@@ -977,6 +977,20 @@ step exiting non-zero an unknown number of minutes in. The run half takes
 `--dry-run` and `--list-steps`, and exits 0 when the chain finished, 1 when a
 step failed, 2 on a refusal an operator can act on before anything starts.
 
+One probe sits outside the CLI because it needs no session at all:
+`tools/pm_probe.py` renders a textured plane from eight known poses, writes the
+COLMAP model with the same `colmapio` code the runner uses, and drives
+`image_undistorter → patch_match_stereo → stereo_fusion` on a named image and
+GPU, then fits a plane to what came back. It is how the sm_120 question was
+settled (both the public image and `orbiter/colmap:cuda129-sm120` run
+PatchMatch on the RTX 5060 Ti correctly) and how it was found that
+`stereo_fusion` fuses nothing without seed tracks. Run it after a driver, a
+COLMAP image or a GPU changes:
+
+```
+native/.venv/Scripts/python tools/pm_probe.py --image orbiter/colmap:cuda129-sm120 --gpu GPU-<uuid> --out <scratch dir>
+```
+
 Everything else — what is captured and why, the session layout, the clean pass,
 what each COLMAP step does and which knob to turn when it disappoints, how to
 read the merge statistics, and the two live-bench checklists — is in

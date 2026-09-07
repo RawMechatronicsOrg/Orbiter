@@ -31,11 +31,13 @@ can find the seam it wants:
 | **E1** | the SCAN panel's PHOTOS group and RECONSTRUCT row |
 | **E2** | these docs |
 
-Two things only a live run can settle, and both are written down as such:
-whether COLMAP accepts our **two-rig** model (`validate_sparse` asks it in
-minutes, on Milestone 1), and whether the RTX 5060 Ti's driver JIT-compiles
-compute_90 PTX forward to sm_120 (the first minutes of the first dense
-`patch_match_stereo`).
+One thing only a live run can settle, and it is written down as such: whether
+COLMAP accepts our **two-rig** model (`validate_sparse` asks it in minutes, on
+Milestone 1; the one-camera case is already proven by `tools/pm_probe.py`,
+which writes the model with the same `colmapio` code). The sm_120 question is
+closed (2026-09-08): the RTX 5060 Ti's driver does JIT compute_90 PTX and the
+public image's PatchMatch is correct on it, and `orbiter/colmap:cuda129-sm120`
+is built and gives the same answer with real kernels — see PHOTOGRAMMETRY.md §9.
 
 ## Laser strobing — background subtraction and true colour  ★ must
 
