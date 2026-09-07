@@ -41,8 +41,8 @@ ORBITER_COLMAP_IMAGE=orbiter/colmap:cuda129-sm120
 
 set in the shell (or the sibling `docker/.env`) before running
 `orbiter-recon --mode dense`. Everything else — session layout, `--gpus
-device=GPU-<uuid>`, the JIT-cache volume, `QT_QPA_PLATFORM=offscreen` — is
-unchanged; only the image name differs.
+device=GPU-<uuid>`, the JIT-cache volume — is unchanged; only the image name
+differs. (This image has no Qt and no GUI; the CLI is all the runner calls.)
 
 ## What is pinned, and why
 
@@ -61,15 +61,16 @@ unchanged; only the image name differs.
 
 The build-stage package list follows the shape of COLMAP's own
 `docker/Dockerfile` (github.com/colmap/colmap) — reproduced from training
-knowledge, not fetched from the 4.2.0 tag itself. This box has no route to
-GitHub during the build, and the shipped `colmap/colmap:latest` image does not
-carry its own build recipe or a dependency manifest as a doc file inside the
-image, so there was nothing to inspect from a running container. Package names
-target Ubuntu 24.04; Qt6 is used rather than Qt5 because 24.04's archive
-treats Qt6 as the primary Qt package and COLMAP's CMakeLists has preferred Qt6
-(falling back to Qt5) for several releases before this one. If 4.2.0 disagrees,
-CMake's configure step fails immediately and by name — it does not silently
-misbuild.
+knowledge, not fetched from the 4.2.0 tag itself: the shipped
+`colmap/colmap:latest` image does not carry its own build recipe or a
+dependency manifest as a doc file, so there was nothing to inspect from a
+running container. Package names target Ubuntu 24.04. The GUI is compiled out
+(`-DGUI_ENABLED=OFF`), so no Qt is installed — the runner only calls the CLI
+and COLMAP loads images through FreeImage. OpenBLAS/LAPACK are for the FAISS
+nearest-neighbour library that COLMAP 3.12+ fetches and builds during
+configure; that FetchContent step and the `git clone` are why the build needs
+network. Tests are compiled out too (`-DTESTS_ENABLED=OFF`) — they are
+upstream's, not ours, and they roughly double the compile.
 
 The runtime stage installs the same `-dev` packages as the builder rather than
 upstream's narrower, version-pinned runtime package list (e.g.

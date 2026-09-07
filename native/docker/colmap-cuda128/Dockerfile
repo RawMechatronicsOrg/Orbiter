@@ -57,12 +57,14 @@ ENV DEBIAN_FRONTEND=noninteractive
 # route to GitHub during the build, and the shipped 'colmap/colmap:latest'
 # image does not carry its own build recipe or dependency manifest as a
 # runtime doc file, so there is nothing to 'docker run ... cat' to check it
-# against. Names below are Ubuntu 24.04 packages. Qt6 (not Qt5) because
-# 24.04's archive treats Qt6 as the primary Qt and COLMAP's own CMakeLists
-# has preferred Qt6 (falling back to Qt5) since before this line of
-# releases; if 4.2.0's CMake configure step disagrees, that will show up
-# immediately as a CMake error naming the missing Qt version, not as a
-# silent misbuild. This list is not claimed to be exhaustive — only
+# against. Names below are Ubuntu 24.04 packages. No Qt at all: the GUI is
+# switched off at configure time (-DGUI_ENABLED=OFF below), the runner only
+# ever calls the CLI, and COLMAP loads images through FreeImage, so Qt was
+# the one dependency whose 4.2.0 configure requirements could not be
+# verified offline and it is simply not needed. OpenBLAS/LAPACK are for the
+# FAISS nearest-neighbour library that COLMAP 3.12+ fetches and builds
+# during configure (FetchContent, so the build needs network — as does the
+# git clone below). This list is not claimed to be exhaustive — only
 # complete enough for the CLI COLMAP the runner actually invokes — and apt
 # pulls in whatever transitive dependency (mesa/OpenGL under libglew-dev,
 # zlib/libjpeg/libpng under libfreeimage-dev, etc.) each of these needs.
@@ -85,8 +87,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libgmock-dev \
         libsqlite3-dev \
         libglew-dev \
-        qt6-base-dev \
-        libqt6opengl6-dev \
+        libopenblas-dev \
+        liblapack-dev \
         libcgal-dev \
         libceres-dev \
         libcurl4-openssl-dev \
@@ -109,6 +111,9 @@ RUN git clone --branch "${COLMAP_TAG}" --depth 1 \
 RUN cmake -S /colmap-src -B /colmap-build -GNinja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_CUDA_ARCHITECTURES="75;89;120" \
+        -DCUDA_ENABLED=ON \
+        -DGUI_ENABLED=OFF \
+        -DTESTS_ENABLED=OFF \
         -DCMAKE_INSTALL_PREFIX=/colmap-installed \
  && cmake --build /colmap-build \
  && cmake --install /colmap-build
@@ -143,8 +148,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libgflags-dev \
         libsqlite3-dev \
         libglew-dev \
-        qt6-base-dev \
-        libqt6opengl6-dev \
+        libopenblas-dev \
+        liblapack-dev \
         libcgal-dev \
         libceres-dev \
         libcurl4-openssl-dev \
@@ -153,11 +158,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /colmap-installed /usr/local
 
-# COLMAP's Qt-based bits (its GUI entry point, and CLI paths that still
-# touch Qt for image loading) go looking for an X server unless told
-# otherwise — the same reason docker/docker-compose.yml sets this for the
-# public image's container.
-ENV QT_QPA_PLATFORM=offscreen
+# No Qt in this image (the GUI is compiled out), so nothing here goes
+# looking for an X server and the QT_QPA_PLATFORM the public image needs
+# has nothing to switch off.
 
 # Sessions are bind-mounted here, matching every other Orbiter container
 # (docker/docker-compose.yml's './data:/data') — a session path is the same
