@@ -1039,3 +1039,20 @@ def test_silhouette_score_reads_the_edge_under_the_projected_boundary(
     # An unreadable file is not a score of zero — it is no score at all, and a
     # pass with no readable samples must not be reported as a bad one.
     assert recon._silhouette_score(info, photo, xyz, tmp_path / "absent.png") is None
+
+
+def test_a_model_without_tracks_is_refused_for_dense_and_only_warned_for_texture(
+        tmp_path, monkeypatch) -> None:
+    """stereo_fusion picks the images that overlap from the sparse model's
+    shared points — measured with tools/pm_probe.py: perfect depth maps and
+    0 fused points without seeds, 369 k with them. So a model in which no
+    seed is seen twice is refused by name before a container starts in
+    dense mode, and merely noted in texture-only, which never reads it."""
+    session = _session(tmp_path)
+    monkeypatch.setattr(recon, "tracks", lambda *a, **k: ([], {}))
+    with pytest.raises(ReconRefused, match=r"no seed point is seen by two"):
+        _run(session, mode="dense", only="write_sparse")
+    result, _ = _run(session, only="write_sparse")
+    log = (session / "recon.log").read_text(encoding="utf-8")
+    assert "warning: no seed point is seen by two" in log
+    assert (session / "colmap" / "sparse" / "points3D.txt").exists()

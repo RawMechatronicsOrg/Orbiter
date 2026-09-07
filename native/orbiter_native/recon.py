@@ -1107,6 +1107,22 @@ def _write_sparse(run: Run) -> None:
     seeds, seed_rgb, seed_normals = seed_points(
         xyz, rgb, cloud_normals, run.params.select.seed_cap)
     points3d, points2d = tracks(selection, seeds, seed_normals, seed_rgb)
+    if not points3d:
+        # The seeds are not decoration. stereo_fusion decides which images
+        # overlap from the sparse model's shared points, so a model without
+        # tracks fuses nothing at all — measured on a synthetic planar
+        # workspace: perfect depth maps, 0 fused points without seeds,
+        # 369 k with them (tools/pm_probe.py). Dense cannot proceed on an
+        # empty model; texture-only never reads the points and only warns.
+        why = ("no seed point is seen by two selected photographs — the "
+               "laser cloud and the photographs do not overlap, so "
+               "stereo_fusion would fuse nothing")
+        if run.mode == "dense":
+            raise ReconRefused(
+                f"write_sparse: {why}. Check that the photographs look at the "
+                "scanned volume (the selection's coverage numbers are in "
+                "session.json) or run --mode texture-only.")
+        run.log.line(f"warning: {why}; texture-only does not need them")
     images = [ImageRecord(image_id=v.image_id, name=v.photo.name,
                           camera_id=v.photo.colmap_camera_id,
                           R=v.photo.R, t=v.photo.t_mm,
