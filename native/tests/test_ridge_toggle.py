@@ -7,6 +7,14 @@ carries its crest out of the frame where the score still exists
 crest wherever the two estimators are looking at the same thing
 (`laser.prefer_ridge`).
 
+Which detector, though, is half the switch. `use_ridge` says take the crest
+where the producer supplied one, and only the GPU producer supplies it: the
+card holds the score already and spends 2.9 ms, while the numpy reference
+spends 70 to 120 ms over the same band and would cost the CPU fallback thirty
+frames' work per frame. So `find_stripe_pixels` computes the crest only when
+its own `crest` keyword asks — which is what the tests below do, and what the
+live path never does, because the live path is the GPU one.
+
 The claim under test is a narrow one, and it is narrow on purpose. The toggle
 moves POSITIONS. Which scanlines are live, how wide their runs had to be, what
 the other eye confirmed and every count the panel shows are decided by the
@@ -90,12 +98,25 @@ def _with_crest(pixels: StripePixels, scan: np.ndarray, pos: np.ndarray) -> Stri
 # ── what the detector carries out ────────────────────────────────────────
 
 
-def test_the_detector_takes_the_crest_only_when_it_is_asked() -> None:
-    """The flag is the whole switch: nothing else about the pixel list moves
-    with it, so a scan that turns it off is the scan that shipped before."""
+def test_the_cpu_producer_leaves_the_crest_out_unless_asked() -> None:
+    """`use_ridge` does not reach this producer, and must not. On the card the
+    crest is 2.9 ms of a score that is already there; here it is 70 to 120 ms
+    over a 240-row band against 2 to 3 ms for the whole rest of the detector,
+    so a scan falling back to the CPU with the crest on would be paying thirty
+    frames for one. The flag means take the crest WHERE THERE IS ONE, and here
+    there is one only when the caller says so by name."""
     bgr = _stripe_frame()
-    on = find_stripe_pixels(bgr, LaserParams(use_ridge=True))
-    off = find_stripe_pixels(bgr, LaserParams(use_ridge=False))
+    assert find_stripe_pixels(bgr, LaserParams(use_ridge=True)).crest is None
+    assert find_stripe_pixels(bgr, LaserParams(use_ridge=False)).crest is None
+    assert find_stripe_pixels(bgr, LaserParams(use_ridge=False), crest=True).crest is not None
+
+
+def test_the_detector_takes_the_crest_only_when_it_is_asked() -> None:
+    """The keyword is the whole switch: nothing else about the pixel list moves
+    with it, so a pixel list without the crest is the one that shipped before."""
+    bgr = _stripe_frame()
+    on = find_stripe_pixels(bgr, crest=True)
+    off = find_stripe_pixels(bgr, crest=False)
 
     assert off.crest is None
     assert on.crest is not None
@@ -110,8 +131,8 @@ def test_the_crest_is_in_whole_frame_coordinates_under_a_band() -> None:
     wrong moves every point of the scan by the band's offset, which is the
     kind of error that looks like a calibration problem."""
     bgr = _stripe_frame(centre=60.0, h=140)
-    whole = find_stripe_pixels(bgr, LaserParams(use_ridge=True))
-    banded = find_stripe_pixels(bgr, LaserParams(use_ridge=True), rows=(30, 110))
+    whole = find_stripe_pixels(bgr, crest=True)
+    banded = find_stripe_pixels(bgr, rows=(30, 110), crest=True)
 
     assert whole.crest is not None and banded.crest is not None
     assert np.array_equal(whole.crest[0], banded.crest[0])
@@ -235,12 +256,15 @@ def test_a_glint_sized_crest_leaves_the_scan_exactly_as_it_was() -> None:
 def test_the_gpu_path_finds_the_same_crest_as_the_cpu_one() -> None:
     """Two implementations, one estimator. The GPU path runs the ridge on the
     score tensor it has just computed and never brings the score down; the
-    number it hands the scan has to be the one the reference would have."""
+    number it hands the scan has to be the one the reference would have. The
+    reference is asked for by name — it is the expensive half of the pair, and
+    the only place it is wanted is here, where it is the thing being agreed
+    with."""
     import torch
 
     bgr = _stripe_frame(centre=44.3, h=96)
     p = LaserParams(use_ridge=True)
-    cpu = find_stripe_pixels(bgr, p)
+    cpu = find_stripe_pixels(bgr, p, crest=True)
     rgb = np.ascontiguousarray(bgr[:, :, ::-1]).transpose(2, 0, 1)
     on_gpu = gpu.stripe_pixels(torch.from_numpy(np.ascontiguousarray(rgb)).cuda(), p)
 
@@ -254,7 +278,7 @@ def test_the_gpu_path_finds_the_same_crest_as_the_cpu_one() -> None:
     # And under a band, where the row the ridge reports is the band's and
     # both paths have to add the same offset back.
     band = (12, 88)
-    cpu_band = find_stripe_pixels(bgr, p, rows=band)
+    cpu_band = find_stripe_pixels(bgr, p, rows=band, crest=True)
     gpu_band = gpu.stripe_pixels(torch.from_numpy(np.ascontiguousarray(rgb)).cuda(),
                                  p, rows=band)
     assert cpu_band.crest is not None and gpu_band.crest is not None

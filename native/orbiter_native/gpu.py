@@ -212,7 +212,10 @@ def stripe_pixels(rgb, p: LaserParams = LaserParams(),
     With `LaserParams.use_ridge` the score also feeds `ridge.response`, which
     is why that runs here and not at the call site: the score is a float32
     plane on the card, the ridge wants exactly that, and nothing but the
-    per-scanline crest ever has to be downloaded."""
+    per-scanline crest ever has to be downloaded. This is the producer that
+    flag reaches, and the only one that can afford to be — the same crest on
+    the CPU costs two orders of magnitude more, so `find_stripe_pixels`
+    leaves it out unless a caller asks by name."""
     t0 = time.perf_counter()
     _, h, w = rgb.shape
     y0, y1 = (0, h) if rows is None else (max(0, int(rows[0])), min(h, int(rows[1])))

@@ -60,20 +60,25 @@ class LaserParams:
     #: Side of the opening, at half resolution, that estimates each channel's
     #: background for `excess_redness`. Wider than the stripe ever is.
     background_px: int = 15
-    #: Take each scanline's centre from `ridge`'s crest rather than from
-    #: `stripe_centroids`. On because the benchmark says so, and the
-    #: benchmark is `tests/test_ridge_bench.py`: on the same synthetic
-    #: families the ridge is 3.6x better on a saturated core (0.012 px RMS
-    #: against 0.043), 2-3x better on the narrow unsaturated profiles the
-    #: repo already measured, and it finds every scanline of a stripe too
-    #: dim to clear `redness_min` at all, for 2.9 ms of GPU time per 1080p
-    #: frame.
+    #: Take each scanline's centre from `ridge`'s crest, WHERE THE PRODUCER
+    #: SUPPLIED ONE, rather than from `stripe_centroids`. On because the
+    #: benchmark says so, and the benchmark is `tests/test_ridge_bench.py`:
+    #: on the same synthetic families the ridge is 3.6x better on a saturated
+    #: core (0.012 px RMS against 0.043), 2-3x better on the narrow
+    #: unsaturated profiles the repo already measured, and it finds every
+    #: scanline of a stripe too dim to clear `redness_min` at all, for 2.9 ms
+    #: of GPU time per 1080p frame.
     #:
-    #: It is a toggle because that 2.9 ms is the GPU's. Where there is no
-    #: CUDA device the numpy reference runs instead, at about a tenth of a
-    #: second over a 240-row band and 0.7 s over a whole 1080p frame — so a
-    #: machine scanning on the CPU path wants this off, and gives up only
-    #: the saturated core by doing so.
+    #: The crest is a GPU-path feature, and this flag reaches only the GPU
+    #: producer: `gpu.stripe_pixels` computes it here, `find_stripe_pixels`
+    #: does not unless its own `crest` keyword asks. That 2.9 ms is the
+    #: card's, and the numpy reference is not the same purchase — measured
+    #: on this rig, 70 to 120 ms over the 240-row band the scan searches, per
+    #: eye per frame, against 2 to 3 ms for the whole rest of the detector,
+    #: and about half a second over a full 1080p frame. Thirty frames' work
+    #: for one frame's centres is not a fallback, so a machine scanning on
+    #: the CPU cannot have the crest at any setting of this flag, and gives
+    #: up only the saturated core by doing without.
     use_ridge: bool = True
 
 
@@ -249,8 +254,9 @@ class StripePixels:
     #: out of — `(scan, pos)`, the pair `stripe_centroids` returns first, in
     #: whole-frame coordinates. Carried here because the score is the one
     #: thing the detector has and throws away, and the ridge needs the
-    #: neighbourhood rather than the surviving pixels. None when
-    #: `LaserParams.use_ridge` did not ask for it.
+    #: neighbourhood rather than the surviving pixels. None when the producer
+    #: computed none: the GPU one does under `LaserParams.use_ridge`, the CPU
+    #: one only where its `crest` keyword asks.
     crest: tuple[np.ndarray, np.ndarray] | None = None
     ms: float = 0.0
     reason: str | None = "no data"
@@ -297,7 +303,8 @@ def _lit(score: np.ndarray, redness_min: int,
 
 
 def find_stripe_pixels(bgr: np.ndarray, p: LaserParams = LaserParams(),
-                       rows: tuple[int, int] | None = None) -> StripePixels:
+                       rows: tuple[int, int] | None = None, *,
+                       crest: bool = False) -> StripePixels:
     """Every stripe pixel in the frame, with its score. For scanning.
 
     No mask: the subject stands above the board, so most of the stripe that
@@ -306,6 +313,15 @@ def find_stripe_pixels(bgr: np.ndarray, p: LaserParams = LaserParams(),
     `rows`, when given, is the band the sheet can appear in at all
     (`scan.stripe_rows`): only those rows are searched, and the pixels come
     back in whole-frame coordinates.
+
+    `crest` asks for `ridge_centres` over the same score. Off by default and
+    off in service: on the CPU the ridge costs 70 to 120 ms over a 240-row
+    band against 2 to 3 ms for everything else here, so a scan that fell back
+    to this producer WITH the crest would not be falling back to anything.
+    `LaserParams.use_ridge` deliberately does not turn it on — that flag is
+    the GPU producer's, where the card already holds the score and the crest
+    is 2.9 ms. Tests and benchmarks that want the numpy reference ask here by
+    name.
     """
     t0 = time.perf_counter()
 
@@ -330,7 +346,7 @@ def find_stripe_pixels(bgr: np.ndarray, p: LaserParams = LaserParams(),
                              w=lit[xy[:, 1], xy[:, 0]],
                              r=bgr[xy[:, 1] + y0, xy[:, 0], 2], wh=(w, h),
                              along_x=along_x, reason=None,
-                             crest=ridge_centres(score, along_x, y0) if p.use_ridge else None))
+                             crest=ridge_centres(score, along_x, y0) if crest else None))
 
 
 #: A red value this high is the sensor's ceiling, as the JPEG hands it over.
