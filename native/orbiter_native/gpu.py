@@ -229,3 +229,46 @@ def stripe_pixels(rgb, p: LaserParams = LaserParams(),
     return StripePixels(x=x, y=y, w=weight.cpu().numpy(), r=red.cpu().numpy(), wh=(w, h),
                         along_x=along_x, reason=None,
                         ms=(time.perf_counter() - t0) * 1000.0)
+
+
+# ── focus ────────────────────────────────────────────────────────────────
+
+
+#: OpenCV's own `cv2.Laplacian` kernel at ksize=1. The CPU fallback in
+#: `worker` measures with exactly this one, so the two paths measure the
+#: same quantity rather than two loosely related ones.
+_LAPLACIAN_3X3 = ((0.0, 1.0, 0.0), (1.0, -4.0, 1.0), (0.0, 1.0, 0.0))
+
+#: Built on the device on first use and kept. A 3x3 tensor is nothing to
+#: allocate, but building it per frame would be a host->device copy per frame.
+_laplacian = None
+
+
+def sharpness(rgb) -> float:
+    """How much detail this frame carries: the variance of a 3x3 Laplacian
+    over its luma.
+
+    This is what the photo pass ranks its offers by — a smeared frame's
+    Laplacian is flat, a crisp one's is not — and it runs here, on the
+    full-resolution GPU frame, because that is the frame the detail is
+    actually in: `to_cpu` hands back a half-size `display` while scanning,
+    and half a frame has already lost the high spatial frequencies this
+    measures. `worker`'s CPU fallback halves the frame before measuring, so
+    the two paths sit on different scales; the policy compares each offer
+    against the recent median of the same camera on the same path rather
+    than against any fixed number.
+
+    One `.item()`, so one synchronisation — and the stripe path already
+    synchronises once per frame, so it is not a new stall.
+    """
+    global _laplacian
+    torch = _torch
+    if _laplacian is None:
+        _laplacian = torch.tensor(_LAPLACIAN_3X3, dtype=torch.float32,
+                                  device=_device)[None, None]
+    x = rgb.to(torch.float32)
+    # Rec.601 luma — the weights `to_cpu`'s fixed-point gray already uses.
+    luma = x[0] * 0.299 + x[1] * 0.587 + x[2] * 0.114
+    lap = _F.conv2d(luma[None, None], _laplacian)
+    # correction=0 to match numpy's `.var()`, which the CPU fallback calls.
+    return float(lap.var(correction=0).item())

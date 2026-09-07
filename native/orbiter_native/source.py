@@ -76,6 +76,13 @@ class Frame:
     #: when the reader decodes there; `bgr` and `gray` are then its copies.
     #: None on the OpenCV path.
     rgb_gpu: object | None = None
+    #: The camera's own JPEG bytes, exactly as they arrived — retained only
+    #: while `MjpegReader.keep_jpeg` asks for them, None otherwise. It is the
+    #: one full-resolution, un-re-encoded view of this frame: while scanning
+    #: on the GPU path `bgr` is not downloaded at all and `display` is half
+    #: size, and a snapshot fetched later is a different frame under a
+    #: different pose.
+    jpeg: bytes | None = None
 
 
 def _parse_headers(blob: bytes) -> dict[str, str]:
@@ -100,6 +107,10 @@ class MjpegReader:
         #: On the GPU path, download the full BGR too. The worker sets it
         #: while the calibration-mode line fit needs the pixels on the CPU.
         self.full_bgr = True
+        #: Keep each frame's JPEG bytes on the `Frame`. Off by default, so a
+        #: plain scan never pays the ~265 kB copy per frame; the worker turns
+        #: it on for as long as photos are being taken.
+        self.keep_jpeg = False
         self._stop = False
 
     def stop(self) -> None:
@@ -187,4 +198,8 @@ class MjpegReader:
             server_age_ms=num("x-age-ms"),
             recv_mono=time.monotonic(),
             rgb_gpu=rgb_gpu,
+            # `payload` is a writable bytearray the GPU decode wraps in place;
+            # `bytes` takes an immutable copy that is safe to hand to another
+            # thread and to hold on to after this one moves on.
+            jpeg=bytes(payload) if self.keep_jpeg else None,
         )

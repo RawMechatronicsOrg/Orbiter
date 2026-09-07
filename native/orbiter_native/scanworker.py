@@ -198,6 +198,13 @@ class ScanInput:
     #: over — what a pose fitted to both eyes at once is fitted through.
     corners: np.ndarray | None = None
     ids: np.ndarray | None = None
+    #: This eye's own JPEG bytes for this frame, when photo capture is armed
+    #: — a reference, never a copy. Kept for BOTH eyes, unlike `bgr`: a
+    #: right-eye photo is a photo in its own right, taken from its own place
+    #: on the rig, and it can only be made of the right eye's pixels.
+    jpeg: bytes | None = None
+    #: This frame's focus measure, NaN while photo capture is disarmed.
+    sharpness: float = float("nan")
 
 
 @dataclass
@@ -453,7 +460,8 @@ class ScanWorker:
                          None if board is None else board.t, res.wh, pose_row=row,
                          bgr=res.bgr if res.side == "left" else None,
                          corners=None if board is None else board.corners,
-                         ids=None if board is None else board.ids)
+                         ids=None if board is None else board.ids,
+                         jpeg=res.jpeg, sharpness=res.sharpness)
         with self._lock:
             if not self._active:
                 return

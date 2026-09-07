@@ -87,6 +87,10 @@ class EyeStats:
     #: a stripe. What the exposure keeper steers by.
     stripe_peak: float = float("nan")
     stripe_clipped: float = float("nan")
+    #: Laplacian variance of the frame's luma: how much detail it carries,
+    #: which is how a steady frame is told from a smeared one. NaN unless
+    #: photo capture is armed — nothing measures it otherwise.
+    sharpness: float = float("nan")
     #: Decoded and scored on the GPU (`gpu.py`) rather than by OpenCV.
     gpu: bool = False
     #: Server-side age of the last frame at send time, from `X-Age-Ms`.
@@ -159,6 +163,14 @@ class EyeResult:
     #: that machine, so this is what pairs a left frame with its right one —
     #: our own arrival times are not comparable between two sockets.
     capture_mono: float | None = None
+    #: This frame's own JPEG bytes, straight from the reader and shared
+    #: rather than copied — the full-resolution pixels the board pose was
+    #: solved on, which is what a photo handed to COLMAP has to be. None
+    #: unless `EyeWorker.set_photo_capture` armed the reader.
+    jpeg: bytes | None = None
+    #: This frame's focus measure, NaN while disarmed. On `stats` too, for
+    #: the overlay; here because the photo pass decides on it.
+    sharpness: float = float("nan")
 
 
 class EyeWorker(QObject):
@@ -190,6 +202,8 @@ class EyeWorker(QObject):
         self._eye = None
         self._laser_on = False
         self._scan_mode = False
+        #: Retain the JPEG and measure sharpness — see `set_photo_capture`.
+        self._photo_capture = False
         self._laser_params = LaserParams()
         #: Rows the sheet can appear in while scanning (`scan.stripe_rows`),
         #: or None for the whole frame. Pushed by the window from the scan
@@ -255,6 +269,28 @@ class EyeWorker(QObject):
         if reader is not None:
             reader.full_bgr = self._needs_full_bgr()
 
+    def set_photo_capture(self, on: bool) -> None:
+        """Keep every frame's JPEG bytes, and measure how sharp it is.
+
+        Both cost something a plain scan has no use for — a ~265 kB copy on
+        the reader thread and a full-frame Laplacian on the detector one — so
+        neither happens until a photo pass asks for it.
+
+        Per eye, and there are two eye workers: a photo pass wants both, so
+        whoever owns the toggle calls this on each, the way `full_bgr` is
+        already pushed per eye. It is not the scan worker's decision gate —
+        that one is `ScanWorker.arm_photos`, and it decides what to do with
+        the bytes this one retains.
+        """
+        with self._cfg_lock:
+            self._photo_capture = on
+        self._push_keep_jpeg()
+
+    def _push_keep_jpeg(self) -> None:
+        reader = self._reader
+        if reader is not None:
+            reader.keep_jpeg = self._photo_capture
+
     def set_stripe_rows(self, rows: tuple[int, int] | None) -> None:
         with self._cfg_lock:
             self._stripe_rows = rows
@@ -272,7 +308,8 @@ class EyeWorker(QObject):
         with self._cfg_lock:
             return (self._url, self._orientation, self._board_spec,
                     self._eye, self._laser_on, self._laser_params,
-                    self._scan_mode, self._stripe_rows, self._scan_gate)
+                    self._scan_mode, self._stripe_rows, self._scan_gate,
+                    self._photo_capture)
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
@@ -311,6 +348,7 @@ class EyeWorker(QObject):
                 continue
             self._reader = MjpegReader(url, gpu=self._gpu)
             self._reader.full_bgr = self._needs_full_bgr()
+            self._reader.keep_jpeg = self._photo_capture
             try:
                 for frame in self._reader.frames():
                     if self._stop.is_set():
@@ -356,7 +394,7 @@ class EyeWorker(QObject):
 
     def _detect_one(self, detector: BoardDetector, frame: Frame) -> None:
         (_, orientation, spec, eye, laser_on, laser_params,
-         scan_mode, stripe_rows, scan_gate) = self._snapshot()
+         scan_mode, stripe_rows, scan_gate, photo_capture) = self._snapshot()
         detector.set_spec(spec)
 
         h, w = frame.gray.shape
@@ -415,12 +453,17 @@ class EyeWorker(QObject):
         # same way, so no oriented copy of the frame is ever made, and a
         # calibration consumer never sees coordinates that depend on a UI
         # setting.
+
+        # Only while photos are being taken: a scan that is not capturing
+        # must pay nothing at all for a measure nothing reads.
+        sharp = _sharpness(frame) if photo_capture else float("nan")
+
         self._det_times.append(time.monotonic())
         self._publish(frame, board, laser, hull, descriptor, pixels,
-                      orientation, intrinsics)
+                      orientation, intrinsics, sharp)
 
     def _publish(self, frame, board, laser, hull, descriptor, pixels,
-                 orientation, intrinsics) -> None:
+                 orientation, intrinsics, sharp) -> None:
         s = self._stats
         s.frames += 1
         s.recv_fps = _rate(self._recv_times)
@@ -443,6 +486,7 @@ class EyeWorker(QObject):
             s.stripe_peak, s.stripe_clipped = exposure_of(red_at(frame.bgr, laser.inlier_points))
         else:
             s.stripe_peak = s.stripe_clipped = float("nan")
+        s.sharpness = sharp
         s.gpu = frame.rgb_gpu is not None
         s.server_age_ms = frame.server_age_ms
         h, w = frame.gray.shape
@@ -451,6 +495,7 @@ class EyeWorker(QObject):
             intrinsics=intrinsics, hull=hull, board=board, laser=laser,
             stripe=pixels, wh=(w, h), descriptor=descriptor,
             capture_mono=frame.capture_mono,
+            jpeg=frame.jpeg, sharpness=sharp,
         )
         for sink in self._sinks:
             sink(res)
@@ -469,6 +514,26 @@ def stripe_wanted(side: str, has_pose: bool, pose_recent: bool) -> bool:
     """
     del side
     return has_pose or pose_recent
+
+
+def _sharpness(frame: Frame) -> float:
+    """How much detail this frame carries — a Laplacian variance over its
+    luma, which is high on a crisp frame and low on a smeared one.
+
+    On the GPU path it is measured where the pixels already are, at full
+    resolution (`gpu.sharpness`). On the CPU path the frame is halved first,
+    which is the difference between 5.6 ms and 1.4 ms per 1080p frame on this
+    machine (one OpenCV thread) on a detector thread whose budget is 33 ms
+    and mostly spent. Blur is what the measure has to see, and blur survives
+    halving.
+
+    So the two paths sit on different scales. The photo policy handles that
+    by comparing each offer against the recent median of the same eye rather
+    than against any fixed threshold.
+    """
+    if frame.rgb_gpu is not None:
+        return gpu.sharpness(frame.rgb_gpu)
+    return float(cv2.Laplacian(frame.gray[::2, ::2], cv2.CV_32F).var())
 
 
 def _rate(times: "deque[float]") -> float:

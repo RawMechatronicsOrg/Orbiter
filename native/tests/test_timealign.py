@@ -77,7 +77,8 @@ def test_scan_worker_hands_over_the_bracketing_right_frame() -> None:
 
     def res(side, t):
         return SimpleNamespace(side=side, capture_mono=t, board=None, stripe=None,
-                               wh=(64, 48), bgr=None)
+                               wh=(64, 48), bgr=None, jpeg=None,
+                               sharpness=float("nan"))
 
     w = ScanWorker()
     w.set_active(True)
