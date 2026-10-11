@@ -1,0 +1,54 @@
+component,category,colour,quantity,tool,material,volume_cm3,role,stl,step,freecad
+CrossRail,aluminium_rail,,1,False,Aluminum 6061,35.5128,,stl/purchased/aluminium_rail/CrossRail.stl,,freecad/parts/purchased/aluminium_rail/CrossRail.FCStd
+MainRail,aluminium_rail,,1,False,Aluminum 6061,35.5882,,stl/purchased/aluminium_rail/MainRail.stl,,freecad/parts/purchased/aluminium_rail/MainRail.FCStd
+OrbitArm,aluminium_rail,,1,False,Aluminum 6061,35.673,,stl/purchased/aluminium_rail/OrbitArm.stl,,freecad/parts/purchased/aluminium_rail/OrbitArm.FCStd
+VertivalBar,aluminium_rail,,1,False,Aluminum 6061,13.113,,stl/purchased/aluminium_rail/VertivalBar.stl,,freecad/parts/purchased/aluminium_rail/VertivalBar.FCStd
+Base BallSet,bearing,,2,False,Steel,4.5304,,stl/purchased/bearing/Base BallSet.stl,,freecad/parts/purchased/bearing/Base BallSet.FCStd
+Base InnerRing,bearing,,2,False,Steel,7.2326,,stl/purchased/bearing/Base InnerRing.stl,,freecad/parts/purchased/bearing/Base InnerRing.FCStd
+Base OuterRing,bearing,,2,False,Steel,10.5765,,stl/purchased/bearing/Base OuterRing.stl,,freecad/parts/purchased/bearing/Base OuterRing.FCStd
+Bearing BallSet,bearing,,2,False,Steel,4.5304,,stl/purchased/bearing/Bearing BallSet.stl,,freecad/parts/purchased/bearing/Bearing BallSet.FCStd
+Bearing InnerRing,bearing,,2,False,Steel,7.2326,,stl/purchased/bearing/Bearing InnerRing.stl,,freecad/parts/purchased/bearing/Bearing InnerRing.FCStd
+Bearing OuterRing,bearing,,2,False,Steel,10.5765,,stl/purchased/bearing/Bearing OuterRing.stl,,freecad/parts/purchased/bearing/Bearing OuterRing.FCStd
+Belt Base GT2 280,belt,,1,False,"Rubber, Black",2.2034,,stl/purchased/belt/Belt Base GT2 280.stl,,freecad/parts/purchased/belt/Belt Base GT2 280.FCStd
+Belt Elevation,belt,,1,False,"Rubber, Black",2.7233,,stl/purchased/belt/Belt Elevation.stl,,freecad/parts/purchased/belt/Belt Elevation.FCStd
+AS5600 Module,electronics,,2,False,FR4,0.8112,,stl/purchased/electronics/AS5600 Module.stl,,freecad/parts/purchased/electronics/AS5600 Module.FCStd
+ISO 4032 M5 nut,fastener,,6,False,Steel,0.1432,,stl/purchased/fastener/ISO 4032 M5 nut.stl,,freecad/parts/purchased/fastener/ISO 4032 M5 nut.FCStd
+ISO 4035 M5 thin nut,fastener,,1,False,Steel,0.0966,,stl/purchased/fastener/ISO 4035 M5 thin nut.stl,,freecad/parts/purchased/fastener/ISO 4035 M5 thin nut.FCStd
+ISO 4762 M3x8,fastener,,8,False,Steel,0.1208,,stl/purchased/fastener/ISO 4762 M3x8.stl,,freecad/parts/purchased/fastener/ISO 4762 M3x8.FCStd
+ISO 4762 M5x10,fastener,,3,False,Steel,0.4073,,stl/purchased/fastener/ISO 4762 M5x10.stl,,freecad/parts/purchased/fastener/ISO 4762 M5x10.FCStd
+ISO 4762 M5x12,fastener,,1,False,Steel,0.4847,,stl/purchased/fastener/ISO 4762 M5x12.stl,,freecad/parts/purchased/fastener/ISO 4762 M5x12.FCStd
+ISO 4762 M5x16,fastener,,3,False,Steel,0.5632,,stl/purchased/fastener/ISO 4762 M5x16.stl,,freecad/parts/purchased/fastener/ISO 4762 M5x16.FCStd
+ISO 4762 M5x25,fastener,,1,False,Steel,0.74,,stl/purchased/fastener/ISO 4762 M5x25.stl,,freecad/parts/purchased/fastener/ISO 4762 M5x25.FCStd
+ISO 4762 M5x30,fastener,,1,False,Steel,0.8381,,stl/purchased/fastener/ISO 4762 M5x30.stl,,freecad/parts/purchased/fastener/ISO 4762 M5x30.FCStd
+ISO 4762 M5x35,fastener,,2,False,Steel,0.9363,,stl/purchased/fastener/ISO 4762 M5x35.stl,,freecad/parts/purchased/fastener/ISO 4762 M5x35.FCStd
+ISO 4762 M5x40,fastener,,2,False,Steel,1.0345,,stl/purchased/fastener/ISO 4762 M5x40.stl,,freecad/parts/purchased/fastener/ISO 4762 M5x40.FCStd
+ISO 4762 M5x70,fastener,,1,False,Steel,1.6235,,stl/purchased/fastener/ISO 4762 M5x70.stl,,freecad/parts/purchased/fastener/ISO 4762 M5x70.FCStd
+ISO 7093 M5 washer 15x1.2,fastener,,6,False,Steel,0.1856,,stl/purchased/fastener/ISO 7093 M5 washer 15x1.2.stl,,freecad/parts/purchased/fastener/ISO 7093 M5 washer 15x1.2.FCStd
+Heat-set insert M5x7,heat_set_insert,,7,False,Brass,0.1109,,stl/purchased/heat_set_insert/Heat-set insert M5x7.stl,,freecad/parts/purchased/heat_set_insert/Heat-set insert M5x7.FCStd
+NEMA17 24mm,motor,,2,False,Steel,42.093,,stl/purchased/motor/NEMA17 24mm.stl,,freecad/parts/purchased/motor/NEMA17 24mm.FCStd
+GT2 16T Pulley,other,,2,False,Aluminum 6061,0.8438,,stl/purchased/other/GT2 16T Pulley.stl,,freecad/parts/purchased/other/GT2 16T Pulley.FCStd
+AngleSensorMount Ribbed,printed,pink,1,False,PLA (FDM print),19.8092,three-legged AS5600 sensor mount on the elevation housing,stl/printed/pink/AngleSensorMount Ribbed.stl,step/printed/pink/AngleSensorMount Ribbed.step,freecad/parts/printed/pink/AngleSensorMount Ribbed.FCStd
+BarMountInsert,printed,light_green,1,False,PLA (FDM print),38.4821,"elevation insert: 1:5 taper into the shaft, clamp for the 25x25 orbit arm, M10x0.75 for the extractor",stl/printed/light_green/BarMountInsert.stl,step/printed/light_green/BarMountInsert.step,freecad/parts/printed/light_green/BarMountInsert.FCStd
+BaseExtractor M10x0.75,printed,red,2,True,PLA (FDM print),1.3856,taper extractor: M10x0.75 plug with a hex socket (tool),stl/printed/red/BaseExtractor M10x0.75.stl,step/printed/red/BaseExtractor M10x0.75.step,freecad/parts/printed/red/BaseExtractor M10x0.75.FCStd
+BaseFootPlug M75x2,printed,light_green,1,False,PLA (FDM print),56.4391,"foot plug of the base housing, external M75x2, hexagon for a 32 mm socket",stl/printed/light_green/BaseFootPlug M75x2.stl,step/printed/light_green/BaseFootPlug M75x2.step,freecad/parts/printed/light_green/BaseFootPlug M75x2.FCStd
+BaseOuterRingSpacer,printed,light_green,1,False,PLA (FDM print),15.4892,spacer between the bearing outer rings inside the base housing,stl/printed/light_green/BaseOuterRingSpacer.stl,step/printed/light_green/BaseOuterRingSpacer.step,freecad/parts/printed/light_green/BaseOuterRingSpacer.FCStd
+BasePlatformInsert Taper,printed,light_green,1,False,PLA (FDM print),45.1998,"base insert: 1:5 taper into the spindle, 120 mm platform disc, M10x0.75 for the extractor",stl/printed/light_green/BasePlatformInsert Taper.stl,step/printed/light_green/BasePlatformInsert Taper.step,freecad/parts/printed/light_green/BasePlatformInsert Taper.FCStd
+BasePulley GT2 112T,printed,light_green,1,False,PLA (FDM print),19.8445,base GT2 112-tooth pulley on the spindle splines,stl/printed/light_green/BasePulley GT2 112T.stl,step/printed/light_green/BasePulley GT2 112T.step,freecad/parts/printed/light_green/BasePulley GT2 112T.FCStd
+BaseSensorRing,printed,red,1,False,PLA (FDM print),9.833,disc holding the base AS5600 sensor under the spindle,stl/printed/red/BaseSensorRing.stl,step/printed/red/BaseSensorRing.step,freecad/parts/printed/red/BaseSensorRing.FCStd
+BaseSpindle,printed,pink,1,False,PLA (FDM print),42.4331,"base spindle (vertical axis): collar, splines for the pulley, M32x1, taper socket on top",stl/printed/pink/BaseSpindle.stl,step/printed/pink/BaseSpindle.step,freecad/parts/printed/pink/BaseSpindle.FCStd
+BearingSpacer,printed,red,2,False,PLA (FDM print),3.1805,spacer between the bearing inner rings,stl/printed/red/BearingSpacer.stl,step/printed/red/BearingSpacer.step,freecad/parts/printed/red/BearingSpacer.FCStd
+BottomHousin,printed,dark_green,1,False,PLA (FDM print),92.1671,"elevation drive housing on the vertical bar: bearing seats, motor mount",stl/printed/dark_green/BottomHousin.stl,step/printed/dark_green/BottomHousin.step,freecad/parts/printed/dark_green/BottomHousin.FCStd
+BottomHousin(Mirror),printed,pink,1,False,PLA (FDM print),120.3347,"base drive housing on the main rail, mirrored sibling of the elevation housing, internal M75x2 at the bottom",stl/printed/pink/BottomHousin(Mirror).stl,step/printed/pink/BottomHousin(Mirror).step,freecad/parts/printed/pink/BottomHousin(Mirror).FCStd
+ClampNut M32x1,printed,red,2,False,PLA (FDM print),11.4327,M32x1 nut that clamps the bearing stack on the shaft and on the spindle,stl/printed/red/ClampNut M32x1.stl,step/printed/red/ClampNut M32x1.step,freecad/parts/printed/red/ClampNut M32x1.FCStd
+ClampNut Wrench AF32,printed,pink,1,True,PLA (FDM print),27.3363,wrench for the clamp nut (tool),stl/printed/pink/ClampNut Wrench AF32.stl,step/printed/pink/ClampNut Wrench AF32.step,freecad/parts/printed/pink/ClampNut Wrench AF32.FCStd
+CrossRail foot cap,printed,dark_green,2,False,PLA (FDM print),10.9299,foot cap on each end of the cross rail,stl/printed/dark_green/CrossRail foot cap.stl,step/printed/dark_green/CrossRail foot cap.step,freecad/parts/printed/dark_green/CrossRail foot cap.FCStd
+CrossRail load spreader,printed,pink,1,False,PLA (FDM print),11.2234,"load spreader under the head of the main stack bolt, inside the cross rail",stl/printed/pink/CrossRail load spreader.stl,step/printed/pink/CrossRail load spreader.step,freecad/parts/printed/pink/CrossRail load spreader.FCStd
+ElevationShaft,printed,pink,1,False,PLA (FDM print),42.9113,"elevation shaft: splines for the pulley, M32x1 for the clamp nut, 1:5 taper socket for the insert",stl/printed/pink/ElevationShaft.stl,step/printed/pink/ElevationShaft.step,freecad/parts/printed/pink/ElevationShaft.FCStd
+HexPlug,printed,dark_green,2,False,PLA (FDM print),1.4532,plug holding the AS5600 magnet in the end of the shaft and of the spindle,stl/printed/dark_green/HexPlug.stl,step/printed/dark_green/HexPlug.step,freecad/parts/printed/dark_green/HexPlug.FCStd
+MainRail tie cap,printed,red,1,False,PLA (FDM print),12.2755,"H-shaped cap tying the main rail to the cross rail, ears around the cross rail",stl/printed/red/MainRail tie cap.stl,step/printed/red/MainRail tie cap.step,freecad/parts/printed/red/MainRail tie cap.FCStd
+MainRail tie wedge,printed,dark_green,1,False,PLA (FDM print),1.023,nut wedge inside the tie cap,stl/printed/dark_green/MainRail tie wedge.stl,step/printed/dark_green/MainRail tie wedge.step,freecad/parts/printed/dark_green/MainRail tie wedge.FCStd
+Rail cap wedge,printed,light_green,3,False,PLA (FDM print),1.9345,M5 nut wedge inside the rail caps,stl/printed/light_green/Rail cap wedge.stl,step/printed/light_green/Rail cap wedge.step,freecad/parts/printed/light_green/Rail cap wedge.FCStd
+ReplacablePulley,printed,light_green,1,False,PLA (FDM print),34.2984,elevation GT2 pulley on the shaft splines,stl/printed/light_green/ReplacablePulley.stl,step/printed/light_green/ReplacablePulley.step,freecad/parts/printed/light_green/ReplacablePulley.FCStd
+Stack clamp jaws,printed,pink,1,False,PLA (FDM print),8.1932,jaws clamping the vertical bar to the rails (main M5x70 bolt),stl/printed/pink/Stack clamp jaws.stl,step/printed/pink/Stack clamp jaws.step,freecad/parts/printed/pink/Stack clamp jaws.FCStd
+Stack clamp wedge,printed,dark_green,1,False,PLA (FDM print),4.5591,nut wedge of the main stack bolt,stl/printed/dark_green/Stack clamp wedge.stl,step/printed/dark_green/Stack clamp wedge.step,freecad/parts/printed/dark_green/Stack clamp wedge.FCStd
+VertivalBar top cap,printed,red,1,False,PLA (FDM print),4.519,top cap of the vertical bar,stl/printed/red/VertivalBar top cap.stl,step/printed/red/VertivalBar top cap.step,freecad/parts/printed/red/VertivalBar top cap.FCStd

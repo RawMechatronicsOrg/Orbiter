@@ -17,4 +17,6 @@
 *.glb binary
 *.fbx binary
 *.stl binary
+*.step binary
+*.FCStd binary
 *.pdf binary

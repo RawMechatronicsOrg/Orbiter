@@ -303,6 +303,8 @@ If the motor is 1.8°/step (200 step/rev) with the same 1/16 microstep + 1:10 ge
 
 Source CAD ships as `cad/assembly/Orbiter.glb` (also `.fbx`, `.obj`); per-part STLs in `cad/parts/`; renders in `cad/screenshots/`. Model started in FreeCAD; the distribution format is the GLB. Edit individual STLs in Blender / Meshmixer for small tweaks; for structural changes (arm length, gear ratio) re-derive in a parametric tool and re-export.
 
+The second-generation mechanics (aluminium tube frame, 6008 bearings, taper inserts, AS5600 on both axes) are in [`cad/v2/`](cad/v2/README.md) as STL, STEP and FreeCAD files. This README, the server's rig model and the firmware still describe v1.
+
 ---
 
 ## 9. Assembly
@@ -771,6 +773,7 @@ Orbiter/
 ├── docs/                   ← per-subsystem deep dives + license
 │   └── LICENSE             ← CC-BY-4.0 (docs)
 ├── cad/                    ← CAD (assembly + per-part STLs + screenshots)
+│   ├── v2/                 ← second-generation mechanics (STL, STEP, FreeCAD)
 │   └── LICENSE             ← CERN-OHL-S-2.0 (hardware)
 ├── firmware/               ← ESP-IDF project — the 2-axis IP actuator
 ├── server/                 ← FastAPI — scene state + ESP proxy + storage
@@ -785,7 +788,7 @@ Orbiter/
 | `firmware/`          | ESP-IDF v6 source for the 2-axis IP actuator.                                          |
 | `server/`            | FastAPI app, `ModelState`, scene-graph builder, scan orchestration, COLMAP-priors exporter. |
 | `ui/`                | Single-page React app over the scene-graph WebSocket.                                  |
-| `cad/`               | `.glb`/`.fbx`/`.obj` assembly + per-part `.stl` files + rendered previews.             |
+| `cad/`               | `.glb`/`.fbx`/`.obj` assembly + per-part `.stl` files + rendered previews; `cad/v2/` holds the second-generation mechanics. |
 | `docker/`            | `docker-compose.yml` with three services and a `colmap` profile.                       |
 | `colmap/`            | Thin container over `colmap/colmap:latest` + an SfM-priors → COLMAP-text converter.    |
 | `docs/`              | Per-subsystem deep dives (architecture, hardware, firmware, API, assembly, COLMAP).    |

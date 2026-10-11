@@ -2,6 +2,12 @@
 
 3D model files for the Orbiter turntable.
 
+This folder holds the **v1 rig** that the rest of the repository describes
+and the server models. The second-generation mechanics (aluminium tube
+frame, taper inserts, AS5600 on both axes) are in [`v2/`](v2/README.md) as
+STL, STEP and FreeCAD files; the software and the assembly guide do not
+cover v2 yet.
+
 ## Files
 
 | File | Format | Use |
@@ -52,8 +58,9 @@ If you want to modify dimensions:
   re-derive in a parametric tool. Import `Orbiter.obj` into FreeCAD as a
   reference mesh, model alongside it, then re-export.
 
-We may publish the FreeCAD source separately later. For now, the printable
-geometry is here in formats that anyone can open.
+The v1 FreeCAD source is not published. For now, the printable geometry is
+here in formats that anyone can open. v2 ships its STEP and FreeCAD files in
+[`v2/`](v2/).
 
 ## Regenerating previews & OBJ
 
