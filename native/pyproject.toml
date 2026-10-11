@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "orbiter-native"
-version = "0.1.0"
+version = "0.3.0"
 description = "Native CV workbench for the Orbiter binocular camera pair."
 readme = "README.md"
 requires-python = ">=3.11"

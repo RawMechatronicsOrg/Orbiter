@@ -1,4 +1,4 @@
-# Orbiter v0.2
+# Orbiter v0.3
 
 A two-axis camera turntable for taking calibrated photo sets of small objects,
 controlled over Wi-Fi from a browser. Think of it as a **bench-top hemisphere
@@ -12,6 +12,26 @@ need, throw out the rest, adapt it to whatever you have on the shelf.
 This README is the consolidated single-page reference. Per-subsystem deep
 dives live in `docs/` and in each subsystem's own `README.md`; treat those as
 authoritative when you need depth.
+
+**New in v0.3**
+
+- **`native/` — a desktop CV workbench** for a binocular camera pair
+  ([`native/README.md`](native/README.md)): per-eye intrinsics and stereo
+  calibration guided stage by stage, a laser-stripe scanner that tracks the
+  ChArUco board and accumulates a coloured point cloud, a rig check, a photo
+  session shot alongside the scan, and `orbiter-recon` — a textured mesh
+  from the laser cloud and the photographs, or the COLMAP 4 dense chain fed
+  with our poses and the stripe masked out.
+- **Stereo tab** in the web UI, with the server routes behind it: the
+  pair's `camserver`, which camera is which eye, per-eye orientation, and
+  a nominal baseline that a stereo solve in the workbench later replaces
+  with the measured one.
+- **`cad/v2/` — the second-generation mechanics** as STL, STEP and FreeCAD
+  ([`cad/v2/README.md`](cad/v2/README.md)): two near-identical rotary
+  drive modules on an aluminium tube frame, 6008 bearings, taper inserts,
+  an AS5600 on both axes. Design files only so far: the server, the
+  firmware and the rest of this README still describe the v1 rig.
+- The docker-compose stack starts on a fresh checkout.
 
 ## Contents
 
@@ -46,15 +66,16 @@ Orbiter is a **lab kit**, not a finished product. Expect rough edges; the pieces
 
 | Layer       | What it does                                                                                  |
 |-------------|-----------------------------------------------------------------------------------------------|
-| **CAD**     | 3D-printable mechanical parts + full assembly (`.glb`, `.fbx`, `.obj`, individual `.stl`)     |
+| **CAD**     | v1: 3D-printable parts + full assembly (`.glb`, `.fbx`, `.obj`, individual `.stl`). v2: the next mechanics as STL, STEP and FreeCAD in `cad/v2/` |
 | **Firmware**| ESP32 sketch that exposes the table as a **generic 2-axis IP actuator** with encoder feedback |
 | **Server**  | FastAPI service that owns scan-session state, drives the actuator, stores photos with poses   |
-| **UI**      | Browser app (Vite + React + react-three-fiber) — live 3D view + photo library on a hemisphere |
+| **UI**      | Browser app (Vite + React + react-three-fiber) — live 3D view + photo library on a hemisphere + the stereo rig settings |
+| **Native**  | Desktop CV workbench (PySide6) for a binocular pair: calibration, laser-stripe scanning, photo capture, `orbiter-recon` dense chain |
 | **COLMAP**  | Optional container + UI panel: feed your photo session into COLMAP with our poses as SfM priors |
 
 ### The "lab kit" framing
 
-The hardware is whatever was within arm's reach during prototyping: A4988 drivers (cheap, forgiving, the silicon is everywhere), generic 1.2°/step NEMA-17 motors with a 1:10 GT2 belt reduction, AS5600 (I²C) on azimuth + AS5048A (SPI) on elevation (mixed because of migration history — two AS5600s if starting fresh), an old ESP32-D0WD-V3 dev board, and an Android phone running [IP Webcam](https://play.google.com/store/apps/details?id=com.pas.webcam) for the camera. Substitution points are called out in each section so you can swap parts.
+The hardware is whatever was within arm's reach during prototyping: A4988 drivers (cheap, forgiving, the silicon is everywhere), generic 1.2°/step NEMA-17 motors with a 1:10 GT2 belt reduction, AS5600 (I²C) on azimuth + AS5048A (SPI) on elevation (mixed because of migration history — two AS5600s if starting fresh, which is what the v2 mechanics in `cad/v2/` do), an old ESP32-D0WD-V3 dev board, and an Android phone running [IP Webcam](https://play.google.com/store/apps/details?id=com.pas.webcam) for the camera. Substitution points are called out in each section so you can swap parts.
 
 ### Three licenses, one repo
 
@@ -111,10 +132,13 @@ Three tiers; the browser never talks to the ESP32 directly.
 | Subsystem | Owns                                            | Doesn't know about                  |
 |-----------|-------------------------------------------------|-------------------------------------|
 | Firmware  | Steppers, encoders, closed-loop control         | Photos, sessions, world frame       |
-| Server    | Scene graph, scan session, poses, photo files   | Stepper microsteps, encoder bits    |
+| Server    | Scene graph, scan session, poses, photo files, the stereo rig baseline | Stepper microsteps, encoder bits |
 | UI        | Rendering and user interaction                  | Anything geometric                  |
+| Native    | Pixels: detectors, calibration solves, stripe triangulation, point clouds, photo sessions | The turntable's motion |
 
 The firmware presents itself as a **generic 2-axis IP actuator** — `POST /move {azimuth_deg, elevation_deg}`, `GET /state`. Drop the firmware on any 2-axis mechanism (gimbal, antenna rotator) and the server still talks to it.
+
+**The native workbench sits beside the browser, not behind it.** The browser can display a camera stream but cannot read its pixels (a cross-origin `<img>` taints the canvas), so the frame-rate computer vision for the binocular pair runs in a desktop app: it reads the rig the Stereo tab set (`GET /config`), pulls MJPEG straight from the cameras' `camserver`, and keeps its results on disk and in the server's config — a stereo solve there replaces the nominal baseline with the measured one. See [§12.4](#124-native-cv-workbench).
 
 ---
 
@@ -481,6 +505,12 @@ docker run --rm -p 8000:8000 \
 | GET    | `/captures/{cid}/...`             | Capture pool (immutable).                                             |
 | GET    | `/camera/stream.mjpeg`            | Live MJPEG preview re-multiplexed from the phone.                     |
 | GET    | `/camera/stream/status`           | Camera connection status.                                             |
+| GET    | `/stereo/upstream/state`          | The binocular pair's `camserver` state, proxied (no-store).           |
+| GET/POST | `/stereo/upstream/controls/{cam_id}` | Read / set a camera's V4L2 controls through the proxy.           |
+| GET    | `/stereo/upstream/formats/{cam_id}` | List a camera's sizes, FourCCs, frame rates.                        |
+| POST   | `/stereo/upstream/format/{cam_id}` | Set a camera's size, FourCC, fps.                                    |
+| GET    | `/command`                        | The command names the server accepts.                                 |
+| POST   | `/command/{name}`                 | Run a command over HTTP — the same handlers as the WS channel; the native workbench uses it (`set_stereo_rig`, …). |
 | WS     | `/ws/scene`                       | Scene + model diffs, command channel ([§12.3](#123-wire-protocol)).   |
 
 ### 11.3 Environment variables
@@ -518,7 +548,7 @@ The capture pool is **immutable** — once `captures/<id>/original.jpg` exists, 
 
 ## 12. UI
 
-Vite + React + react-three-fiber + zustand + Radix Tabs. Two tabs: **Scaner** (live 3D, motion controls, motion planner, scan-session controls) and **Library** (saved scans, per-scan **Export SfM priors** — which also stages `photos/` for the COLMAP container — and a placeholder **Run COLMAP** button reserved for a future release).
+Vite + React + react-three-fiber + zustand + Radix Tabs. Four tabs: **Scaner** (live 3D, motion controls, motion planner, scan-session controls), **Stereo** (the binocular pair: its `camserver`, eyes, orientation, nominal baseline), **Library** (saved scans, per-scan **Export SfM priors** — which also stages `photos/` for the COLMAP container — and a placeholder **Run COLMAP** button reserved for a future release) and **Help**.
 
 ### 12.1 Dev / build
 
@@ -540,6 +570,7 @@ docker run --rm -p 8080:80 orbiter-ui
 
 - **Scaner.** Single persistent WebSocket to `ws://server:8000/ws/scene`. Server pushes `scene_snapshot` + `scene_update` diffs (rendered via `nodeRegistry.ts`) and model state. Commands (`move`, `take_shot`, `start_scan`, …) go back over the same socket.
 - **Library.** REST-only: `GET /scans`, `GET /config`, `POST /scans/{sid}/sfm_priors`, `DELETE /scans/{sid}`.
+- **Stereo.** LEFT | RIGHT previews straight from `camserver` (an `<img>` each, so two MJPEG streams stay off the server), per-eye camera select, rotation and mirrors, Swap L/R, nominal baseline, draft → **Apply**. Apply sends `set_stereo_rig` over the scene socket; the server persists it and refuses two eyes on one camera. Orientation is flip-then-rotate, a contract shared with the server's command handler and the native workbench.
 
 ### 12.3 Wire protocol
 
@@ -560,6 +591,25 @@ Frame envelope: `{ t: string, seq: number, ts: number, data: T }`. Server → br
 ```
 
 Patches carry only the changed fields. The browser does no trig — new rendering features mean a new node type in `protocol.ts` plus a server-side scene-graph builder, not new client-side math.
+
+### 12.4 Native CV workbench
+
+`native/` is a PySide6 desktop app for a second capture rig: two UVC cameras ~15 cm apart behind `camserver` on the LAN, and a line laser. It needs Python ≥ 3.11 and the sibling `server/` package (the ChArUco detection and pose code is imported from there, not copied):
+
+```bash
+python -m venv native/.venv                                   # Scripts/ below is the Windows layout; bin/ on Linux
+native/.venv/Scripts/pip install -e ./server -e ./native
+native/.venv/Scripts/pip install -e "./native[gpu]" --extra-index-url https://download.pytorch.org/whl/cu128   # optional: nvJPEG + torch; CUDA torch is not on PyPI
+native/.venv/Scripts/orbiter-native --server http://localhost:8000
+```
+
+What it does, in the order you use it:
+
+- **Calibrate**, guided stage by stage: per-eye intrinsics from diverse board views with per-view residuals, the stereo pair from views both eyes saw at one instant (paired on `camserver`'s capture clock, rejected if the board slid more than 0.3 px between the exposures), the laser plane, and the rolling-shutter readout time measured from the board in motion. Each solve lands in the server's config with its residual and view count; the panel shows the expected one-sigma error of a scanned point (the derivation is [`native/docs/ERROR_BUDGET.md`](native/docs/ERROR_BUDGET.md)). `orbiter-rigcheck` measures whether the rig can deliver what a scan needs.
+- **Scan**: the board is tracked between ChArUco passes, the stripe is found on the GPU when there is one, each point is placed through the pose at its own row's instant, and the cloud accumulates in the board's frame with the colour of the surface beside the stripe. Frame path and thresholds: [`native/docs/PIPELINE.md`](native/docs/PIPELINE.md).
+- **Photograph** alongside the scan: a photo session with poses and sidecars, then `orbiter-recon` (COLMAP 4 in Docker, or a local build) meshes the laser cloud and textures it from the photographs by default (`texture-only`, no GPU needed); `--mode dense` adds the images with the stripe masked and inpainted, our poses as the model, PatchMatch on one GPU, fusion, and the merge with the laser cloud ([`native/docs/PHOTOGRAMMETRY.md`](native/docs/PHOTOGRAMMETRY.md)). `native/docker/colmap-cuda128/` builds COLMAP for sm_75/89/120.
+
+The three docs under `native/docs/` are in Russian; `native/README.md` (English) carries the design notes and what was measured on the bench.
 
 ---
 
@@ -743,8 +793,10 @@ For deeper firmware problems: the firmware log is verbose by design — watch it
 
 The full Orbiter project (in the parent repo) includes more — left out of the kit on purpose:
 
-- **Laser-stripe scanner + live triangulator.** Needs a line laser and a separately calibrated camera; the parent project couples both tightly to its own optical stack.
-- **Photogrammetry job orchestration.** Beyond the single-session COLMAP wrapper and the standalone mask tool that ship here.
+- **The multi-user library service** (`orbiter_library`, leases, derived-data generations) and its UI pages. The kit keeps one flat server and one Library tab.
+- **The parent project's post-processing and deployment scripts.** `orbiter-recon` ends at a textured COLMAP mesh (`mesh/model.glb`); what the parent project does with it after that, and how it deploys, are not here.
+
+Two things that *were* out of scope until v0.2 are in now: the laser-stripe scanner lives in `native/` ([§12.4](#124-native-cv-workbench)), and photogrammetry has an offline runner, `orbiter-recon`, beside the single-session COLMAP container. Both are built for the binocular rig; the single-camera turntable path is unchanged (one NaN guard in the board-pose solver aside).
 
 ChArUco hand-eye geometry calibration *is* shipped here — the **Machine config → Calibrate from board** flow in the UI. The default board spec is an 8×8 ChArUco, `DICT_5X5_100`, 36 mm squares / 26.64 mm markers (generate one at [calib.io](https://calib.io/pages/camera-calibration-pattern-generator), print, **measure a square with a ruler** and set the real size in Machine config → Board — a 20 % size error biases every solved distance by the same 20 %). The v0.2 solver resolves the flat-board pose ambiguity, refines the EL-axis tilt and reports per-view residuals; per-shot errors land well under a degree / a few mm.
 
@@ -777,7 +829,8 @@ Orbiter/
 │   └── LICENSE             ← CERN-OHL-S-2.0 (hardware)
 ├── firmware/               ← ESP-IDF project — the 2-axis IP actuator
 ├── server/                 ← FastAPI — scene state + ESP proxy + storage
-├── ui/                     ← Vite + React + react-three-fiber — viewer & library
+├── ui/                     ← Vite + React + react-three-fiber — viewer, library, stereo rig
+├── native/                 ← PySide6 CV workbench — calibration, laser scanning, orbiter-recon
 ├── docker/                 ← docker-compose stack
 └── colmap/                 ← COLMAP container + integration notes
 ```
@@ -788,6 +841,7 @@ Orbiter/
 | `firmware/`          | ESP-IDF v6 source for the 2-axis IP actuator.                                          |
 | `server/`            | FastAPI app, `ModelState`, scene-graph builder, scan orchestration, COLMAP-priors exporter. |
 | `ui/`                | Single-page React app over the scene-graph WebSocket.                                  |
+| `native/`            | Desktop CV workbench for the binocular pair: `orbiter-native`, `orbiter-rigcheck`, `orbiter-recon`; docs in `native/docs/`. |
 | `cad/`               | `.glb`/`.fbx`/`.obj` assembly + per-part `.stl` files + rendered previews; `cad/v2/` holds the second-generation mechanics. |
 | `docker/`            | `docker-compose.yml` with three services and a `colmap` profile.                       |
 | `colmap/`            | Thin container over `colmap/colmap:latest` + an SfM-priors → COLMAP-text converter.    |

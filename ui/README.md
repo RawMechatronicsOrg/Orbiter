@@ -9,7 +9,7 @@ camera-only photogrammetry pass:
   session controls (new / save / take shot / start scan / stop).
 - **Library** — list of saved scans with their captured photos, plus
   per-scan "Export SfM priors" (POST `/scans/{sid}/sfm_priors`) and a
-  disabled "Run COLMAP" button reserved for v0.2.
+  disabled "Run COLMAP" button reserved for a future release.
 
 What was intentionally removed from the upstream `ui/` codebase: the live
 laser-scan panel, the laser-scans Library section, and the laser-points
@@ -62,13 +62,13 @@ nginx config is enough — no custom routing needed for the SPA.
 ## COLMAP integration
 
 Not in the kit yet. Each scan row in the Library tab has a placeholder "Run
-COLMAP" button that's disabled with a tooltip pointing to v0.2. The
+COLMAP" button that's disabled with a tooltip pointing to a future release. The
 adjacent "Export SfM priors" button does work — it POSTs to
 `/scans/{sid}/sfm_priors` on the storage-api, which writes a JSON sidecar
 of per-capture poses suitable for feeding into COLMAP's exhaustive
 matcher / point triangulator as known camera extrinsics.
 
-The v0.2 work plan is: invoke `colmap` from a sibling Docker service
+The plan is: invoke `colmap` from a sibling Docker service
 against a loaded scan + its priors, stream progress over the same
 WebSocket, and surface the resulting sparse / dense reconstruction back
 into the scene as a `point_cloud` node.

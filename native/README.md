@@ -363,9 +363,11 @@ good, and a stream URL can ask for another size; 1280x720 intrinsics on a 1080p
 frame put the principal point in the wrong place and scale the focal length by
 two thirds.
 
-**The laser plane is not solved.** Scanning does not need it — triangulation
-from two cameras gives the 3D point directly — but it would be a second,
-independent check on every point, and it is not implemented.
+**The laser plane is solved and used.** Triangulation from two cameras gives
+a 3D point on its own; the plane, fitted from stripe points banked across
+board poses (`laserplane.py`, refused from one pose or collinear samples), is
+the second, independent check on every point and the way a point one eye
+lost is rescued. Its residual and sample count are stored with the solve.
 
 **OpenCV version skew.** The server image pins `opencv-python-headless>=4.7`
 and resolves to 4.x; this venv resolved 5.0. Both work — the aruco API and a
