@@ -43,6 +43,31 @@ The colour folder is the filament spool the part is printed from:
 `dark_green`, `light_green`, `red`, `pink`. The same colours are on the
 bodies in Fusion and in FreeCAD.
 
+## Previews
+
+![Assembly — 3/4 iso](screenshots/assembly_iso.jpg)
+
+| Front | Side | Top |
+|-------|------|-----|
+| ![front](screenshots/assembly_front.jpg) | ![side](screenshots/assembly_side.jpg) | ![top](screenshots/assembly_top.jpg) |
+
+Per-part renders are in [`screenshots/`](screenshots/) (`part_*.jpg`, one
+per printed STL), in the same style and palette as the v1 previews so the
+two sets read together. The colours there are the palette of the renders,
+not the filament colours.
+
+[`render_screenshots.py`](render_screenshots.py) makes them, headless, from
+an assembly `.blend` of the v2 rig and the STL files here:
+
+```bash
+blender -b assembly.blend -P render_screenshots.py -- screenshots-png
+```
+
+It writes 2560 × 1920 PNGs; the JPEGs in `screenshots/` are those scaled
+to 1600 × 1200. The assembly `.blend` is built by the Blender project in
+the private hardware tree from the Fusion export and is not in this
+repository; the per-part renders need only the STLs.
+
 ## Printed parts
 
 32 pieces from 25 files, about 830 g of filament at 100 % infill (a real
