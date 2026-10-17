@@ -116,6 +116,12 @@ float motion_get_az_zero_raw(void);
 /** Get current elevation zero offset (raw encoder degrees). */
 float motion_get_el_zero_raw(void);
 
+/** +1 when the user elevation grows with the raw EL reading, -1 against it. */
+int motion_get_el_sign(void);
+
+/** Set and persist the EL sign (+1 or -1); the zero offset stays as it is. */
+esp_err_t motion_set_el_sign(int sign);
+
 /**
  * Start continuous rotation on one axis (non-blocking).
  * A second axis may spin while the first is active; /move remains blocked until all spins stop.

@@ -214,7 +214,8 @@ esp_err_t handler_state(httpd_req_t *req)
         "\"elevation\":{\"angle_deg\":%.3f},"
         "\"calibration\":{"
             "\"az_zero_raw_deg\":%.3f,"
-            "\"el_zero_raw_deg\":%.3f"
+            "\"el_zero_raw_deg\":%.3f,"
+            "\"el_sign\":%d"
         "},"
         "\"runner\":{"
             "\"id\":%lu,"
@@ -231,6 +232,7 @@ esp_err_t handler_state(httpd_req_t *req)
         (double)pos.az_deg, (double)pos.el_deg,
         (double)motion_get_az_zero_raw(),
         (double)motion_get_el_zero_raw(),
+        motion_get_el_sign(),
         (unsigned long)snap.id,
         motion_runner_kind_str(snap.kind),
         motion_runner_status_str(snap.status),
@@ -633,6 +635,31 @@ esp_err_t handler_ota(httpd_req_t *req)
         return send_json(req,
             "{\"status\":\"ok\",\"message\":\"updated, reboot to run it\"}", 200);
     return send_json(req, "{\"status\":\"ok\",\"message\":\"updated, rebooting\"}", 200);
+}
+
+/* ── POST /calibrate/el_sign ────────────────────────────────────────────── */
+
+/*
+ * {"sign": 1|-1} — which way the user elevation runs against the raw EL
+ * reading ("+ = up"). Persisted; the encoder zero is kept, so the horizontal
+ * stays 0 whichever sign is set.
+ */
+esp_err_t handler_el_sign(httpd_req_t *req)
+{
+    char body[48];
+    if (read_body(req, body, sizeof(body)) < 0)
+        return send_json(req, "{\"status\":\"error\",\"message\":\"bad body\"}", 400);
+    float f;
+    if (!json_float(body, "sign", &f) || (f != 1.0f && f != -1.0f))
+        return send_json(req, "{\"status\":\"error\",\"message\":\"sign must be 1 or -1\"}", 400);
+    motion_state_t st = motion_get_state();
+    if (st == MOTION_MOVING || st == MOTION_SPINNING)
+        return send_json(req, "{\"status\":\"busy\"}", 409);
+    if (motion_set_el_sign((int)f) != ESP_OK)
+        return send_json(req, "{\"status\":\"error\",\"message\":\"nvs write failed\"}", 500);
+    char resp[64];
+    snprintf(resp, sizeof(resp), "{\"status\":\"ok\",\"el_sign\":%d}", motion_get_el_sign());
+    return send_json(req, resp, 200);
 }
 
 /* ── Motor calibration ──────────────────────────────────────────────────── */

@@ -186,7 +186,7 @@ static void start_http_server(void)
     httpd_config_t config  = HTTPD_DEFAULT_CONFIG();
     config.server_port     = CONFIG_ORBITER_HTTP_PORT;
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 32;   /* default is 8, we now have 27 routes + /ws/log */
+    config.max_uri_handlers = 32;   /* default is 8, we now have 29 routes + /ws/log */
     /*
      * 8 KB instead of the 4 KB default: handlers build their JSON on the
      * stack, and /state (pose + runner + per-axis motor calibration, ~2 KB of
@@ -228,6 +228,8 @@ static void start_http_server(void)
         { .uri = "/zero",         .method = HTTP_OPTIONS, .handler = handler_options      },
         { .uri = "/calibrate",    .method = HTTP_POST,    .handler = handler_calibrate    },
         { .uri = "/calibrate",    .method = HTTP_OPTIONS, .handler = handler_options      },
+        { .uri = "/calibrate/el_sign", .method = HTTP_POST,    .handler = handler_el_sign },
+        { .uri = "/calibrate/el_sign", .method = HTTP_OPTIONS, .handler = handler_options },
         { .uri = "/spin",         .method = HTTP_POST,    .handler = handler_spin         },
         { .uri = "/spin",         .method = HTTP_OPTIONS, .handler = handler_options      },
         { .uri = "/spin/stop",    .method = HTTP_POST,    .handler = handler_spin_stop    },

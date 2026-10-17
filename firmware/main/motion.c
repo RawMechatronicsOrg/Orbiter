@@ -21,6 +21,7 @@ static const char *TAG = "motion";
 #define CAL_NVS_NAMESPACE   "orbiter"
 #define CAL_KEY_AZ          "az_zero_raw"
 #define CAL_KEY_EL          "el_zero_raw"
+#define CAL_KEY_EL_SIGN     "el_sign"
 #define CAL_DEFAULT_AZ_RAW  0.0f
 #define CAL_DEFAULT_EL_RAW  138.296f
 
@@ -87,6 +88,14 @@ static portMUX_TYPE s_spin_lk = portMUX_INITIALIZER_UNLOCKED;
  */
 static float s_az_zero_raw = CAL_DEFAULT_AZ_RAW;
 static float s_el_zero_raw = CAL_DEFAULT_EL_RAW;
+/*
+ * +1: the user elevation grows with the raw EL reading (arm up = raw up), -1:
+ * against it. Which one holds depends on the sensor and which way its magnet
+ * faces — the AS5048A of v1 read -1, the AS5600 of the v2 bench reads +1 (a
+ * move to +15 sent the arm DOWN under the old hard-coded -1). Stored in NVS
+ * and set over HTTP, so remounting a magnet never needs a reflash.
+ */
+static int8_t s_el_sign = 1;
 
 /* ── Helpers ────────────────────────────────────────────────────────────── */
 
@@ -141,17 +150,11 @@ static float az_user_from_raw(float raw)
 /**
  * Elevation: bounded signed, user-space in (-180, +180] (then range-validated
  * to [MOTION_EL_MIN_DEG, MOTION_EL_MAX_DEG] at HTTP layer). See COORDINATES.md
- * §3.2, §4.1.
- *
- * The EL sensor is mounted such that raising the arm DECREASES raw
- * reading (opposite of AZ). We negate the (raw - zero) term so user_el
- * follows the conventional "+ = up" sense. This held for the AS5048A; the
- * AS5600 that replaced it reverses with its DIR strap and magnet side, so
- * check the sign on the rig after swapping sensors.
+ * §3.2, §4.1. "+ = up" through s_el_sign, whichever way the sensor counts.
  */
 static float el_user_from_raw(float raw)
 {
-    return fmodf(s_el_zero_raw - raw + 540.0f, 360.0f) - 180.0f;
+    return fmodf((float)s_el_sign * (raw - s_el_zero_raw) + 540.0f, 360.0f) - 180.0f;
 }
 
 /* ── NVS calibration load/save ──────────────────────────────────────────── */
@@ -170,9 +173,11 @@ static void calibration_load_from_nvs(void)
     if (nvs_get_blob(h, CAL_KEY_AZ, &v, &sz) == ESP_OK) s_az_zero_raw = v;
     sz = sizeof(float);
     if (nvs_get_blob(h, CAL_KEY_EL, &v, &sz) == ESP_OK) s_el_zero_raw = v;
+    int8_t sign;
+    if (nvs_get_i8(h, CAL_KEY_EL_SIGN, &sign) == ESP_OK) s_el_sign = (sign < 0) ? -1 : 1;
     nvs_close(h);
-    ESP_LOGI(TAG, "calibration loaded: az_zero=%.3f° el_zero=%.3f°",
-             (double)s_az_zero_raw, (double)s_el_zero_raw);
+    ESP_LOGI(TAG, "calibration loaded: az_zero=%.3f° el_zero=%.3f° el_sign=%d",
+             (double)s_az_zero_raw, (double)s_el_zero_raw, s_el_sign);
 }
 
 static esp_err_t calibration_save_to_nvs(bool save_az, bool save_el)
@@ -326,6 +331,26 @@ void motion_zero(bool do_az, bool do_el)
 float motion_get_az_zero_raw(void) { return s_az_zero_raw; }
 float motion_get_el_zero_raw(void) { return s_el_zero_raw; }
 
+int motion_get_el_sign(void) { return s_el_sign; }
+
+esp_err_t motion_set_el_sign(int sign)
+{
+    if (sign != 1 && sign != -1) return ESP_ERR_INVALID_ARG;
+    s_el_sign = (int8_t)sign;
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(CAL_NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_set_i8(h, CAL_KEY_EL_SIGN, s_el_sign);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+
+    float raw;
+    if (encoder_read_locked(ENC_EL, &raw) == ESP_OK) s_pos.el_deg = el_user_from_raw(raw);
+    LOGX_EMIT_I(TAG, "EL sign set to %+d (EL now %.2f°)", s_el_sign, (double)s_pos.el_deg);
+    return err;
+}
+
 esp_err_t motion_set_calibration(bool do_az, bool do_el,
                                  motion_cal_mode_t mode,
                                  float manual_az_raw, float manual_el_raw)
@@ -466,13 +491,13 @@ typedef struct {
  * on the v2 bench it was measured wrong on both axes — a closed-loop move
  * would drive away from its target until the timeout. Motor calibration
  * measures which DIR raises the RAW angle (dir_sign); the user angle follows
- * raw on AZ and runs against it on EL (el_user_from_raw), so the mapping
+ * raw on AZ and follows s_el_sign on EL (el_user_from_raw), so the mapping
  * falls out of those two signs.
  */
 static stepper_dir_t dir_toward(stepper_axis_t sax, float err)
 {
     if (!motorcal_valid(sax)) return (err >= 0.0f) ? DIR_CCW : DIR_CW;
-    int user_from_raw = (sax == STEPPER_EL) ? -1 : 1;
+    int user_from_raw = (sax == STEPPER_EL) ? s_el_sign : 1;
     int raw_up        = ((err >= 0.0f) ? 1 : -1) * user_from_raw;
     return (raw_up * motorcal_dir_sign(sax) > 0) ? DIR_CCW : DIR_CW;
 }
