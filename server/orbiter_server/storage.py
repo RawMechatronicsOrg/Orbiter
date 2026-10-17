@@ -14,6 +14,7 @@ import secrets
 import shutil
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,13 +61,31 @@ def _manifest_path(scan_id: str) -> Path:
     return _scan_dir(scan_id) / "manifest.json"
 
 
+#: One manifest replace at a time in this process: the scan's background
+#: stores, the sweep and the autosave each write from a worker thread, and two
+#: renames over one manifest.json race on Windows ("Access is denied").
+_replace_lock = threading.Lock()
+#: Windows also refuses the rename while another handle has the target open
+#: (a reader, an antivirus scan, the SMB redirector) — it lets go within ms.
+_REPLACE_ATTEMPTS = 5
+_REPLACE_BACKOFF_S = 0.05
+
+
 def _atomic_write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".manifest.", suffix=".json", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, path)
+        with _replace_lock:
+            for attempt in range(1, _REPLACE_ATTEMPTS + 1):
+                try:
+                    os.replace(tmp, path)
+                    break
+                except PermissionError:
+                    if attempt == _REPLACE_ATTEMPTS:
+                        raise
+                    time.sleep(_REPLACE_BACKOFF_S * attempt)
     except Exception:
         try:
             os.unlink(tmp)

@@ -8,7 +8,9 @@
  *
  * The phone-IMU elevation estimate comes ready-made from the server
  * (`model.phone_el_deg`, single mount convention shared with the encoder
- * auto-zero) — do NOT re-derive it here.
+ * auto-zero) — do NOT re-derive it here. Both phone apps (IP Webcam, the
+ * capture node) serve the IMU; without a live IMU source the phone-el row and
+ * the marker toggle are not shown at all.
  */
 
 import { useState } from 'react';
@@ -79,8 +81,8 @@ export function PositionOverlay({ commands }: { commands: Commands }) {
   const targetAz = model.move_target_az as number | null | undefined;
   const targetEl = model.move_target_el as number | null | undefined;
   const hasTarget = targetAz != null && targetEl != null;
-  // Phone IMU — surfaced by the server's phone_sensor poll. Null while the
-  // camera URL is empty or the IP Webcam sensors endpoint is unreachable.
+  // Phone IMU — surfaced by the server's phone_sensor poll. Offline while the
+  // camera URL is empty or the phone's /sensors.json does not answer.
   const phoneOnline = model.phone_sensor_online === true;
   const phoneEl = phoneOnline
     ? (model.phone_el_deg as number | null | undefined) ?? null
@@ -98,7 +100,7 @@ export function PositionOverlay({ commands }: { commands: Commands }) {
                  rounded-2xl border border-cardline bg-[#131c2e]/90 px-5 py-4
                  backdrop-blur-sm"
     >
-      {/* left column — pose readout + phone-marker toggle */}
+      {/* left column — pose readout + phone-marker toggle (IMU only) */}
       <div className="flex w-[150px] flex-col justify-center gap-2 self-stretch">
         <div className="rounded-lg border border-cardline bg-black/25 px-3 py-2">
           <ReadoutRow label="az" value={`${num(model, 'az').toFixed(1)}°`} />
@@ -118,15 +120,17 @@ export function PositionOverlay({ commands }: { commands: Commands }) {
             />
           )}
         </div>
-        <label className="flex cursor-pointer items-center gap-2 text-[12px] text-inkmute">
-          <input
-            type="checkbox"
-            className={cls.check}
-            checked={showPhoneMarker}
-            onChange={(e) => setShowPhoneMarker(e.target.checked)}
-          />
-          <span>phone marker</span>
-        </label>
+        {phoneOnline && (
+          <label className="flex cursor-pointer items-center gap-2 text-[12px] text-inkmute">
+            <input
+              type="checkbox"
+              className={cls.check}
+              checked={showPhoneMarker}
+              onChange={(e) => setShowPhoneMarker(e.target.checked)}
+            />
+            <span>phone marker</span>
+          </label>
+        )}
       </div>
 
       {/* navball — pure indicator, no controls on it */}

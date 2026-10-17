@@ -28,7 +28,7 @@ from PIL import Image, ImageOps
 # Preset registry
 # ─────────────────────────────────────────────────────────────────────────
 
-PresetName = Literal["native", "sm22"]
+PresetName = Literal["native", "sm22", "sensor0", "sensor90", "sensor180", "sensor270"]
 
 
 @dataclass(frozen=True)
@@ -65,7 +65,27 @@ PRESETS: dict[PresetName, PresetSpec] = {
         honor_exif_orientation=False,
         strip_metadata_from_original=False,
     ),
+    # CameraStreamer capture node: sensor-native pixels with EXIF
+    # Orientation=1, turned upright by the camera's SENSOR_ORIENTATION (deg CW)
+    # for a phone held in its natural orientation. `sensor90` is what `sm22`
+    # does; `camera_io.capture_preset` picks one from the node's capabilities.
+    **{
+        f"sensor{deg}": PresetSpec(
+            name=f"sensor{deg}",  # type: ignore[arg-type]
+            extra_cw_quarter_turns=deg // 90,
+            honor_exif_orientation=False,
+            strip_metadata_from_original=False,
+        )
+        for deg in (0, 90, 180, 270)
+    },
 }
+
+
+def sensor_preset_name(sensor_orientation_deg: int) -> PresetName:
+    """The `sensor*` preset for a camera's SENSOR_ORIENTATION (0/90/180/270,
+    rounded to the nearest quarter turn)."""
+    deg = (round(sensor_orientation_deg / 90) % 4) * 90
+    return f"sensor{deg}"  # type: ignore[return-value]
 
 
 def get_preset(name: str | None) -> PresetSpec:

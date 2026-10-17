@@ -1332,6 +1332,10 @@ def residual_structure(rows: list[dict[str, float]]) -> str | None:
     )
 
 
+#: Consecutive poses whose photo failed before a calibration sweep gives up.
+_CAMERA_FAILURES_IN_A_ROW = 2
+
+
 async def _capture_one(
     az: float,
     el: float,
@@ -1416,9 +1420,28 @@ async def run_calibration(
         f"{model.camera_url or '(unset)'}"
     ))
 
+    # No sweep without a camera that can shoot (and, on the capture node, a
+    # locked profile: intrinsics need one fixed focus) — fail before moving.
+    await camera_io.require_ready()
+
     samples: list[CaptureSample] = []
+    camera_failures = 0
     for i, (az, el) in enumerate(poses, 1):
-        sample = await _capture_one(az, el, board)
+        try:
+            sample = await _capture_one(az, el, board)
+        except camera_io.CameraError as exc:
+            # One lost photo costs one view, like an undetected board; a camera
+            # that keeps failing ends the sweep with the reason.
+            camera_failures += 1
+            _ui_log("E", f"calibration: [{i}/{len(poses)}] "
+                         f"az={az:.0f}° el={el:.0f}° → camera failed ✗: {exc}")
+            if camera_failures >= _CAMERA_FAILURES_IN_A_ROW:
+                raise RuntimeError(
+                    f"calibration aborted: the camera failed at {camera_failures} "
+                    f"poses in a row — {exc}"
+                ) from exc
+            continue
+        camera_failures = 0
         if sample is not None:
             n = (len(sample.charuco_corners)
                  if sample.charuco_corners is not None else 0)

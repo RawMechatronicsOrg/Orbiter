@@ -31,6 +31,7 @@ import { Input } from '../components/ui/input';
 import { Card, CardContent, CardTitle } from '../components/ui/card';
 import { GeometryStateModal } from './GeometryStateModal';
 import { MotorCalibration } from './MotorCalibration';
+import { CameraConnectionNotes } from './CameraConnection';
 
 type CalPreset = 'fast' | 'normal' | 'full';
 
@@ -734,6 +735,7 @@ export function MachineConfig({ commands }: { commands: Commands }) {
               }}
             />
           </label>
+          <CameraConnectionNotes cameraUrl={cameraUrl} espIp={espIp} />
           <Button
             onClick={() => {
               commands.raw('set_endpoints', {

@@ -95,6 +95,10 @@ class CaptureMeta(BaseModel):
     # MotionPlanner action that produced this capture (`photo`, `photo_flash`).
     # None for manual `Take shot` and legacy captures.
     action: str | None = None
+    # CameraStreamer capture node only: the phone's shot id, the locked profile
+    # fingerprint, and whether the camera reported exactly that profile
+    # (`camera_io.shot_summary`). None for IP Webcam and legacy captures.
+    camera_shot: dict[str, Any] | None = None
 
 
 class Capture(CaptureMeta):

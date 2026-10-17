@@ -8,11 +8,15 @@ import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 
-/** Pretty labels for action checkboxes — the two camera-only actions for
- *  the v0.1 photogrammetry slice. */
-const ACTION_LABELS: ReadonlyArray<readonly [string, string]> = [
-  ['photo', 'plain photo'],
-  ['photo_flash', 'photo + flash'],
+/** Action checkboxes — the two camera-only actions: [key, label, tooltip].
+ *  `photo_flash` turns the phone LED on for the shot: IP Webcam's torch, or
+ *  on the capture node a torch-on step of its locked profile (exposure, ISO
+ *  and white balance stay as locked, so the lit frames come out brighter). */
+const ACTIONS: ReadonlyArray<readonly [string, string, string]> = [
+  ['photo', 'plain photo', 'one photo at each point'],
+  ['photo_flash', 'photo + flash',
+   'one photo with the phone LED on — the torch is switched on and settled ' +
+   'before the shot and off after it; exposure stays as locked'],
 ];
 
 const FIELD_LABELS: Record<string, string> = {
@@ -217,8 +221,8 @@ export function LeftBar({ commands }: { commands: Commands }) {
           <div className="mt-1 text-[12px] uppercase tracking-[0.12em] text-inkdim">
             Actions per point
           </div>
-          {ACTION_LABELS.map(([key, label]) => (
-            <label key={key} className="flex items-center gap-2 text-[13px]">
+          {ACTIONS.map(([key, label, title]) => (
+            <label key={key} className="flex items-center gap-2 text-[13px]" title={title}>
               <input
                 type="checkbox"
                 className={cls.check}

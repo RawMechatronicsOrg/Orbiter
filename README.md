@@ -523,7 +523,8 @@ docker run --rm -p 8000:8000 \
 | GET    | `/scans/{sid}/photos/{idx}/...`   | Thumbnails / full / meta.                                             |
 | GET    | `/captures/{cid}/...`             | Capture pool (immutable).                                             |
 | GET    | `/camera/stream.mjpeg`            | Live MJPEG preview re-multiplexed from the phone.                     |
-| GET    | `/camera/stream/status`           | Camera connection status.                                             |
+| GET    | `/camera/stream/status`           | Camera connection status: URL, frame size, last error.                |
+| POST   | `/camera/node/{lock\|profile\|unlock}` | Capture node only: meter and lock its manual profile, re-lock / patch it, back to auto. |
 | GET    | `/stereo/upstream/state`          | The binocular pair's `camserver` state, proxied (no-store).           |
 | GET/POST | `/stereo/upstream/controls/{cam_id}` | Read / set a camera's V4L2 controls through the proxy.           |
 | GET    | `/stereo/upstream/formats/{cam_id}` | List a camera's sizes, FourCCs, frame rates.                        |
@@ -542,7 +543,7 @@ docker run --rm -p 8000:8000 \
 |--------------------------------|------------------------|------------------------------------------------|
 | `ORBITER_STORAGE_DIR`          | `./data`               | Root for `scans/` + `captures/`.               |
 | `ORBITER_ESP_IP`               | `orbiter.local`        | ESP32 firmware host (mDNS auto-discovery or the UI override it). |
-| `ORBITER_CAMERA_URL`           | empty                  | IP Webcam HTTP base URL (e.g. `http://phone-ip:8080`). |
+| `ORBITER_CAMERA_URL`           | empty                  | The phone, `http://phone-ip:8080`: a CameraStreamer capture node (recognised automatically; scans pull each photo behind the next move) or IP Webcam. |
 | `ORBITER_PORT`                 | `8000`                 | Bound port.                                    |
 | `ORBITER_CORS_ORIGINS`         | localhost:5173 / 5174  | Comma-separated allowed origins.               |
 | `ORBITER_DEFAULT_CAMERA_PRESET`| `native`               | Pixel-rotation preset for new captures.        |
