@@ -1,8 +1,16 @@
 """Camera HTTP I/O.
 
-Targets the IP Webcam (Pavel Khlebovich) Android app on `settings.camera_url`.
-Only the `scheme://host:port` of that URL matters — any path is stripped and
-we hit the documented endpoints directly:
+Talks to the phone on `model.camera_url`, which runs one of two apps. Only the
+`scheme://host:port` of that URL matters — any path is stripped.
+
+**CameraStreamer** (`labs/orbiter-lab/camerastreamer`, recognised by
+`GET /status` → `"app": "camerastreamer"`) — the capture node. The camera sits
+on a locked manual profile; `trigger_shot` returns as soon as the frame is
+exposed (the rig may move), and `fetch_shot` later pulls the JPEG, checks its
+SHA-256, reads the per-frame verification and frees the phone's copy. See its
+docs/CAPTURE_API.md.
+
+**IP Webcam** (Pavel Khlebovich) — the legacy source, documented endpoints:
 
   * `/photoaf.jpg`  — trigger autofocus + capture (slow, sharp)
   * `/photo.jpg`    — capture with whatever focus is currently set (fast)
@@ -14,9 +22,11 @@ we hit the documented endpoints directly:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import logging
-from typing import Iterable
+import time
+from typing import Any, Iterable
 from urllib.parse import urlparse
 
 import httpx
@@ -217,13 +227,21 @@ async def fetch_photo(el_deg: float | None = None) -> bytes:
       el_deg: ignored. Kept in the signature for source compatibility with
               callers that still pass it.
 
-    Hits ``/photo.jpg`` (no AF trigger) — every shot uses whatever focal
-    distance the lens currently holds. Callers that need a stable focal
-    length across views must call ``lock_focus()`` first.
+    On a capture node: one shot on its locked profile, waited for and pulled
+    (raises on failure — a blank stand-in would poison calibration or a scan).
 
-    Falls back to PLACEHOLDER on any camera/network error so a sweep job
-    still writes valid (if blank) pairs instead of crashing."""
+    On IP Webcam: hits ``/photo.jpg`` (no AF trigger) — every shot uses
+    whatever focal distance the lens currently holds. Callers that need a
+    stable focal length across views must call ``lock_focus()`` first. Falls
+    back to PLACEHOLDER on any camera/network error so a sweep job still
+    writes valid (if blank) pairs instead of crashing."""
     global _warned_no_camera
+    if await is_capture_node():
+        shot_id = new_shot_id("photo")
+        await trigger_shot(shot_id, {"source": "orbiter-server fetch_photo"})
+        jpeg, _record = await fetch_shot(shot_id)
+        await release_shot(shot_id)
+        return jpeg
     base = camera_base()
     if base is None:
         if not _warned_no_camera:
@@ -246,9 +264,21 @@ async def fetch_photo(el_deg: float | None = None) -> bytes:
 
 
 async def set_torch(on: bool) -> None:
-    """Toggle the phone LED. No-op + warning on failure (never fatal)."""
+    """Toggle the phone LED. No-op + warning on failure (never fatal).
+
+    On a capture node the torch is part of the locked profile: the change is
+    applied and settled before this returns."""
     base = camera_base()
     if base is None:
+        return
+    if await is_capture_node():
+        try:
+            resp = await _client().post(f"{base}/profile", json={"torch": on},
+                                        timeout=_PROFILE_TIMEOUT_S)
+            if resp.status_code != 200 or not _body(resp).get("settled"):
+                log.warning("torch %s: HTTP %d %s", on, resp.status_code, _error(resp))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("torch %s failed: %s", on, exc)
         return
     endpoint = "/enabletorch" if on else "/disabletorch"
     try:
@@ -257,3 +287,199 @@ async def set_torch(on: bool) -> None:
             resp.raise_for_status()
     except Exception as exc:  # noqa: BLE001
         log.warning("torch %s failed: %s", endpoint, exc)
+
+
+# ── CameraStreamer capture node ─────────────────────────────────────────────
+
+#: `POST /shots` returns at "exposed": the HAL queue plus the exposure, well
+#: under a second; the phone waits up to 3 s (longer for long exposures) for
+#: the camera to settle first.
+_SHOT_TIMEOUT_S = 20.0
+#: `GET /shots/{id}.jpg` waits on the phone until the file is written.
+_FETCH_WAIT_MS = 30_000
+_FETCH_TIMEOUT_S = 60.0
+_PROFILE_TIMEOUT_S = 10.0
+_NODE_APP = "camerastreamer"
+#: How long an answer to "is this a capture node?" holds for one URL.
+_NODE_CACHE_S = 30.0
+
+_node_cache: dict[str, tuple[bool, float]] = {}
+_shot_counter = iter(range(1, 1 << 62))
+
+
+class ShotError(RuntimeError):
+    """A capture-node shot did not happen or could not be fetched.
+
+    ``definitive`` — the phone says the shot itself failed: retrying the SAME
+    id returns that failure again, a retry needs a new id. Otherwise (busy,
+    not settled, network) the same id is safe to retry: the phone never
+    shoots a known id twice and records nothing for a 503."""
+
+    def __init__(self, message: str, definitive: bool = False):
+        super().__init__(message)
+        self.definitive = definitive
+
+
+_shared: tuple[asyncio.AbstractEventLoop, httpx.AsyncClient] | None = None
+
+
+def _client() -> httpx.AsyncClient:
+    """One keep-alive client per event loop for every capture-node call: a new
+    connection costs the phone a thread and a WiFi round trip (20–70 ms on the
+    bench), which would sit on the scan's critical path at every pose."""
+    global _shared
+    loop = asyncio.get_running_loop()
+    if _shared is None or _shared[0] is not loop:
+        _shared = (loop, httpx.AsyncClient(timeout=_SHOT_TIMEOUT_S))
+    return _shared[1]
+
+
+async def aclose() -> None:
+    """Close the shared client (app shutdown)."""
+    global _shared
+    if _shared is not None:
+        client, _shared = _shared[1], None
+        await client.aclose()
+
+
+def _body(resp: httpx.Response) -> dict[str, Any]:
+    try:
+        data = resp.json()
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _error(resp: httpx.Response) -> str:
+    return str(_body(resp).get("error") or resp.text[:200])
+
+
+def _require_base() -> str:
+    base = camera_base()
+    if base is None:
+        raise ShotError("camera_url is not configured")
+    return base
+
+
+def new_shot_id(prefix: str) -> str:
+    """A process-unique shot id (the phone accepts ``[A-Za-z0-9_-]``)."""
+    return f"{prefix}-{time.strftime('%Y%m%d-%H%M%S')}-{next(_shot_counter)}"
+
+
+async def is_capture_node() -> bool:
+    """True when ``camera_url`` points at a CameraStreamer capture node.
+
+    Answers are cached per URL for `_NODE_CACHE_S`; an unreachable phone is
+    not cached, so the next call asks again."""
+    base = camera_base()
+    if base is None:
+        return False
+    hit = _node_cache.get(base)
+    now = time.monotonic()
+    if hit is not None and now - hit[1] < _NODE_CACHE_S:
+        return hit[0]
+    try:
+        resp = await _client().get(f"{base}/status", timeout=_CONTROL_TIMEOUT_S)
+    except Exception:  # noqa: BLE001 — unreachable: no answer to cache
+        return False
+    is_node = resp.status_code == 200 and _body(resp).get("app") == _NODE_APP
+    _node_cache[base] = (is_node, now)
+    return is_node
+
+
+async def require_locked_node() -> dict[str, Any]:
+    """The node's ``GET /status``; raises unless it is ready and locked on a
+    profile — a scan must never start on auto exposure."""
+    base = _require_base()
+    resp = await _client().get(f"{base}/status", timeout=_CONTROL_TIMEOUT_S)
+    status = _body(resp)
+    if resp.status_code != 200:
+        raise ShotError(f"phone status: HTTP {resp.status_code} {_error(resp)}")
+    if status.get("state") != "ready":
+        raise ShotError(f"phone camera is {status.get('state')}: {status.get('last_error')}")
+    if status.get("mode") != "locked":
+        raise ShotError("phone camera is not locked on a profile — lock it first "
+                        "(camerastreamer: POST /lock, or `camctl lock`)")
+    return status
+
+
+async def trigger_shot(shot_id: str, meta: dict[str, Any]) -> dict[str, Any]:
+    """Shoot ``shot_id`` and return once the frame is exposed — the rig may
+    move as soon as this returns. The JPEG stays on the phone until
+    `fetch_shot`. Raises `ShotError`."""
+    base = _require_base()
+    try:
+        resp = await _client().post(f"{base}/shots",
+                                    json={"id": shot_id, "meta": meta, "wait": "exposed"},
+                                    timeout=_SHOT_TIMEOUT_S)
+    except httpx.HTTPError as exc:
+        raise ShotError(f"shot {shot_id}: {exc!r}") from exc
+    record = _body(resp)
+    if resp.status_code not in (200, 201) or record.get("state") == "failed":
+        raise ShotError(f"shot {shot_id}: HTTP {resp.status_code} "
+                        f"{record.get('error') or _error(resp)}",
+                        definitive=record.get("state") == "failed")
+    if record.get("state") not in ("exposed", "stored"):
+        raise ShotError(f"shot {shot_id}: not exposed in time (state {record.get('state')})")
+    return record
+
+
+async def fetch_shot(shot_id: str) -> tuple[bytes, dict[str, Any]]:
+    """Wait for ``shot_id``'s JPEG on the phone and take it (SHA-256 checked)
+    with its final record (the per-frame verification). The phone keeps its
+    copy until `release_shot` — call that once the photo is safely stored.
+    Safe to retry. Raises `ShotError`."""
+    base = _require_base()
+    try:
+        client = _client()
+        resp = await client.get(f"{base}/shots/{shot_id}.jpg",
+                                params={"wait_ms": _FETCH_WAIT_MS}, timeout=_FETCH_TIMEOUT_S)
+        if resp.status_code != 200:
+            raise ShotError(f"fetch {shot_id}: HTTP {resp.status_code} {_error(resp)}",
+                            definitive=resp.status_code in (404, 409))
+        jpeg = resp.content
+        want = resp.headers.get("x-shot-sha256")
+        if want and hashlib.sha256(jpeg).hexdigest() != want:
+            raise ShotError(f"fetch {shot_id}: sha256 mismatch")
+        record = _body(await client.get(f"{base}/shots/{shot_id}", timeout=_CONTROL_TIMEOUT_S))
+    except httpx.HTTPError as exc:
+        raise ShotError(f"fetch {shot_id}: {exc!r}") from exc
+    if record.get("state") == "failed":
+        log.warning("shot %s recovered after a phone-side failure (%s): unverified",
+                    shot_id, record.get("error"))
+    elif record.get("deviations"):
+        log.warning("shot %s was not shot as locked: %s", shot_id, "; ".join(record["deviations"]))
+    return jpeg, record
+
+
+async def release_shot(shot_id: str) -> None:
+    """Free the phone's copy of a stored shot. Best effort: a shot left behind
+    only costs phone storage (it shows up in ``GET /shots?state=stored``)."""
+    try:
+        resp = await _client().delete(f"{_require_base()}/shots/{shot_id}",
+                                      timeout=_CONTROL_TIMEOUT_S)
+        if resp.status_code not in (200, 404):
+            log.warning("shot %s stays on the phone: delete HTTP %d %s",
+                        shot_id, resp.status_code, _error(resp))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("shot %s stays on the phone: %s", shot_id, exc)
+
+
+def shot_summary(record: dict[str, Any]) -> dict[str, Any]:
+    """What a capture keeps of the phone's shot record: identity, the profile
+    it was shot with, and whether the camera reported exactly that."""
+    frame = record.get("frame") or {}
+    return {
+        "id": record.get("id"),
+        "state": record.get("state"),
+        "error": record.get("error"),
+        "profile_fingerprint": record.get("profile_fingerprint"),
+        "verified": record.get("verified"),
+        "deviations": record.get("deviations") or [],
+        "sensor_timestamp_ns": frame.get("sensor_timestamp_ns"),
+        "exposure_ns": frame.get("exposure_ns"),
+        "iso": frame.get("iso"),
+        "focus_diopters": frame.get("focus_diopters"),
+        "physical_camera_id": frame.get("physical_camera_id"),
+        "latency_ms": record.get("latency_ms"),
+    }

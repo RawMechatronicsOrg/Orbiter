@@ -27,6 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import camera_adapter
 import discovery
 import scan_task
+import camera_io
 from camera_stream import stream as camera_stream
 from config import settings
 from esp_proxy import esp
@@ -63,6 +64,7 @@ async def lifespan(_app: FastAPI):
     finally:
         await scan_task.stop_autosave()
         await camera_stream.stop()
+        await camera_io.aclose()
         await phone_sensor.stop()
         await discovery.stop()
         await esp.stop()

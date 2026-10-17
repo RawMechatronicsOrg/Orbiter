@@ -8,13 +8,22 @@ step. At each ring point the loop runs every checked `action` in order
 Photo bytes always hit the `captures/` pool immediately; only the lightweight
 manifest.json gets the dirty / save / autosave treatment (UI shows it as
 "unsaved changes").
+
+A capture is two steps: `_take` exposes the photo at the current pose and
+`_store` gets it into the pool. The sweep moves the rig on as soon as `_take`
+returns and runs `_store` in the background (`_StoreQueue`). With a
+CameraStreamer capture node `_take` returns once the frame is exposed and
+`_store` pulls the JPEG off the phone, so the transfer overlaps the next move;
+with IP Webcam `_take` already includes the transfer.
 """
 
 from __future__ import annotations
 
 import asyncio
+import bisect
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, TypeVar
 
@@ -74,6 +83,9 @@ _ACTION_SETTLE_S = 0.2
 _OP_ATTEMPTS = 3
 _OP_BACKOFF_S = (1.0, 3.0)
 _MAX_CONSECUTIVE_FAILED_POINTS = 3
+#: Photos taken but not yet in the pool. Each one holds the phone's storage
+#: (capture node) or memory (IP Webcam); beyond this the sweep waits.
+_MAX_PENDING_STORES = 4
 
 _T = TypeVar("_T")
 
@@ -121,19 +133,40 @@ def _vec3(t: tuple[float, float, float]) -> Vec3:
 # ── single capture ─────────────────────────────────────────────────────────
 
 
-async def _capture_at(
+@dataclass
+class _Taken:
+    """A photo exposed at one pose: ``raw`` when it is already here (IP
+    Webcam), ``shot_id`` while it is still on the capture node."""
+
+    meta: CaptureMeta
+    raw: bytes | None = None
+    shot_id: str | None = None
+
+
+async def _take(
     scan_id: str,
     index: int,
     planned_az: float | None,
     planned_el: float | None,
     action: str | None = None,
-) -> dict[str, Any]:
-    """Take one photo at the current rig pose and store it. Returns the
-    JSON-able Capture dict."""
+    shot_id: str | None = None,
+) -> _Taken:
+    """Expose one photo at the current rig pose. On a capture node this
+    returns as soon as the frame is exposed — the rig may move on — and the
+    JPEG stays on the phone for `_store`."""
     geom = _geom_params()
     az_act, el_act = model.az, model.el
     pose = camera_pose_at(az_act, el_act, geom)
-    raw = await camera_io.fetch_photo(el_deg=el_act)
+    raw: bytes | None = None
+    if await camera_io.is_capture_node():
+        shot_id = shot_id or camera_io.new_shot_id(f"{scan_id}-{index:04d}")
+        await camera_io.trigger_shot(shot_id, {
+            "scan_id": scan_id, "index": index, "action": action,
+            "az_deg": az_act, "el_deg": el_act,
+        })
+    else:
+        shot_id = None
+        raw = await camera_io.fetch_photo(el_deg=el_act)
 
     # Bank the stored camera orientation by the live bracket roll — ONLY on
     # the manual-model path. The calibrated mount X already carries the
@@ -170,9 +203,22 @@ async def _capture_at(
         camera_preset=model.camera_preset,
         action=action,
     )
+    return _Taken(meta=meta, raw=raw, shot_id=shot_id)
+
+
+async def _store(scan_id: str, taken: _Taken) -> dict[str, Any]:
+    """Get a taken photo into the captures pool — pulled off the phone first
+    when it is still there — and return the JSON-able Capture dict. The
+    phone's copy is released only once the pool holds it. Safe to retry."""
+    meta, raw = taken.meta, taken.raw
+    if raw is None:
+        raw, record = await camera_io.fetch_shot(taken.shot_id)
+        meta = meta.model_copy(update={"camera_shot": camera_io.shot_summary(record)})
     cap_id, _orig, _thumb, _meta_path, width, height = await asyncio.to_thread(
         storage.save_capture_with_thumb, scan_id, meta, raw,
     )
+    if taken.shot_id is not None:
+        await camera_io.release_shot(taken.shot_id)
     capture = Capture(
         **meta.model_dump(),
         capture_id=cap_id,
@@ -183,6 +229,80 @@ async def _capture_at(
         stored_height=height,
     )
     return capture.model_dump(mode="json")
+
+
+async def _capture_at(
+    scan_id: str,
+    index: int,
+    planned_az: float | None,
+    planned_el: float | None,
+    action: str | None = None,
+) -> dict[str, Any]:
+    """Take one photo at the current rig pose and store it. Returns the
+    JSON-able Capture dict."""
+    return await _store(scan_id, await _take(scan_id, index, planned_az, planned_el, action))
+
+
+def _shot_attempts(base_id: str, take: Callable[[str], Awaitable[_T]]) -> Callable[[], Awaitable[_T]]:
+    """Adapts a shot for `_with_retries`: retries reuse the shot id — the phone
+    never shoots a known id twice, so a lost answer cannot double a frame —
+    until the phone reports the shot itself failed; then the next attempt
+    needs a fresh id."""
+    failed = 0
+
+    async def attempt() -> _T:
+        nonlocal failed
+        try:
+            return await take(base_id if failed == 0 else f"{base_id}-r{failed}")
+        except camera_io.ShotError as exc:
+            if exc.definitive:
+                failed += 1
+            raise
+
+    return attempt
+
+
+class _StoreQueue:
+    """Stores taken photos in the background while the sweep moves on, at
+    most `_MAX_PENDING_STORES` pending. Transfers run one at a time: one
+    already fills the WiFi link, and parallel ones only delay the next shot's
+    small request behind them (bench: 800 ms instead of 240 ms on a slow
+    link). Captures land in ``captures`` in index order."""
+
+    def __init__(self, scan_id: str, captures: list[dict[str, Any]]) -> None:
+        self._scan_id = scan_id
+        self._captures = captures
+        self._tasks: set[asyncio.Task[None]] = set()
+        self._transfer = asyncio.Lock()
+
+    async def add(self, point: ScanPathPoint, action: str, taken: _Taken) -> None:
+        while len(self._tasks) >= _MAX_PENDING_STORES:
+            await asyncio.wait(self._tasks, return_when=asyncio.FIRST_COMPLETED)
+        task = asyncio.create_task(self._store(point, action, taken))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def drain(self) -> None:
+        if self._tasks:
+            await asyncio.gather(*list(self._tasks), return_exceptions=True)
+
+    async def _store(self, point: ScanPathPoint, action: str, taken: _Taken) -> None:
+        try:
+            async with self._transfer:
+                cap = await _with_retries(
+                    f"store {action} @ point {point.index}",
+                    lambda: _store(self._scan_id, taken),
+                )
+        except Exception as exc:  # noqa: BLE001 — the point fails, the sweep goes on
+            stage = f"{action} transfer" + (f" (shot {taken.shot_id} left on the phone)"
+                                            if taken.shot_id else "")
+            _record_failed_point(point, stage, exc)
+            await _persist_capture_now()
+            return
+        bisect.insort(self._captures, cap, key=lambda c: c["index"])
+        model.update(scan_progress=len(self._captures), captures=list(self._captures))
+        # Write-through: the capture is durable the moment it exists.
+        await _persist_capture_now()
 
 
 # ── path + plan helpers ────────────────────────────────────────────────────
@@ -453,14 +573,15 @@ async def stop_autosave() -> None:
 # ── scan execution (discrete sweep) ─────────────────────────────────────────
 
 
-async def _capture_with_action(
+async def _take_with_action(
     scan_id: str,
     index: int,
     planned_az: float | None,
     planned_el: float | None,
     action: str,
-) -> dict[str, Any]:
-    """Run one MotionPlanner action: prep hardware (torch), settle, capture,
+    shot_id: str,
+) -> _Taken:
+    """Run one MotionPlanner action: prep hardware (torch), settle, take,
     tear down. Hardware tear-down runs in `finally` so the rig returns to a
     clean state even on capture failure."""
     want_flash = action == "photo_flash"
@@ -468,7 +589,7 @@ async def _capture_with_action(
         if want_flash:
             await camera_io.set_torch(True)
             await asyncio.sleep(_ACTION_SETTLE_S)
-        return await _capture_at(scan_id, index, planned_az, planned_el, action=action)
+        return await _take(scan_id, index, planned_az, planned_el, action=action, shot_id=shot_id)
     finally:
         if want_flash:
             try:
@@ -508,9 +629,26 @@ async def _run_discrete(scan_id: str, plan: DiscretePlan) -> None:
     )
     actions: list[str] = list(plan.actions) or ["photo"]
     captures: list[dict[str, Any]] = []
-    consecutive_failed = 0
+    stores = _StoreQueue(scan_id, captures)
     log.info("discrete scan %s started — %d points × %d actions",
              scan_id, len(path), len(actions))
+    try:
+        await _sweep(scan_id, path, actions, stores)
+    finally:
+        # Photos already taken still get stored, also after an abort or a
+        # failure — they are on the phone or in memory, not yet in the pool.
+        await stores.drain()
+
+
+async def _sweep(
+    scan_id: str,
+    path: list[ScanPathPoint],
+    actions: list[str],
+    stores: _StoreQueue,
+) -> None:
+    """The move → take loop of `_run_discrete`; stores run in ``stores``."""
+    next_index = 0
+    consecutive_failed = 0
     for point in path:
         if _abort.is_set():
             log.info("scan %s aborted at point %d/%d",
@@ -537,24 +675,24 @@ async def _run_discrete(scan_id: str, plan: DiscretePlan) -> None:
         for action in actions:
             if _abort.is_set():
                 break
+            index = next_index
             try:
-                cap = await _with_retries(
+                taken = await _with_retries(
                     f"capture {action} @ point {point.index}",
-                    lambda p=point, a=action, i=len(captures):
-                        _capture_with_action(scan_id, i, p.az_deg, p.el_deg, a),
+                    _shot_attempts(
+                        f"{scan_id}-{index:04d}",
+                        lambda shot_id, p=point, a=action, i=index:
+                            _take_with_action(scan_id, i, p.az_deg, p.el_deg, a, shot_id),
+                    ),
                 )
             except Exception as exc:  # noqa: BLE001 — skip this point's action
                 _record_failed_point(point, action, exc)
                 await _persist_capture_now()
                 point_ok = False
                 break
-            captures.append(cap)
-            model.update(
-                scan_progress=len(captures),
-                captures=list(captures),
-            )
-            # Write-through: the capture is durable the moment it exists.
-            await _persist_capture_now()
+            next_index += 1
+            # The rig moves on now; the photo reaches the pool in the background.
+            await stores.add(point, action, taken)
 
         if point_ok:
             consecutive_failed = 0
@@ -610,6 +748,12 @@ async def start_scan() -> dict[str, Any]:
     )
     if not check:
         raise RuntimeError("discrete plan is empty — check params")
+
+    if await camera_io.is_capture_node():
+        try:
+            await camera_io.require_locked_node()
+        except camera_io.ShotError as exc:
+            raise RuntimeError(str(exc)) from exc
 
     info = await new_active_scan(machine_captured=True)
     scan_id = info["scan_id"]
