@@ -22,7 +22,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { useViewerStore } from './modelStore';
 import type { Commands } from './commands';
-import { num } from './ui';
+import { calibrationStatus, num } from './ui';
 import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
 import { Card, CardContent, CardTitle } from '../components/ui/card';
@@ -256,7 +256,13 @@ export function MachineConfig({ commands }: { commands: Commands }) {
 
   // Reactive — re-renders when these model fields change (e.g. when the
   // server applies a calibration result).
-  const calibrated = useViewerStore((s) => s.model.calibrated === true);
+  const calState = useViewerStore((s) => calibrationStatus(s.model));
+  const calibRigId = useViewerStore((s) =>
+    typeof s.model.calib_rig_id === 'string' ? s.model.calib_rig_id : null,
+  );
+  const rigId = useViewerStore((s) =>
+    typeof s.model.rig_id === 'string' ? s.model.rig_id : '',
+  );
   // Result of "Test accuracy" — a human string the server writes after it
   // captures a photo, detects the board, and compares optical vs encoder pose.
   const calTestMsg = useViewerStore((s) =>
@@ -321,6 +327,18 @@ export function MachineConfig({ commands }: { commands: Commands }) {
     setBoardDirty(false);
   };
 
+  const resetCalibration = () => {
+    if (
+      window.confirm(
+        'Reset the geometry calibration? The solved mount, axis corrections ' +
+          'and arm geometry are dropped; the rig falls back to the CAD model. ' +
+          'Camera intrinsics are kept.',
+      )
+    ) {
+      commands.resetCalibration();
+    }
+  };
+
   // Chosen accuracy step — defaults to the most accurate (full).
   const [calPreset, setCalPreset] = useState<CalPreset>('full');
 
@@ -359,10 +377,33 @@ export function MachineConfig({ commands }: { commands: Commands }) {
       <CardTitle className="mb-2">Machine config</CardTitle>
 
       {/* ── Status — the first thing you see ── */}
-      {calibrated ? (
+      {calState === 'current' ? (
         <div className="mb-3 rounded-md border border-emerald-500/50 bg-emerald-500/10 px-3 py-2 text-[12px] text-emerald-300">
           ✓ Calibrated — camera poses are solved. Re-run Step 2 if you change
           the board or rig.
+        </div>
+      ) : calState === 'stale' ? (
+        <div className="mb-3 rounded-md border-2 border-amber-500 bg-amber-500/10 px-3 py-2.5">
+          <div className="text-[12px] font-bold uppercase tracking-[0.08em] text-amber-300">
+            ⚠ Calibration is from other mechanics
+          </div>
+          <div className="mt-1 text-[12px] text-amber-100/90">
+            It was solved on rig{' '}
+            <span className="font-mono">{calibRigId ?? 'unknown (unstamped)'}</span>,
+            this server models rig <span className="font-mono">{rigId || '?'}</span>.
+            Its mount and corrections still drive the camera poses, and scans
+            are refused until you recalibrate (Step 2) or reset it.
+          </div>
+          <div className="mt-2 flex gap-2">
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={calibrating}
+              onClick={resetCalibration}
+            >
+              Reset calibration
+            </Button>
+          </div>
         </div>
       ) : (
         <div className="mb-3 rounded-md border-2 border-amber-500 bg-amber-500/10 px-3 py-2.5">

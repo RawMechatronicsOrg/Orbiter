@@ -30,6 +30,7 @@ lengths etc. without round-tripping through the browser.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from dataclasses import dataclass
@@ -221,12 +222,28 @@ def _default_glb() -> Path:
     return _GLB_CANDIDATES[-1]
 
 
+def rig_glb_path() -> Path:
+    """The rig GLB this server uses: `ORBITER_RIG_GLB`, else the first
+    candidate that exists."""
+    return Path(os.environ.get("ORBITER_RIG_GLB") or _default_glb()).resolve()
+
+
+@lru_cache(maxsize=2)
+def rig_identity(glb_path: str | Path | None = None) -> str:
+    """Short content hash of the rig GLB — the mechanics identity a geometry
+    calibration is stamped with (`model.calib_rig_id`).
+
+    A calibration solves offsets relative to this CAD model, so one made
+    against another GLB (other mechanics, or a re-export after a CAD change)
+    no longer describes the rig the server draws and computes poses for."""
+    path = rig_glb_path() if glb_path is None else Path(glb_path).resolve()
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+
+
 @lru_cache(maxsize=2)
 def load_rig(glb_path: str | Path | None = None) -> RigModel:
     """Cached loader. Call without args to use the bundled `Orbiter.glb`."""
-    if glb_path is None:
-        glb_path = os.environ.get("ORBITER_RIG_GLB") or _default_glb()
-    path = Path(glb_path).resolve()
+    path = rig_glb_path() if glb_path is None else Path(glb_path).resolve()
     if not path.is_file():
         raise FileNotFoundError(f"rig GLB not found: {path}")
     scene = trimesh.load(str(path), force="scene")

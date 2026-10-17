@@ -52,6 +52,9 @@ export interface Commands {
    *  `preset` controls the pose count / accuracy tradeoff
    *  (fast ≈ 9 poses, normal ≈ 24, full ≈ 32). */
   calibrateGeometry(preset: 'fast' | 'normal' | 'full'): void;
+  /** Forget the geometry calibration — the rig goes back to the CAD-derived
+   *  geometry (camera intrinsics are kept). */
+  resetCalibration(): void;
   setMotionPlan(plan: Record<string, unknown>): void;
   /** Set the per-axis closed-loop top step rate (Hz) — the Machine-config
    *  speed knobs. Either or both axes; the server clamps to a safe band and
@@ -106,6 +109,7 @@ export function makeCommands(client: WsClient): Commands {
     setBoardParams: (params) => client.sendCommand('set_board_params', params),
     calibrateGeometry: (preset) =>
       client.sendCommand('calibrate_geometry', { apply: true, preset }),
+    resetCalibration: () => client.sendCommand('reset_calibration'),
     setMotionPlan: (plan) =>
       client.sendCommand('set_motion_plan', { motion_plan: plan }),
     setMoveSpeed: (azHzMax, elHzMax) => {

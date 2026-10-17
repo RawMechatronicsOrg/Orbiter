@@ -30,6 +30,7 @@ import scan_task
 from camera_stream import stream as camera_stream
 from config import settings
 from esp_proxy import esp
+from geom.rig_model import rig_identity
 from logsetup import install_loop_exception_handler, setup_logging
 from orbiter_model import PERSISTED_FIELDS, model
 from phone_sensor import phone_sensor
@@ -41,6 +42,7 @@ from ws_hub import hub
 setup_logging("server")
 # The ESP proxy polls /state ~4 Hz — silence httpx's per-request INFO line.
 logging.getLogger("httpx").setLevel(logging.WARNING)
+log = logging.getLogger("orbiter.app")
 
 
 @asynccontextmanager
@@ -49,6 +51,10 @@ async def lifespan(_app: FastAPI):
     launch the scan autosave loop. Shutdown unwinds in reverse so each
     component's teardown can still talk to its dependencies."""
     install_loop_exception_handler(asyncio.get_running_loop())
+    try:
+        model.update(rig_id=rig_identity())
+    except OSError as exc:  # no GLB: calibrations then read as stale
+        log.error("cannot identify the rig GLB: %s", exc)
     hub.start(model)
     scan_task.publish_scan_list()   # populate model.scans so the Library lists
                                     # already-saved scans on first connect

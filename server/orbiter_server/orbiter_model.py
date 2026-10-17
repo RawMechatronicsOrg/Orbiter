@@ -16,7 +16,7 @@ import asyncio
 import json
 import logging
 import os
-from dataclasses import dataclass, field, fields
+from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Callable
 
@@ -36,8 +36,9 @@ PERSISTED_FIELDS: frozenset[str] = frozenset({
     "charuco_squares_x", "charuco_squares_y",
     "charuco_square_length_mm", "charuco_marker_length_mm", "aruco_dict_id",
     # Set True once a ChArUco geometry calibration has been applied; the UI
-    # keys a "not calibrated" warning off it.
-    "calibrated", "calib_extrinsic", "calib_board_world",
+    # keys a "not calibrated" warning off it. `calib_rig_id` records which
+    # mechanics (rig GLB) it was solved on.
+    "calibrated", "calib_extrinsic", "calib_board_world", "calib_rig_id",
     # One-shot first-boot encoder zeroing (see encoder_init.py).
     "encoder_zero_initialized",
     # EL-axis correction (tilt + transverse offset) from the hand-eye refine.
@@ -54,6 +55,18 @@ PERSISTED_FIELDS: frozenset[str] = frozenset({
     "move_hz_max_az", "move_hz_max_el",
     "show_axes", "scan_preview", "hide_back_facing", "mirror_photo_on_frustum",
 })
+
+
+# What a geometry calibration writes (calibration.apply_result) and so what
+# `reset_calibration` puts back to the defaults. `arm_radius_mm = 0` means
+# "use the CAD arm" (scene_graph.effective_arm_radius).
+CALIBRATION_FIELDS: tuple[str, ...] = (
+    "calibrated", "calib_rig_id", "calib_extrinsic", "calib_board_world",
+    "rocker_correction", "az_encoder_correction", "el_encoder_scale",
+    "calib_test_msg",
+    "arm_radius_mm", "camera_offset_mm", "camera_tilt_deg", "camera_pan_deg",
+    "turntable_axis",
+)
 
 
 def _default_motion_plan() -> dict[str, Any]:
@@ -182,6 +195,11 @@ class ModelState:
     # calibration.apply_result). Persisted so the UI can show a "not
     # calibrated" warning on a fresh rig that has never been solved.
     calibrated: bool = False
+    # `rig_id` (see below) of the mechanics the calibration was solved on.
+    # None for a calibration that predates the stamp. When it differs from
+    # the running `rig_id` the solve describes other mechanics — see
+    # `calibration_status`.
+    calib_rig_id: str | None = None
     # Calibration internals persisted for the post-calibration "Test accuracy"
     # check: the hand-eye X (camera↔arm) and the board-in-world reference pose
     # Z_ref, each as {"rvec": [...], "t": [...]}. None until a calibration runs.
@@ -217,6 +235,10 @@ class ModelState:
     # (platform_spin in scene_graph). A miscalibrated AZ zero rotates the
     # whole accumulated cloud by a constant.
     az_kinematic_offset_deg: float = 0.0
+
+    # Identity of the mechanics this server models: a hash of the rig GLB it
+    # loads (geom.rig_model.rig_identity). Set at startup; not persisted.
+    rig_id: str = ""
 
     # ── motion speed (persisted) ───────────────────────────────────────────
     # Per-axis closed-loop top step rate (Hz) sent to the firmware with every
@@ -316,6 +338,31 @@ class ModelState:
             if key in PERSISTED_FIELDS:
                 setattr(state, key, value)
         return state
+
+    # ── geometry calibration ───────────────────────────────────────────────
+
+    def calibration_status(self) -> str:
+        """`none` (never calibrated), `current` (solved on the mechanics this
+        server models) or `stale` (solved on other mechanics, or before
+        calibrations were stamped). The UI derives the same from the fields."""
+        if not self.calibrated:
+            return "none"
+        if self.calib_rig_id and self.calib_rig_id == self.rig_id:
+            return "current"
+        return "stale"
+
+    def reset_calibration(self) -> None:
+        """Drop the geometry calibration and everything it solved, back to the
+        defaults: the rig is then drawn from the CAD model alone. Camera
+        intrinsics are left alone — they belong to the camera, not to the
+        mechanics."""
+        defaults = {f.name: f for f in fields(self)}
+
+        def default(name: str) -> Any:
+            f = defaults[name]
+            return f.default_factory() if f.default_factory is not MISSING else f.default
+
+        self.update(**{name: default(name) for name in CALIBRATION_FIELDS})
 
     # ── mutation + change notification ─────────────────────────────────────
 

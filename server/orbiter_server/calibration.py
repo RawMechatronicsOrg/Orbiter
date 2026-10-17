@@ -1732,8 +1732,9 @@ def apply_result(result: CalibrationResult) -> None:
         camera_pan_deg=0.0,
         camera_tilt_deg=0.0,
         # Flips the UI's "not calibrated" warning off — a calibration has now
-        # been applied.
+        # been applied — and records which mechanics it describes.
         calibrated=True,
+        calib_rig_id=model.rig_id,
     )
     if result.intrinsics_from_photos and result.camera_fx is not None:
         model.update(

@@ -17,8 +17,33 @@ import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
 import { useViewerStore } from './modelStore';
 import type { Commands } from './commands';
+import { calibrationStatus } from './ui';
 
 type ModelLike = Record<string, unknown>;
+
+/** Compact readout of a solved value: numbers to 4 places, `{rvec, t}`
+ *  transforms as two vectors, absent values as a dash. */
+function fmtSolved(v: unknown): string {
+  if (v == null) return '—';
+  if (typeof v === 'number') return v.toFixed(4);
+  if (Array.isArray(v)) return `[${v.map((x) => fmtSolved(x)).join(', ')}]`;
+  if (typeof v === 'object') {
+    const o = v as Record<string, unknown>;
+    if ('rvec' in o || 't' in o) {
+      return `rvec ${fmtSolved(o.rvec)} · t ${fmtSolved(o.t)}`;
+    }
+  }
+  return String(v);
+}
+
+function ReadRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-baseline gap-2 text-[12px]">
+      <span className="w-44 shrink-0 font-mono text-inkdim">{label}</span>
+      <span className="break-all font-mono text-[11px] text-zinc-200">{value}</span>
+    </div>
+  );
+}
 
 function Field({
   label,
@@ -138,6 +163,49 @@ export function GeometryStateModal({
         </div>
 
         <div className="space-y-3 p-4">
+          {/* ── geometry calibration (read-only solver output) ── */}
+          <Section
+            title="Geometry calibration"
+            hint={
+              {
+                none: 'not calibrated',
+                current: 'solved on this rig',
+                stale: 'solved on other mechanics',
+              }[calibrationStatus(model)]
+            }
+          >
+            <ReadRow label="calibrated" value={String(model.calibrated === true)} />
+            <ReadRow label="calib_rig_id" value={fmtSolved(model.calib_rig_id)} />
+            <ReadRow label="rig_id (this server)" value={fmtSolved(model.rig_id)} />
+            <ReadRow label="calib_extrinsic" value={fmtSolved(model.calib_extrinsic)} />
+            <ReadRow label="calib_board_world" value={fmtSolved(model.calib_board_world)} />
+            <ReadRow label="rocker_correction" value={fmtSolved(model.rocker_correction)} />
+            <ReadRow label="el_encoder_scale" value={fmtSolved(model.el_encoder_scale)} />
+            <ReadRow
+              label="az_encoder_correction"
+              value={fmtSolved(model.az_encoder_correction)}
+            />
+            <div className="pt-1">
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={model.calibrated !== true}
+                onClick={() => {
+                  if (
+                    window.confirm(
+                      'Reset the geometry calibration? The rig falls back to the ' +
+                        'CAD model; camera intrinsics are kept.',
+                    )
+                  ) {
+                    commands.resetCalibration();
+                  }
+                }}
+              >
+                Reset calibration
+              </Button>
+            </div>
+          </Section>
+
           {/* ── manual rig geometry ── */}
           <Section title="Manual rig geometry">
             <Field

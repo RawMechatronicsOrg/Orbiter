@@ -1,0 +1,82 @@
+"""A geometry calibration is stamped with the mechanics it was solved on.
+
+The persisted state outlives a change of mechanics (v1 to v2): the stamp is
+what lets the server and the UI tell a current calibration from one that
+describes another rig, and `reset_calibration` is the way back to the CAD.
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+import commands
+import scan_task
+from config import settings
+from geom.rig_model import rig_identity
+from orbiter_model import CALIBRATION_FIELDS, ModelState, model
+
+
+@pytest.fixture(autouse=True)
+def _tmp_storage(tmp_path, monkeypatch):
+    """Model updates persist; keep them out of the checkout."""
+    monkeypatch.setattr(settings, "storage_dir", tmp_path)
+
+
+def _calibrated(state: ModelState, rig: str | None) -> None:
+    state.update(
+        calibrated=True, calib_rig_id=rig, arm_radius_mm=292.2,
+        camera_offset_mm=41.0, turntable_axis=(3.0, 0.0),
+        calib_extrinsic={"rvec": [0.1, 0.0, 0.0], "t": [1.0, 2.0, 3.0]},
+        calib_board_world={"rvec": [0.0, 0.0, 0.0], "t": [0.0, 0.0, 0.0]},
+        rocker_correction={"rvec": [0.01, 0.0, 0.0], "t": [0.0, 0.0, 0.0]},
+        el_encoder_scale=1.02, az_encoder_correction=[0.1, 0.2],
+        calib_test_msg="dR 0.1 deg", camera_fx=1234.0,
+    )
+
+
+def test_rig_identity_is_a_content_hash(tmp_path) -> None:
+    a = tmp_path / "a.glb"
+    b = tmp_path / "b.glb"
+    a.write_bytes(b"glTF one")
+    b.write_bytes(b"glTF two")
+    assert len(rig_identity(a)) == 12
+    assert rig_identity(a) == rig_identity(str(a))
+    assert rig_identity(a) != rig_identity(b)
+
+
+def test_status_follows_the_stamp() -> None:
+    state = ModelState(rig_id="aaaa")
+    assert state.calibration_status() == "none"
+    _calibrated(state, "aaaa")
+    assert state.calibration_status() == "current"
+    state.update(rig_id="bbbb")
+    assert state.calibration_status() == "stale"
+    # A calibration from before the stamp existed is stale too.
+    state.update(calib_rig_id=None, rig_id="aaaa")
+    assert state.calibration_status() == "stale"
+
+
+def test_reset_restores_the_defaults_but_keeps_intrinsics() -> None:
+    state = ModelState(rig_id="aaaa")
+    _calibrated(state, "zzzz")
+    state.reset_calibration()
+    fresh = ModelState()
+    for name in CALIBRATION_FIELDS:
+        assert getattr(state, name) == getattr(fresh, name), name
+    assert state.calibration_status() == "none"
+    assert state.camera_fx == 1234.0
+
+
+def test_reset_command_and_scan_guard(monkeypatch) -> None:
+    monkeypatch.setattr(model, "rig_id", "aaaa")
+    _calibrated(model, "old-mechanics")
+    try:
+        with pytest.raises(RuntimeError, match="other mechanics"):
+            asyncio.run(scan_task.start_scan())
+        asyncio.run(commands.dispatch("reset_calibration", {}))
+        assert model.calibration_status() == "none"
+        assert model.arm_radius_mm == 0.0
+    finally:
+        model.reset_calibration()

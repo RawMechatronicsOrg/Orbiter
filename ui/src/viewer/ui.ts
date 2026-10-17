@@ -6,6 +6,19 @@ export const num = (m: Record<string, unknown>, k: string, d = 0): number => {
   return typeof v === 'number' ? v : d;
 };
 
+/** Geometry-calibration state — mirrors `ModelState.calibration_status`:
+ *  `stale` = solved on other mechanics (another rig GLB) or before calibrations
+ *  were stamped with one. */
+export type CalibrationStatus = 'none' | 'current' | 'stale';
+
+export function calibrationStatus(m: Record<string, unknown>): CalibrationStatus {
+  if (m.calibrated !== true) return 'none';
+  const solvedOn = m.calib_rig_id;
+  return typeof solvedOn === 'string' && solvedOn !== '' && solvedOn === m.rig_id
+    ? 'current'
+    : 'stale';
+}
+
 /** Tailwind class strings for the recurring viewer UI pieces.
  *  Buttons live in `components/ui/button.tsx` now — keep this file to shared
  *  bar / card / field utilities. */

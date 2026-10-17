@@ -428,6 +428,17 @@ async def _cmd_calibrate_geometry(args: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+async def _cmd_reset_calibration(_args: dict[str, Any]) -> dict[str, Any]:
+    """Forget the geometry calibration (Machine config → Reset calibration):
+    the solved mount, corrections and geometry go back to their defaults, so
+    the rig is drawn and posed from the CAD model alone. The way out of a
+    calibration solved on other mechanics."""
+    if model.scan_running:
+        raise CommandError("cannot reset the calibration while a scan is running")
+    model.reset_calibration()
+    return {"calibrated": False}
+
+
 async def _cmd_set_endpoints(args: dict[str, Any]) -> dict[str, Any]:
     """Update endpoint-class settings in one go: `esp_ip`, `camera_url`,
     `esp_autodiscover`. Missing fields are left untouched.
@@ -745,6 +756,7 @@ _COMMANDS: dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]] = {
     "set_endpoints": _cmd_set_endpoints,
     "set_stereo_rig": _cmd_set_stereo_rig,
     "calibrate_geometry": _cmd_calibrate_geometry,
+    "reset_calibration": _cmd_reset_calibration,
     "test_calibration_accuracy": _cmd_test_calibration_accuracy,
 }
 

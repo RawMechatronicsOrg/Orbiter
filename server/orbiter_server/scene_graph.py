@@ -200,14 +200,14 @@ def _arm_reach_mm(rig_cad) -> float:
     return math.hypot(tip[1] - pivot[1], tip[2] - pivot[2])
 
 
-def _effective_arm_radius(model: ModelState, rig_cad) -> float:
+def effective_arm_radius(model: ModelState, rig_cad=None) -> float:
     """`model.arm_radius_mm` if positive, else the reach of the CAD arm — so a
     fresh boot shows the camera as far out as the arm's tip. The manual model
     keeps the camera in the plane of the azimuth axis, so `cam_stem` bridges
     the arm's 179 mm side offset until a calibration places it."""
     if model.arm_radius_mm > 0:
         return model.arm_radius_mm
-    return _arm_reach_mm(rig_cad)
+    return _arm_reach_mm(rig_cad if rig_cad is not None else load_rig())
 
 
 def build_scene(model: ModelState) -> list[Node]:
@@ -292,7 +292,7 @@ def build_scene(model: ModelState) -> list[Node]:
     el_with_offset = model.el + float(getattr(model, "el_kinematic_offset_deg", 0.0))
     rig = compute_rig(
         el_deg=el_with_offset,
-        arm_radius_mm=_effective_arm_radius(model, rig_cad),
+        arm_radius_mm=effective_arm_radius(model, rig_cad),
         camera_offset_mm=model.camera_offset_mm,
         # Tilt is zeroed by design — see _geom_params above.
         camera_tilt_deg=0.0,
