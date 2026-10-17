@@ -408,10 +408,9 @@ async def _cmd_calibrate_geometry(args: dict[str, Any]) -> dict[str, Any]:
 
     if not model.encoder_zero_initialized:
         raise CommandError(
-            "encoder zero not initialized — the sweep would move to absolute "
-            "poses while the encoders may read arbitrary angles. Wait for the "
-            "first-boot auto-zero (needs ESP + phone IMU online) or zero the "
-            "encoders manually in Machine config first."
+            "the EL encoder zero is not set — the sweep moves to absolute "
+            "elevations, and an unzeroed encoder reads an arbitrary angle. "
+            "Level the arm and press Zero EL (Machine config → Step 0) first."
         )
     do_apply = bool(args.get("apply", True))
     preset = str(args.get("preset", "fast"))
@@ -527,23 +526,35 @@ async def _cmd_motors(args: dict[str, Any]) -> dict[str, Any]:
     return await esp.motors(bool(args["enabled"]))
 
 
-async def _cmd_calibrate_encoder(args: dict[str, Any]) -> dict[str, Any]:
-    """Set the firmware encoder zero.
+_ZERO_AXES = ("az", "el", "both")
+_ZERO_MODES = ("current", "explicit", "reset")
 
-    Tells the ESP firmware to interpret the current encoder reading (or a
-    supplied raw degree value) as zero for the named axis. The same primitive
-    the operator hits after physically aligning the rig — so it also counts
-    as the rig's first-boot zero initialization.
+
+async def _cmd_calibrate_encoder(args: dict[str, Any]) -> dict[str, Any]:
+    """Set or clear the firmware encoder zero (Machine config → Step 0).
+
+    `{axis: az|el|both, mode: current|explicit|reset}`: `current` takes the
+    present encoder reading as 0, `explicit` takes `az_raw_deg`/`el_raw_deg`,
+    `reset` drops the zero (the encoder then reads raw). Setting the EL zero
+    is what makes the rig ready for absolute moves; resetting it undoes that
+    (see encoder_init).
     """
     import encoder_init
 
+    axis = str(args.get("axis", "both"))
+    mode = str(args.get("mode", "current"))
+    if axis not in _ZERO_AXES:
+        raise CommandError(f"calibrate_encoder: axis must be one of {_ZERO_AXES}")
+    if mode not in _ZERO_MODES:
+        raise CommandError(f"calibrate_encoder: mode must be one of {_ZERO_MODES}")
     result = await esp.calibrate(
-        axis=str(args.get("axis", "both")),
-        mode=str(args.get("mode", "current")),
+        axis=axis,
+        mode=mode,
         az_raw_deg=args.get("az_raw_deg"),
         el_raw_deg=args.get("el_raw_deg"),
     )
-    encoder_init.mark_initialized("manual encoder zero")
+    if axis in ("el", "both"):
+        encoder_init.set_initialized(mode != "reset", f"EL zero {mode}")
     return result
 
 

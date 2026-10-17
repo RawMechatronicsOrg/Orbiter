@@ -31,12 +31,10 @@ export interface StereoEye {
 export interface Commands {
   move(az?: number, el?: number): void;
   motors(enabled: boolean): void;
-  /** Zero / reset stepper encoders. Despite the name this is NOT the
-   *  geometry/intrinsics calibration (that lives in Machine config →
-   *  "Calibrate from board") — it's the firmware's encoder-position
-   *  zeroing routine. Kept under the original protocol name to stay
-   *  wire-compatible with the server. */
-  calibrate(axis: Axis, mode?: string): void;
+  /** Set or clear the firmware encoder zero (`calibrate_encoder`):
+   *  `current` takes the present reading as 0, `reset` drops the zero. Not the
+   *  geometry calibration (Machine config → "Calibrate from board"). */
+  zeroEncoder(axis: Axis, mode?: 'current' | 'reset'): void;
   rebootEsp(): void;
   setGeometry(fields: Record<string, number>): void;
   /** Update the persisted ChArUco board params. Only the keys present in
@@ -102,8 +100,8 @@ export function makeCommands(client: WsClient): Commands {
       client.sendCommand('move', { az, el });
     },
     motors: (enabled) => client.sendCommand('motors', { enabled }),
-    calibrate: (axis, mode = 'current') =>
-      client.sendCommand('calibrate', { axis, mode }),
+    zeroEncoder: (axis, mode = 'current') =>
+      client.sendCommand('calibrate_encoder', { axis, mode }),
     rebootEsp: () => client.sendCommand('reboot_esp'),
     setGeometry: (fields) => client.sendCommand('set_geometry', fields),
     setBoardParams: (params) => client.sendCommand('set_board_params', params),

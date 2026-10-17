@@ -39,7 +39,7 @@ PERSISTED_FIELDS: frozenset[str] = frozenset({
     # keys a "not calibrated" warning off it. `calib_rig_id` records which
     # mechanics (rig GLB) it was solved on.
     "calibrated", "calib_extrinsic", "calib_board_world", "calib_rig_id",
-    # One-shot first-boot encoder zeroing (see encoder_init.py).
+    # Whether the EL encoder zero has been set (see encoder_init.py).
     "encoder_zero_initialized",
     # EL-axis correction (tilt + transverse offset) from the hand-eye refine.
     "rocker_correction",
@@ -221,10 +221,10 @@ class ModelState:
     el_encoder_scale: float | None = None
     # Last "Test accuracy" result — a human string for the UI (runtime only).
     calib_test_msg: str = ""
-    # True once the encoder zeros have been initialized for this rig — by the
-    # first-boot auto-zero (encoder_init.py: AZ at current position, EL from
-    # the phone IMU) or by a manual zero/align from the UI. Until then the
-    # encoders may report arbitrary angles and absolute moves are unsafe.
+    # True once the EL encoder zero has been set from the UI (Machine config →
+    # Step 0 · Zero EL), False again after it is reset (encoder_init.py).
+    # Until then the EL encoder reads an arbitrary angle and absolute moves
+    # (calibration sweep) are refused.
     encoder_zero_initialized: bool = False
     # Operator-tunable EL correction (deg) added to `model.el` in every
     # pose/kinematic calculation. Lets the operator dial out a constant EL

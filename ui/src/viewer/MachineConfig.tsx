@@ -281,9 +281,22 @@ export function MachineConfig({ commands }: { commands: Commands }) {
   const moveHzAz = useViewerStore((s) => num(s.model, 'move_hz_max_az', SPEED_KNOBS.az.def));
   const moveHzEl = useViewerStore((s) => num(s.model, 'move_hz_max_el', SPEED_KNOBS.el.def));
 
-  // Encoder-zero block: the live EL, so the operator can see what value is
-  // about to become the new zero.
+  // Step 0 · encoder zero: the live angles (what is about to become 0), the
+  // raw zero offsets the firmware holds, and whether the EL zero is set —
+  // the calibration sweep needs it (the server refuses without it).
+  const liveAz = useViewerStore((s) => num(s.model, 'az', 0));
   const liveEl = useViewerStore((s) => num(s.model, 'el', 0));
+  const encZero = useViewerStore((s) =>
+    s.model.encoder_zero && typeof s.model.encoder_zero === 'object'
+      ? (s.model.encoder_zero as Record<string, unknown>)
+      : null,
+  );
+  const zeroReady = useViewerStore((s) => s.model.encoder_zero_initialized === true);
+  const espOnline = useViewerStore((s) => s.model.esp_online === true);
+  const rawZero = (k: string) =>
+    typeof encZero?.[k] === 'number' ? `${(encZero[k] as number).toFixed(2)}°` : '—';
+  const calibrateBlocked = calibrating || !zeroReady;
+  const calibrateTitle = zeroReady ? undefined : 'Zero the EL encoder first (Step 0)';
 
   const boardSx    = useViewerStore((s) => num(s.model, 'charuco_squares_x', 8));
   const boardSy    = useViewerStore((s) => num(s.model, 'charuco_squares_y', 8));
@@ -417,17 +430,90 @@ export function MachineConfig({ commands }: { commands: Commands }) {
           <div className="mt-2">
             <Button
               size="sm"
-              disabled={calibrating}
+              disabled={calibrateBlocked}
+              title={calibrateTitle}
               onClick={() => runCalibration(calPreset)}
             >
               {calibrating ? 'Calibrating…' : `Calibrate now (${calPreset})`}
             </Button>
+            {!zeroReady && (
+              <div className="mt-1 text-[11px] text-amber-100/80">
+                Zero the EL encoder first (Step 0 below).
+              </div>
+            )}
           </div>
           {calStatus && (
             <div className="mt-2 text-[11px] text-amber-100/80">{calStatus}</div>
           )}
         </div>
       )}
+
+      {/* ── Step 0 · encoder zero — before anything moves to absolute poses ── */}
+      <Card className="my-3 border-cardline/80 bg-black/20">
+        <CardTitle className="mb-2">Step 0 · Zero encoders</CardTitle>
+        <CardContent>
+          <div className="text-[12px] text-inkdim">
+            Level the arm and press <b>Zero EL</b>: the firmware takes the
+            current elevation as 0. <b>Zero AZ</b> makes the current platform
+            heading 0°. Nothing moves; the zeros are kept in the firmware.
+          </div>
+          <div className="rounded-md border border-cardline bg-black/20 px-2.5 py-1.5 font-mono text-[12px]">
+            <div className="flex justify-between">
+              <span className="text-inkmute">az / el (now)</span>
+              <span className="text-zinc-100">
+                {liveAz.toFixed(1)}° / {liveEl.toFixed(1)}°
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-inkmute">raw zero az / el</span>
+              <span className="text-zinc-100">
+                {rawZero('az_zero_raw_deg')} / {rawZero('el_zero_raw_deg')}
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-inkmute">EL zero</span>
+              <span className={zeroReady ? 'text-emerald-300' : 'text-amber-300'}>
+                {zeroReady ? 'set' : 'not set'}
+              </span>
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <Button
+              disabled={!espOnline}
+              onClick={() => commands.zeroEncoder('el', 'current')}
+              title="Record the current elevation as 0"
+            >
+              Zero EL
+            </Button>
+            <Button
+              variant="secondary"
+              disabled={!espOnline}
+              onClick={() => commands.zeroEncoder('az', 'current')}
+              title="Record the current platform heading as 0"
+            >
+              Zero AZ
+            </Button>
+            <Button
+              variant="secondary"
+              disabled={!espOnline}
+              onClick={() => {
+                if (
+                  window.confirm(
+                    'Reset both encoder zeros? The encoders then read raw ' +
+                      'angles, and the calibration sweep is blocked until EL ' +
+                      'is zeroed again.',
+                  )
+                ) {
+                  commands.zeroEncoder('both', 'reset');
+                }
+              }}
+              title="Drop both zeros — the encoders read raw"
+            >
+              Reset
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
 
       {/* ── Step 1 · ChArUco board (the ONLY manual input) ── */}
       <Card className="my-3 border-cardline/80 bg-black/20">
@@ -515,7 +601,11 @@ export function MachineConfig({ commands }: { commands: Commands }) {
         <div className="text-[11px] text-inkmute">
           {CAL_PRESETS.find(([p]) => p === calPreset)?.[2]}
         </div>
-        <Button disabled={calibrating} onClick={() => runCalibration(calPreset)}>
+        <Button
+          disabled={calibrateBlocked}
+          title={calibrateTitle}
+          onClick={() => runCalibration(calPreset)}
+        >
           {calibrating ? 'Calibrating…' : 'Calibrate from board'}
         </Button>
         {calStatus && (
@@ -637,33 +727,6 @@ export function MachineConfig({ commands }: { commands: Commands }) {
           >
             Apply endpoints
           </Button>
-        </CardContent>
-      </Collapsible>
-
-      {/* ── encoder zero — collapsed ── */}
-      <Collapsible title="Encoder zero">
-        <CardContent>
-          <div className="text-[12px] text-inkdim">
-            Level the arm horizontally, then press <b>Zero EL</b>: the firmware
-            records the current elevation as 0. Do this once after assembly —
-            it only rewrites the encoder zero offset, nothing moves.
-          </div>
-          <div className="rounded-md border border-cardline bg-black/20 px-2.5 py-1.5 font-mono text-[12px]">
-            <div className="flex justify-between">
-              <span className="text-inkmute">rig el (now)</span>
-              <span className="text-zinc-100">{liveEl.toFixed(1)}°</span>
-            </div>
-          </div>
-          <Button
-            onClick={() => commands.calibrate('el', 'current')}
-            title="Record the current elevation as 0"
-          >
-            Zero EL
-          </Button>
-          <div className="mt-1 text-[11px] text-inkmute">
-            After pressing, rig el reads ~0°. Required before a calibration
-            sweep so the arm stays in its physical range.
-          </div>
         </CardContent>
       </Collapsible>
 

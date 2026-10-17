@@ -76,6 +76,7 @@ class EspProxy:
         self._last_pose_at = 0.0
         #: one-shot guard so the "degraded to REST poll" notice fires once.
         self._degraded_logged = False
+        self._hydrate_task: asyncio.Task[None] | None = None
 
     # ── lifecycle ───────────────────────────────────────────────────────────
 
@@ -181,6 +182,7 @@ class EspProxy:
                 ) as ws:
                     connected = True
                     backoff = 1.0
+                    self._hydrate_task = asyncio.create_task(self._hydrate())
                     if self._degraded_logged:
                         # Stream is back after a spell of REST-poll fallback.
                         self._degraded_logged = False
@@ -262,6 +264,15 @@ class EspProxy:
         data = resp.json()
         self._apply_state(data)
         return data
+
+    async def _hydrate(self) -> None:
+        """One `GET /state` each time the stream (re)connects. The encoder
+        zeros are not in the pose frames, and the /state poll stays dormant
+        while the stream is fresh — without this the UI would never see them."""
+        try:
+            await self.fetch_state()
+        except Exception as exc:  # noqa: BLE001 — the poll / next connect retries
+            log.debug("ESP /state hydrate failed: %s", exc)
 
     async def _poll_loop(self) -> None:
         """REST `/state` fallback. Dormant while the /ws/log `pose` stream is
