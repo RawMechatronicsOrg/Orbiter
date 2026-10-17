@@ -30,6 +30,9 @@ export interface StereoEye {
 
 export interface Commands {
   move(az?: number, el?: number): void;
+  /** Bump one axis by `deltaDeg` from its live reading. The server stops an
+   *  EL jog at the travel limit and refuses one starting far outside it. */
+  jog(axis: 'az' | 'el', deltaDeg: number): void;
   motors(enabled: boolean): void;
   /** Continuous rotation of one axis at a driver step rate (Hz) inside the
    *  band of `model.axes`. The server refuses an EL spin without the EL zero
@@ -113,6 +116,7 @@ export function makeCommands(client: WsClient): Commands {
       });
       client.sendCommand('move', { az, el });
     },
+    jog: (axis, deltaDeg) => client.sendCommand('jog', { axis, delta_deg: deltaDeg }),
     motors: (enabled) => client.sendCommand('motors', { enabled }),
     spin: (axis, dir, stepHz) =>
       client.sendCommand('spin', { axis, dir, step_hz: Math.round(stepHz) }),

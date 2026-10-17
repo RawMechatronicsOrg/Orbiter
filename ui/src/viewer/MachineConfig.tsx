@@ -212,13 +212,10 @@ function SpeedKnob({
   );
 }
 
-// UI-side heuristic: when *Calibrate from board* is pressed we have no
-// progress channel from server back yet, so we just keep the button
-// disabled for this long and trust the WS `model` update to refresh
-// the read-only geometry display when the solver applies its result.
-// Server logs the real outcome (success or per-view detection failures)
-// to /ws/log; check the log panel if nothing changed after this elapses.
-const CALIBRATION_TIMEOUT_MS = 60_000;
+// The server flags a running sweep (`model.calibration_running`); the local
+// flag only bridges the moment between the click and that flag arriving, and
+// gives up after this long if the command was refused (the log says why).
+const CALIBRATION_START_TIMEOUT_MS = 5_000;
 
 export function MachineConfig({ commands }: { commands: Commands }) {
   // Reactive bindings to the model so the inputs and the resolved-IP line
@@ -257,7 +254,18 @@ export function MachineConfig({ commands }: { commands: Commands }) {
     setAutoEsp(modelAutoEsp);
   }, [modelAutoEsp]);
 
-  const [calibrating, setCalibrating] = useState<boolean>(false);
+  const [calibrateClicked, setCalibrateClicked] = useState<boolean>(false);
+  const calRunning = useViewerStore((s) => s.model.calibration_running === true);
+  const calibrating = calibrateClicked || calRunning;
+  // Clear the click bridge once the server reports the run (or its end).
+  const prevCalRunning = useRef(calRunning);
+  useEffect(() => {
+    if (calRunning) setCalibrateClicked(false);
+    if (prevCalRunning.current && !calRunning) {
+      setCalStatus('Done — check the status above, the geometry and the log panel.');
+    }
+    prevCalRunning.current = calRunning;
+  }, [calRunning]);
   const [calStatus, setCalStatus] = useState<string | null>(null);
   // "Test accuracy" affordance — flips while we wait for the server to push
   // its result into model.calib_test_msg (and log to the panel).
@@ -268,11 +276,10 @@ export function MachineConfig({ commands }: { commands: Commands }) {
   // Reactive — re-renders when these model fields change (e.g. when the
   // server applies a calibration result).
   const calState = useViewerStore((s) => calibrationStatus(s.model));
-  const calibRigId = useViewerStore((s) =>
-    typeof s.model.calib_rig_id === 'string' ? s.model.calib_rig_id : null,
-  );
-  const rigId = useViewerStore((s) =>
-    typeof s.model.rig_id === 'string' ? s.model.rig_id : '',
+  const staleReason = useViewerStore((s) =>
+    typeof s.model.calibration_stale_reason === 'string'
+      ? s.model.calibration_stale_reason
+      : '',
   );
   // Result of "Test accuracy" — a human string the server writes after it
   // captures a photo, detects the board, and compares optical vs encoder pose.
@@ -368,19 +375,14 @@ export function MachineConfig({ commands }: { commands: Commands }) {
   const [calPreset, setCalPreset] = useState<CalPreset>('full');
 
   const runCalibration = (preset: CalPreset) => {
-    setCalibrating(true);
+    setCalibrateClicked(true);
     setCalStatus(
       `Sweeping poses (${preset}) and solving — this takes ~30–60 s. Keep the ` +
         'ChArUco board visible to the camera.',
     );
     commands.calibrateGeometry(preset);
-    // Heuristic: switch the buttons back after the timeout. Real outcome
-    // (success or solver error) shows in /ws/log, flips `model.calibrated`,
-    // and refreshes the geometry rows above.
-    setTimeout(() => {
-      setCalibrating(false);
-      setCalStatus('Done (check geometry above and the log panel).');
-    }, CALIBRATION_TIMEOUT_MS);
+    // A refused command never sets the server flag; release the buttons.
+    setTimeout(() => setCalibrateClicked(false), CALIBRATION_START_TIMEOUT_MS);
   };
 
   // Capture at the current pose and compare optical pose vs encoder angles.
@@ -410,14 +412,12 @@ export function MachineConfig({ commands }: { commands: Commands }) {
       ) : calState === 'stale' ? (
         <div className="mb-3 rounded-md border-2 border-amber-500 bg-amber-500/10 px-3 py-2.5">
           <div className="text-[12px] font-bold uppercase tracking-[0.08em] text-amber-300">
-            ⚠ Calibration is from other mechanics
+            ⚠ Calibration no longer matches the rig
           </div>
           <div className="mt-1 text-[12px] text-amber-100/90">
-            It was solved on rig{' '}
-            <span className="font-mono">{calibRigId ?? 'unknown (unstamped)'}</span>,
-            this server models rig <span className="font-mono">{rigId || '?'}</span>.
-            Its mount and corrections still drive the camera poses, and scans
-            are refused until you recalibrate (Step 4) or reset it.
+            It was {staleReason || 'solved on another setup'}. Its mount and
+            corrections still drive the camera poses, and scans are refused
+            until you recalibrate (Step 4) or reset it.
           </div>
           <div className="mt-2 flex gap-2">
             <Button

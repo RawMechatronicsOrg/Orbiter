@@ -86,15 +86,11 @@ export function PositionOverlay({ commands }: { commands: Commands }) {
     ? (model.phone_el_deg as number | null | undefined) ?? null
     : null;
 
-  // Degree-jog: read live pose, add a signed step, send a one-axis `move`.
-  const jogAz = (dir: 1 | -1) => {
-    commands.move(num(model, 'az') + dir * stepN(), undefined);
-  };
-  const jogEl = (dir: 1 | -1) => {
-    let target = liveEl + dir * stepN();
-    if (travel) target = Math.min(travel.max, Math.max(travel.min, target));
-    commands.move(undefined, target);
-  };
+  // Degree-jog: the server adds the signed step to the live reading, stops
+  // EL at the travel limit and refuses a jog from a reading far outside it
+  // (an unzeroed encoder) — clamping here would turn that into a long move.
+  const jogAz = (dir: 1 | -1) => commands.jog('az', dir * stepN());
+  const jogEl = (dir: 1 | -1) => commands.jog('el', dir * stepN());
 
   return (
     <div

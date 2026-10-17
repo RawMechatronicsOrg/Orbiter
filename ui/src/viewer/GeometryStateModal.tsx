@@ -167,14 +167,28 @@ export function GeometryStateModal({
             hint={
               {
                 none: 'not calibrated',
-                current: 'solved on this rig',
-                stale: 'solved on other mechanics',
+                current: 'matches this rig',
+                stale: `stale: ${String(model.calibration_stale_reason ?? '')}`,
               }[calibrationStatus(model)]
             }
           >
             <ReadRow label="calibrated" value={String(model.calibrated === true)} />
             <ReadRow label="calib_rig_id" value={fmtSolved(model.calib_rig_id)} />
             <ReadRow label="rig_id (this server)" value={fmtSolved(model.rig_id)} />
+            <ReadRow
+              label="calib_encoder_zero"
+              value={fmtSolved(
+                model.calib_encoder_zero &&
+                  Object.values(model.calib_encoder_zero as Record<string, number>),
+              )}
+            />
+            <ReadRow
+              label="encoder_zero (now)"
+              value={fmtSolved(
+                model.encoder_zero &&
+                  Object.values(model.encoder_zero as Record<string, number>),
+              )}
+            />
             <ReadRow label="calib_extrinsic" value={fmtSolved(model.calib_extrinsic)} />
             <ReadRow label="calib_board_world" value={fmtSolved(model.calib_board_world)} />
             <ReadRow label="rocker_correction" value={fmtSolved(model.rocker_correction)} />

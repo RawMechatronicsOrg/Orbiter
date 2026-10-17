@@ -72,17 +72,15 @@ export function degPerS(hz: number, a: AxisInfo): string {
   return `${v < 10 ? v.toFixed(2) : v.toFixed(1)} °/s`;
 }
 
-/** Geometry-calibration state — mirrors `ModelState.calibration_status`:
- *  `stale` = solved on other mechanics (another rig GLB) or before calibrations
- *  were stamped with one. */
+/** Geometry-calibration state, derived by the server
+ *  (`model.calibration_status`, reason in `calibration_stale_reason`):
+ *  `stale` = solved on other mechanics (another rig GLB), before calibrations
+ *  were stamped, or with other encoder zeros. */
 export type CalibrationStatus = 'none' | 'current' | 'stale';
 
 export function calibrationStatus(m: Record<string, unknown>): CalibrationStatus {
-  if (m.calibrated !== true) return 'none';
-  const solvedOn = m.calib_rig_id;
-  return typeof solvedOn === 'string' && solvedOn !== '' && solvedOn === m.rig_id
-    ? 'current'
-    : 'stale';
+  const s = m.calibration_status;
+  return s === 'current' || s === 'stale' ? s : 'none';
 }
 
 /** Tailwind class strings for the recurring viewer UI pieces.

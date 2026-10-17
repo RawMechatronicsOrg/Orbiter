@@ -19,12 +19,13 @@ binary file, so it is a route rather than a WS command.
 from __future__ import annotations
 
 import logging
+import struct
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from esp_proxy import EspError, esp
+from esp_proxy import EspBusy, EspError, esp
 from orbiter_model import model
 
 log = logging.getLogger("orbiter.routes.firmware")
@@ -36,11 +37,38 @@ _ESP_IMAGE_MAGIC = 0xE9
 #: Bigger than either OTA slot (1.875 MiB on the 4 MB layout); refuse before
 #: the upload ties up the device's HTTP server.
 _MAX_IMAGE_BYTES = 4 * 1024 * 1024
+#: esp_app_desc_t follows the image header (24 bytes) and the first segment
+#: header (8 bytes) of every ESP-IDF app image.
+_APP_DESC_OFFSET = 32
+_APP_DESC_MAGIC = 0xABCD5432
+
+
+def app_description(image: bytes) -> dict[str, str] | None:
+    """The app descriptor baked into an ESP-IDF app image (version, project,
+    build time, IDF, ELF hash), or None when there is none — a bootloader or
+    partition-table image also starts with 0xE9 but carries no descriptor."""
+    off = _APP_DESC_OFFSET
+    if len(image) < off + 176 or struct.unpack_from("<I", image, off)[0] != _APP_DESC_MAGIC:
+        return None
+
+    def text(start: int, size: int) -> str:
+        raw = image[off + start: off + start + size]
+        return raw.split(b"\0", 1)[0].decode("ascii", "replace")
+
+    return {
+        "version": text(16, 32),
+        "project": text(48, 32),
+        "built": f"{text(96, 16)} {text(80, 16)}",
+        "idf": text(112, 32),
+        "elf_sha256": image[off + 144: off + 176].hex()[:16],
+    }
 
 
 async def _proxy_get(path: str) -> dict[str, Any]:
     try:
         return await esp.get_json(path)
+    except EspBusy as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except EspError as exc:
         raise HTTPException(status_code=502, detail=f"firmware not reachable: {exc}") from exc
 
@@ -76,15 +104,18 @@ async def firmware_motor() -> dict[str, Any]:
 async def firmware_ota(request: Request) -> JSONResponse:
     """Stream a firmware image to the device. On 200 it reboots into it; the
     new image confirms itself once its HTTP server is up, else the bootloader
-    rolls back after 120 s (poll `/firmware/health` to see which)."""
-    if model.scan_running:
-        raise HTTPException(status_code=409, detail="a scan is running")
+    rolls back after 120 s (poll `/firmware/health` to see which). The
+    response adds `image`: the app descriptor of what was sent."""
+    busy = model.busy_reason()
+    if busy:
+        raise HTTPException(status_code=409, detail=busy)
     image = await request.body()
     if not image:
         raise HTTPException(status_code=400, detail="empty body — send build/orbiter.bin")
     if len(image) > _MAX_IMAGE_BYTES:
         raise HTTPException(status_code=413, detail=f"{len(image)} bytes is larger than any OTA slot")
-    if image[0] != _ESP_IMAGE_MAGIC:
+    desc = app_description(image) if image[0] == _ESP_IMAGE_MAGIC else None
+    if desc is None:
         raise HTTPException(
             status_code=400,
             detail="not an ESP32 app image — send the .bin from firmware/build/, "
@@ -95,5 +126,6 @@ async def firmware_ota(request: Request) -> JSONResponse:
         status, data = await esp.ota(image)
     except EspError as exc:
         raise HTTPException(status_code=502, detail=f"firmware not reachable: {exc}") from exc
-    log.warning("firmware update: HTTP %d %s", status, data)
-    return JSONResponse(status_code=status, content=data)
+    log.warning("firmware update (%s %s): HTTP %d %s",
+                desc["project"], desc["version"], status, data)
+    return JSONResponse(status_code=status, content={**data, "image": desc})

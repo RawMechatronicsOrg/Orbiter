@@ -48,14 +48,14 @@ def test_rig_identity_is_a_content_hash(tmp_path) -> None:
 
 def test_status_follows_the_stamp() -> None:
     state = ModelState(rig_id="aaaa")
-    assert state.calibration_status() == "none"
+    assert state.calibration_status == "none"
     _calibrated(state, "aaaa")
-    assert state.calibration_status() == "current"
+    assert state.calibration_status == "current"
     state.update(rig_id="bbbb")
-    assert state.calibration_status() == "stale"
+    assert state.calibration_status == "stale"
     # A calibration from before the stamp existed is stale too.
     state.update(calib_rig_id=None, rig_id="aaaa")
-    assert state.calibration_status() == "stale"
+    assert state.calibration_status == "stale"
 
 
 def test_reset_restores_the_defaults_but_keeps_intrinsics() -> None:
@@ -65,7 +65,7 @@ def test_reset_restores_the_defaults_but_keeps_intrinsics() -> None:
     fresh = ModelState()
     for name in CALIBRATION_FIELDS:
         assert getattr(state, name) == getattr(fresh, name), name
-    assert state.calibration_status() == "none"
+    assert state.calibration_status == "none"
     assert state.camera_fx == 1234.0
 
 
@@ -73,10 +73,32 @@ def test_reset_command_and_scan_guard(monkeypatch) -> None:
     monkeypatch.setattr(model, "rig_id", "aaaa")
     _calibrated(model, "old-mechanics")
     try:
-        with pytest.raises(RuntimeError, match="other mechanics"):
+        with pytest.raises(RuntimeError, match="no longer matches"):
             asyncio.run(scan_task.start_scan())
         asyncio.run(commands.dispatch("reset_calibration", {}))
-        assert model.calibration_status() == "none"
+        assert model.calibration_status == "none"
         assert model.arm_radius_mm == 0.0
     finally:
         model.reset_calibration()
+
+
+def test_a_re_zeroed_encoder_makes_the_calibration_stale() -> None:
+    state = ModelState(rig_id="aaaa")
+    state.update(encoder_zero={"az_zero_raw_deg": 0.0, "el_zero_raw_deg": 126.2})
+    _calibrated(state, "aaaa")
+    state.update(calib_encoder_zero=dict(state.encoder_zero))
+    assert state.calibration_status == "current"
+    state.update(encoder_zero={"az_zero_raw_deg": 0.0, "el_zero_raw_deg": 131.0})
+    assert state.calibration_status == "stale"
+    assert "EL encoder zero changed" in state.calibration_stale_reason
+    state.update(encoder_zero={"az_zero_raw_deg": 0.0, "el_zero_raw_deg": 126.2})
+    assert state.calibration_status == "current"
+
+
+def test_busy_reason_covers_scan_calibration_and_motor_calibration() -> None:
+    state = ModelState()
+    assert state.busy_reason() is None
+    state.update(calibration_running=True)
+    assert "geometry calibration" in state.busy_reason()
+    state.update(calibration_running=False, motor_cal={"active": True})
+    assert "motor calibration" in state.busy_reason()

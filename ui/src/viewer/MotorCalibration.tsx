@@ -10,8 +10,9 @@
  * such an axis, and the position controls say so.
  */
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useState } from 'react';
 import { getJson } from './api';
+import { usePoll } from './usePoll';
 import { useViewerStore } from './modelStore';
 import type { Commands } from './commands';
 import { Button } from '../components/ui/button';
@@ -51,7 +52,9 @@ const AXES = [
 
 export function MotorCalibration({ commands }: { commands: Commands }) {
   const espOnline = useViewerStore((s) => s.model.esp_online === true);
-  const scanRunning = useViewerStore((s) => s.model.scan_running === true);
+  const rigBusy = useViewerStore(
+    (s) => s.model.scan_running === true || s.model.calibration_running === true,
+  );
   // The /state summary (model.motor_cal) flips `active` even before the next
   // report arrives, so polling speeds up as soon as a run starts anywhere.
   const summaryActive = useViewerStore(
@@ -72,11 +75,7 @@ export function MotorCalibration({ commands }: { commands: Commands }) {
   }, []);
 
   const active = report?.run.active === true || summaryActive;
-  useEffect(() => {
-    void read();
-    const id = window.setInterval(read, active ? 1000 : 15_000);
-    return () => window.clearInterval(id);
-  }, [read, active]);
+  usePoll(read, active ? 1000 : 15_000);
 
   const start = (axis: 'az' | 'el') => {
     const what =
@@ -96,7 +95,7 @@ export function MotorCalibration({ commands }: { commands: Commands }) {
   };
 
   const run = report?.run;
-  const blocked = !espOnline || scanRunning || active;
+  const blocked = !espOnline || rigBusy || active;
 
   return (
     <Card className="my-3 border-cardline/80 bg-black/20">

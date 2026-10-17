@@ -397,6 +397,9 @@ async def _cmd_calibrate_geometry(args: dict[str, Any]) -> dict[str, Any]:
     """
     import calibration
 
+    busy = model.busy_reason()
+    if busy:
+        raise CommandError(f"calibrate_geometry: {busy}")
     if not model.encoder_zero_initialized:
         raise CommandError(
             "the EL encoder zero is not set — the sweep moves to absolute "
@@ -406,10 +409,13 @@ async def _cmd_calibrate_geometry(args: dict[str, Any]) -> dict[str, Any]:
     do_apply = bool(args.get("apply", True))
     preset = str(args.get("preset", "fast"))
     poses = calibration.poses_for_preset(preset)
+    model.update(calibration_running=True)
     try:
         result = await calibration.run_calibration(poses=poses)
     except RuntimeError as exc:
         raise CommandError(f"calibrate_geometry: {exc}") from exc
+    finally:
+        model.update(calibration_running=False)
     if do_apply:
         calibration.apply_result(result)
     out = calibration.result_dict(result)
@@ -423,8 +429,9 @@ async def _cmd_reset_calibration(_args: dict[str, Any]) -> dict[str, Any]:
     the solved mount, corrections and geometry go back to their defaults, so
     the rig is drawn and posed from the CAD model alone. The way out of a
     calibration solved on other mechanics."""
-    if model.scan_running:
-        raise CommandError("cannot reset the calibration while a scan is running")
+    busy = model.busy_reason()
+    if busy:
+        raise CommandError(f"reset_calibration: {busy}")
     model.reset_calibration()
     return {"calibrated": False}
 
@@ -562,26 +569,21 @@ async def _cmd_calibrate_encoder(args: dict[str, Any]) -> dict[str, Any]:
     `{axis: az|el|both, mode: current|explicit|reset}`: `current` takes the
     present encoder reading as 0, `explicit` takes `az_raw_deg`/`el_raw_deg`,
     `reset` restores the firmware's default zero. Setting the EL zero is what
-    makes the rig ready for absolute moves; resetting it undoes that (see
-    encoder_init).
+    makes the rig ready for absolute moves; resetting it undoes that — both
+    follow from the offsets the firmware answers with (encoder_init).
     """
-    import encoder_init
-
     axis = str(args.get("axis", "both"))
     mode = str(args.get("mode", "current"))
     if axis not in _ZERO_AXES:
         raise CommandError(f"calibrate_encoder: axis must be one of {_ZERO_AXES}")
     if mode not in _ZERO_MODES:
         raise CommandError(f"calibrate_encoder: mode must be one of {_ZERO_MODES}")
-    result = await esp.calibrate(
+    return await esp.calibrate(
         axis=axis,
         mode=mode,
         az_raw_deg=args.get("az_raw_deg"),
         el_raw_deg=args.get("el_raw_deg"),
     )
-    if axis in ("el", "both"):
-        encoder_init.set_initialized(mode != "reset", f"EL zero {mode}")
-    return result
 
 
 async def _cmd_spin(args: dict[str, Any]) -> dict[str, Any]:
@@ -605,8 +607,9 @@ async def _cmd_spin(args: dict[str, Any]) -> dict[str, Any]:
         raise CommandError(
             f"spin: step_hz must be {band.hz_min}..{band.hz_max} Hz for {axis.upper()}"
         )
-    if model.scan_running:
-        raise CommandError("spin: a scan is running")
+    busy = model.busy_reason()
+    if busy:
+        raise CommandError(f"spin: {busy}")
     if axis == "el":
         if not model.encoder_zero_initialized:
             raise CommandError(
@@ -619,11 +622,19 @@ async def _cmd_spin(args: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _cmd_spin_stop(args: dict[str, Any]) -> dict[str, Any]:
-    """Stop continuous rotation: `{axis: az|el|both}` (default both)."""
+    """Stop continuous rotation: `{axis: az|el|both}` (default both).
+
+    Only axes the firmware reports spinning are sent: its /spin/stop with
+    nothing spinning still releases the motion mutex, which a running move
+    holds."""
     axis = str(args.get("axis", "both"))
     if axis not in _ZERO_AXES:
         raise CommandError("spin_stop: axis must be 'az', 'el' or 'both'")
-    return await esp.spin_stop(axis)
+    spinning = [a for a in ("az", "el")
+                if axis in (a, "both") and getattr(model, f"spinning_{a}")]
+    if not spinning:
+        return {"status": "ok", "message": "nothing spinning"}
+    return await esp.spin_stop("both" if len(spinning) == 2 else spinning[0])
 
 
 async def _cmd_motor_calibrate(args: dict[str, Any]) -> dict[str, Any]:
@@ -641,8 +652,9 @@ async def _cmd_motor_calibrate(args: dict[str, Any]) -> dict[str, Any]:
             "motor_calibrate: EL turns full circles — remove the arm and confirm "
             "arm_removed"
         )
-    if model.scan_running:
-        raise CommandError("motor_calibrate: a scan is running")
+    busy = model.busy_reason()
+    if busy:
+        raise CommandError(f"motor_calibrate: {busy}")
     return await esp.motor_calibrate(axis, arm_removed)
 
 
@@ -811,8 +823,9 @@ async def _cmd_start_scan(args: dict[str, Any]) -> dict[str, Any]:
     UI can configure + start in a single click without a set/start race — both
     happen in this one ordered handler), then launches the discrete loop.
     """
-    if model.scan_running:
-        raise CommandError("a scan is already running")
+    busy = model.busy_reason()
+    if busy:
+        raise CommandError(f"start_scan: {busy}")
     mp = args.get("motion_plan")
     if mp is not None:
         from models import MotionPlan

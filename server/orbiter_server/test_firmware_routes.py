@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import struct
 from typing import Any
 
 import httpx
@@ -30,7 +31,24 @@ ENCODER = {
                   "magnet_weak": 0, "magnet_strong": 0,
                   "lines": {"sda": 0, "scl": 1, "external_pullups": 0}},
 }
-IMAGE = bytes([0xE9]) + b"\x00" * 1023
+
+
+def _image(desc: bool = True) -> bytes:
+    """An app image as ESP-IDF lays it out: image header (24 B), first
+    segment header (8 B), then esp_app_desc_t — or none (a bootloader)."""
+    head = bytes([0xE9]) + bytes(31)
+    if not desc:
+        return head + bytes(992)
+    app = (struct.pack("<II8x", 0xABCD5432, 0) + b"v0.3-motorcal".ljust(32, b"\0")
+           + b"orbiter".ljust(32, b"\0") + b"08:12:00".ljust(16, b"\0")
+           + b"Oct 17 2026".ljust(16, b"\0") + b"v6.0.1".ljust(32, b"\0")
+           + bytes.fromhex("ab" * 32))
+    return (head + app).ljust(1024, b"\0")
+
+
+IMAGE = _image()
+IMAGE_DESC = {"version": "v0.3-motorcal", "project": "orbiter",
+              "built": "Oct 17 2026 08:12:00", "idf": "v6.0.1", "elf_sha256": "ab" * 8}
 
 
 def axis_result(valid: bool, spd: float = 0.0) -> dict[str, Any]:
@@ -100,6 +118,9 @@ def fw(tmp_path, monkeypatch):
     monkeypatch.setattr(esp, "_http_lock", asyncio.Lock(), raising=False)
     monkeypatch.setattr(esp, "base_url", "http://esp.test")
     monkeypatch.setattr(esp, "_last_el", None)
+    monkeypatch.setattr(esp, "_el_guard_quiet_until", 0.0)
+    monkeypatch.setattr(esp, "_stop_client", lambda: httpx.AsyncClient(
+        transport=httpx.MockTransport(fake), base_url="http://esp.test"))
     yield fake
     model.update(scan_running=False, spinning_az=False, spinning_el=False,
                  encoder_zero_initialized=False, el=0.0, motor_cal=None, axes=axes_info())
@@ -123,10 +144,22 @@ def test_health_and_encoder_pass_through(client, fw) -> None:
     assert "not reachable" in r.json()["detail"]
 
 
+def test_diagnostics_give_way_to_commands(client, fw) -> None:
+    lock = esp._http_lock
+    asyncio.run(lock.acquire())   # e.g. a /move or an update holding the link
+    try:
+        r = client.get("/firmware/encoder")
+    finally:
+        lock.release()
+    assert r.status_code == 503
+    assert fw.requests == []
+
+
 def test_ota_streams_the_image_and_relays_the_answer(client, fw) -> None:
     r = client.post("/firmware/ota", content=IMAGE,
                     headers={"Content-Type": "application/octet-stream"})
-    assert (r.status_code, r.json()) == (200, {"status": "ok", "message": "updated, rebooting"})
+    assert (r.status_code, r.json()) == (
+        200, {"status": "ok", "message": "updated, rebooting", "image": IMAGE_DESC})
     assert fw.requests[-1] == ("POST", "/ota", IMAGE, "application/octet-stream")
 
     fw.ota_reply = (409, {"status": "error", "message": "axes are moving, stop them first"})
@@ -135,7 +168,8 @@ def test_ota_streams_the_image_and_relays_the_answer(client, fw) -> None:
     assert r.json()["message"].startswith("axes are moving")
 
 
-@pytest.mark.parametrize(("body", "status"), [(b"", 400), (b"\x7fELF" + b"\x00" * 64, 400)])
+@pytest.mark.parametrize(("body", "status"), [
+    (b"", 400), (b"\x7fELF" + b"\x00" * 64, 400), (_image(desc=False), 400)])
 def test_ota_refuses_what_is_not_an_app_image(client, fw, body, status) -> None:
     assert client.post("/firmware/ota", content=body).status_code == status
     assert fw.requests == []
@@ -149,9 +183,13 @@ def test_ota_refused_during_a_scan(client, fw) -> None:
 
 def test_spin_commands(fw) -> None:
     asyncio.run(commands.dispatch("spin", {"axis": "az", "dir": "ccw", "step_hz": 800}))
+    # Nothing reported spinning yet: the stop is not forwarded (the firmware's
+    # /spin/stop with nothing spinning releases the motion mutex).
+    assert asyncio.run(commands.dispatch("spin_stop", {}))["message"] == "nothing spinning"
+    model.update(spinning_az=True)
     asyncio.run(commands.dispatch("spin_stop", {}))
     assert fw.posted("/spin") == [{"axis": "az", "dir": "ccw", "step_hz": 800}]
-    assert fw.posted("/spin/stop") == [{"axis": "both"}]
+    assert fw.posted("/spin/stop") == [{"axis": "az"}]
     for bad in ({"axis": "x"}, {"axis": "az", "dir": "up"}, {"axis": "az", "step_hz": 9000},
                 {"axis": "el", "step_hz": 300}):  # EL without its zero
         with pytest.raises(commands.CommandError):
@@ -178,11 +216,25 @@ def test_pose_frames_keep_the_spin_flags_and_guard_el(fw) -> None:
     # Spinning up, away from the lower limit: no stop.
     async def spin_up() -> None:
         esp._last_el = None
+        esp._el_guard_quiet_until = 0.0
         for el in (EL_MIN + 1.0, EL_MIN + 2.0, EL_MIN + 4.0):
             esp._handle_frame(pose(el, True))
             await asyncio.sleep(0)
 
     asyncio.run(spin_up())
+    assert fw.posted("/spin/stop") == [{"axis": "el"}]
+
+
+def test_an_el_spin_without_readings_is_stopped(fw) -> None:
+    model.update(encoder_zero_initialized=True, el=10.0)
+
+    async def spin_blind() -> None:
+        await commands.dispatch("spin", {"axis": "el", "dir": "cw", "step_hz": 300})
+        await asyncio.sleep(0.9)   # no pose frames arrive
+        assert esp._el_stop_task is not None
+        await esp._el_stop_task
+
+    asyncio.run(spin_blind())
     assert fw.posted("/spin/stop") == [{"axis": "el"}]
 
 

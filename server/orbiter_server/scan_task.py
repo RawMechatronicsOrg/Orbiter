@@ -596,12 +596,15 @@ async def start_scan() -> dict[str, Any]:
     global _scan_task
     if _scan_lock.locked():
         raise RuntimeError("a scan is already running")
-    if model.calibration_status() == "stale":
+    if model.calibration_running:
+        raise RuntimeError("a geometry calibration is running")
+    if model.calibration_status == "stale":
         # Its mount transform still drives every capture pose; scanning with it
-        # would record poses for mechanics that are not on the bench.
+        # would record poses for a rig that is not on the bench.
         raise RuntimeError(
-            "the geometry calibration was solved on other mechanics — "
-            "recalibrate, or Reset calibration in Machine config, before scanning"
+            f"the geometry calibration no longer matches the rig "
+            f"({model.calibration_stale_reason}) — recalibrate, or Reset "
+            "calibration in Machine config, before scanning"
         )
 
     try:

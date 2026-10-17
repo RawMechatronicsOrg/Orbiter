@@ -54,20 +54,34 @@ _STREAM_IDLE_TIMEOUT_S = 5.0
 #: Read-only diagnostics (/health, /test/encoder) answer at once or not at all
 #: (the device is rebooting) — fail fast so a UI poll stays responsive.
 _DIAG_TIMEOUT_S = 3.0
+#: How long a diagnostic read waits for the HTTP lock before it gives up as
+#: "busy" — diagnostics must never queue up ahead of motion commands.
+_DIAG_LOCK_WAIT_S = 0.5
 #: POST /ota streams ~1-2 MB over the ESP's Wi-Fi, then the device verifies
 #: the image before it answers.
 _OTA_TIMEOUT_S = 120.0
 #: A spin is open loop and the firmware does not stop it at the EL travel
 #: limits (API.md, POST /spin), so the proxy does: an EL spin heading out of
-#: the travel is stopped this far before the limit. One pose frame (10 Hz)
-#: at the top EL step rate is about 1°.
+#: the travel is stopped this far before the limit — at least
+#: `_EL_SPIN_MARGIN_DEG`, more at speed (`_EL_SPIN_MARGIN_S` of travel).
 _EL_SPIN_MARGIN_DEG = 3.0
+_EL_SPIN_MARGIN_S = 0.4
+#: …and stopped outright when the EL reading stops changing for this long
+#: while it spins: a stalled stream, a frozen encoder read or a stalled motor
+#: all blind the limit check.
+_EL_SPIN_FROZEN_S = 0.6
+#: After a guard stop, frames still flagging the spin are ignored this long.
+_EL_GUARD_QUIET_S = 1.5
 
 LogCallback = Callable[[dict[str, Any]], None]
 
 
 class EspError(RuntimeError):
     """A firmware command was rejected or the device is unreachable."""
+
+
+class EspBusy(EspError):
+    """A diagnostic read gave way to commands holding the HTTP channel."""
 
 
 class EspProxy:
@@ -90,8 +104,14 @@ class EspProxy:
         #: one-shot guard so the "degraded to REST poll" notice fires once.
         self._degraded_logged = False
         self._hydrate_task: asyncio.Task[None] | None = None
-        #: Last EL reading and the pending guard stop (see `_guard_el_spin`).
+        #: EL spin guard state (see `_guard_el_spin`): last reading, when it
+        #: last changed, the margin for the running spin, the watchdog and
+        #: the pending stop.
         self._last_el: float | None = None
+        self._el_changed_at = 0.0
+        self._el_spin_margin_deg = _EL_SPIN_MARGIN_DEG
+        self._el_guard_quiet_until = 0.0
+        self._el_watchdog: asyncio.Task[None] | None = None
         self._el_stop_task: asyncio.Task[None] | None = None
 
     # ── lifecycle ───────────────────────────────────────────────────────────
@@ -420,27 +440,62 @@ class EspProxy:
         """Stop an EL spin that is heading out of the travel. Direction comes
         from the reading trend — which way cw/ccw turns the arm is wiring."""
         prev, self._last_el = self._last_el, el
+        if prev is None or el != prev:
+            self._el_changed_at = time.monotonic()
         if not self.model.spinning_el or prev is None:
+            return
+        margin = self._el_spin_margin_deg
+        if el < prev and el <= EL_MIN + margin:
+            self._stop_el_spin_now(f"at {el:.1f}° — {EL_MIN:+g}° travel limit ahead")
+        elif el > prev and el >= EL_MAX - margin:
+            self._stop_el_spin_now(f"at {el:.1f}° — {EL_MAX:+g}° travel limit ahead")
+
+    def _stop_el_spin_now(self, why: str) -> None:
+        if time.monotonic() < self._el_guard_quiet_until:
             return
         if self._el_stop_task is not None and not self._el_stop_task.done():
             return
-        if el < prev and el <= EL_MIN + _EL_SPIN_MARGIN_DEG:
-            limit = EL_MIN
-        elif el > prev and el >= EL_MAX - _EL_SPIN_MARGIN_DEG:
-            limit = EL_MAX
-        else:
-            return
-        msg = f"EL spin stopped at {el:.1f}° — {limit:+g}° travel limit ahead"
+        self._el_guard_quiet_until = time.monotonic() + _EL_GUARD_QUIET_S
+        msg = f"EL spin stopped {why}"
         log.warning(msg)
         self._emit_log("W", "esp", msg)
         self._el_stop_task = asyncio.get_running_loop().create_task(self._stop_el_spin())
 
     async def _stop_el_spin(self) -> None:
+        """POST /spin/stop for EL on a client of its own, so it does not
+        wait behind a request holding the shared channel; the shared, retried
+        path is the fallback."""
+        try:
+            async with self._stop_client() as c:
+                resp = await c.post("/spin/stop", json={"axis": "el"})
+            resp.raise_for_status()
+            return
+        except httpx.HTTPError as exc:
+            log.warning("EL spin guard: direct /spin/stop failed (%s) — retrying", exc)
         try:
             await self.spin_stop("el")
         except EspError as exc:
             log.error("EL spin guard: /spin/stop failed: %s", exc)
             self._emit_log("E", "esp", f"EL spin guard could not stop the axis: {exc}")
+
+    def _stop_client(self) -> httpx.AsyncClient:
+        """A one-off client for the guard's stop, outside the shared one."""
+        return httpx.AsyncClient(base_url=self.base_url, timeout=2.0)
+
+    async def _watch_el_spin(self) -> None:
+        """While EL spins, stop it when its reading freezes — the limit check
+        runs on readings, so without them the arm would spin on blind."""
+        started = time.monotonic()
+        self._el_changed_at = started
+        while True:
+            await asyncio.sleep(0.1)
+            now = time.monotonic()
+            if now - started > 1.0 and not self.model.spinning_el:
+                return  # stopped (and the flag has caught up)
+            if now - self._el_changed_at > _EL_SPIN_FROZEN_S:
+                self._stop_el_spin_now(
+                    f"— no new EL reading for {now - self._el_changed_at:.1f} s")
+                return
 
     def _emit_log(self, level: str, tag: str, msg: str) -> None:
         cb = self.on_log
@@ -560,12 +615,17 @@ class EspProxy:
         if self._client is None:
             raise EspError("ESP proxy not started")
         try:
-            async with self._http_lock:
-                resp = await self._client.get(path, timeout=_DIAG_TIMEOUT_S)
+            await asyncio.wait_for(self._http_lock.acquire(), _DIAG_LOCK_WAIT_S)
+        except asyncio.TimeoutError:
+            raise EspBusy(f"{path}: the firmware link is busy with commands") from None
+        try:
+            resp = await self._client.get(path, timeout=_DIAG_TIMEOUT_S)
             resp.raise_for_status()
             return resp.json()
         except (httpx.HTTPError, ValueError) as exc:
             raise EspError(f"{path}: {type(exc).__name__}: {exc}") from exc
+        finally:
+            self._http_lock.release()
 
     async def ota(self, image: bytes) -> tuple[int, dict[str, Any]]:
         """Stream a firmware image to `POST /ota`. Returns the firmware's
@@ -707,8 +767,17 @@ class EspProxy:
 
     async def spin(self, axis: str, direction: str, step_hz: int) -> dict[str, Any]:
         """Continuous rotation of one axis at a driver step rate (open loop).
-        An EL spin is stopped short of the travel by `_guard_el_spin`."""
-        return await self._post("/spin", {"axis": axis, "dir": direction, "step_hz": step_hz})
+        An EL spin is stopped short of the travel by `_guard_el_spin` and when
+        its reading freezes by `_watch_el_spin`."""
+        result = await self._post("/spin", {"axis": axis, "dir": direction, "step_hz": step_hz})
+        if axis == "el":
+            steps_per_deg = float(self.model.axes["el"]["steps_per_deg"])
+            self._el_spin_margin_deg = max(
+                _EL_SPIN_MARGIN_DEG, _EL_SPIN_MARGIN_S * step_hz / steps_per_deg)
+            self._el_guard_quiet_until = 0.0
+            if self._el_watchdog is None or self._el_watchdog.done():
+                self._el_watchdog = asyncio.create_task(self._watch_el_spin())
+        return result
 
     async def spin_stop(self, axis: str = "both") -> dict[str, Any]:
         return await self._post("/spin/stop", {"axis": axis})

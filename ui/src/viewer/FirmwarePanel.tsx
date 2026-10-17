@@ -11,6 +11,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { API_BASE, getJson } from './api';
+import { usePoll } from './usePoll';
 import { useViewerStore } from './modelStore';
 import type { Commands } from './commands';
 import { axisInfo, degPerS } from './ui';
@@ -98,11 +99,7 @@ export function EncoderDiagCard() {
     }
   }, []);
 
-  useEffect(() => {
-    if (!auto) return undefined;
-    const id = window.setInterval(read, 1000);
-    return () => window.clearInterval(id);
-  }, [auto, read]);
+  usePoll(read, 1000, auto);
 
   return (
     <Card>
@@ -199,13 +196,24 @@ const ROLLBACK_WINDOW_S = 120;
 /** How long to watch for the device after an update before giving up. */
 const WATCH_S = ROLLBACK_WINDOW_S + 60;
 
+/** The app descriptor of the uploaded image, as the server read it. */
+interface ImageDesc {
+  version: string;
+  project: string;
+  built: string;
+  idf: string;
+  elf_sha256: string;
+}
+
 type Update =
   | { phase: 'idle' }
   | { phase: 'uploading'; bytes: number }
   | { phase: 'watching'; since: number; seenDown: boolean }
   | { phase: 'done'; ok: boolean; text: string };
 
-async function postImage(file: File): Promise<{ ok: boolean; text: string }> {
+async function postImage(
+  file: File,
+): Promise<{ ok: boolean; text: string; image: ImageDesc | null }> {
   const r = await fetch(`${API_BASE}/firmware/ota`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/octet-stream' },
@@ -219,7 +227,8 @@ async function postImage(file: File): Promise<{ ok: boolean; text: string }> {
   }
   // Firmware replies carry {status, message}; server-side refusals {detail}.
   const text = String(body.message ?? body.detail ?? `HTTP ${r.status}`);
-  return { ok: r.ok, text: r.ok ? text : `HTTP ${r.status}: ${text}` };
+  const image = (body.image as ImageDesc | undefined) ?? null;
+  return { ok: r.ok, text: r.ok ? text : `HTTP ${r.status}: ${text}`, image };
 }
 
 export function FirmwareCard({ commands }: { commands: Commands }) {
@@ -231,6 +240,8 @@ export function FirmwareCard({ commands }: { commands: Commands }) {
   const motorCalActive = useViewerStore(
     (s) => (s.model.motor_cal as { active?: boolean } | null | undefined)?.active === true,
   );
+  const geomCalRunning = useViewerStore((s) => s.model.calibration_running === true);
+  const rigBusy = scanRunning || geomCalRunning || motorCalActive;
   const azAxis = useViewerStore((s) => axisInfo(s.model, 'az'));
   const elAxis = useViewerStore((s) => axisInfo(s.model, 'el'));
 
@@ -249,15 +260,12 @@ export function FirmwareCard({ commands }: { commands: Commands }) {
     }
   }, []);
 
-  useEffect(() => {
-    void readHealth();
-    const id = window.setInterval(readHealth, 10_000);
-    return () => window.clearInterval(id);
-  }, [readHealth]);
+  usePoll(readHealth, 10_000);
 
   // ── update over Wi-Fi ──
   const [file, setFile] = useState<File | null>(null);
   const [update, setUpdate] = useState<Update>({ phase: 'idle' });
+  const [sentImage, setSentImage] = useState<ImageDesc | null>(null);
   const watchTimer = useRef<number | null>(null);
   useEffect(() => () => {
     if (watchTimer.current) window.clearTimeout(watchTimer.current);
@@ -273,12 +281,20 @@ export function FirmwareCard({ commands }: { commands: Commands }) {
         const h = await readHealth();
         if (h && typeof h.uptime_ms === 'number' && h.uptime_ms / 1000 < elapsed) {
           const bootedAfter = elapsed - h.uptime_ms / 1000;
+          // /health does not name the running image, so this is read from
+          // timing: a watchdog rollback (HTTP never came up) takes the full
+          // window; a crash during start-up rolls back within seconds and
+          // cannot be told apart from a good boot here.
           setUpdate(
             bootedAfter < ROLLBACK_WINDOW_S / 2
               ? {
                   phase: 'done',
                   ok: true,
-                  text: `Back up ${bootedAfter.toFixed(0)} s after the upload — the new image is running and confirmed itself.`,
+                  text:
+                    `Back up ${bootedAfter.toFixed(0)} s after the upload. That is the new ` +
+                    'image unless it crashed while starting and the bootloader went back ' +
+                    "to the previous one — /health cannot tell; the firmware log's " +
+                    '"OTA image confirmed" can.',
                 }
               : {
                   phase: 'done',
@@ -317,6 +333,7 @@ export function FirmwareCard({ commands }: { commands: Commands }) {
     setUpdate({ phase: 'uploading', bytes: file.size });
     try {
       const res = await postImage(file);
+      setSentImage(res.image);
       if (!res.ok) {
         setUpdate({ phase: 'done', ok: false, text: res.text });
         return;
@@ -338,8 +355,7 @@ export function FirmwareCard({ commands }: { commands: Commands }) {
   const band = spinAxis === 'az' ? azAxis : elAxis;
   const hz = band ? Math.min(band.hz_max, Math.max(band.hz_min, spinHz[spinAxis])) : spinHz[spinAxis];
   const spinning = spinAxis === 'az' ? spinningAz : spinningEl;
-  const spinBlocked =
-    !espOnline || scanRunning || updating || motorCalActive || (spinAxis === 'el' && !elZeroSet);
+  const spinBlocked = !espOnline || rigBusy || updating || (spinAxis === 'el' && !elZeroSet);
 
   return (
     <Card>
@@ -404,7 +420,7 @@ export function FirmwareCard({ commands }: { commands: Commands }) {
         />
         <Button
           size="sm"
-          disabled={!file || !espOnline || scanRunning || updating || motorCalActive}
+          disabled={!file || !espOnline || rigBusy || updating}
           onClick={() => void upload()}
           title="Send firmware/build/orbiter.bin to POST /ota"
         >
@@ -421,6 +437,12 @@ export function FirmwareCard({ commands }: { commands: Commands }) {
             Written; the device is rebooting. Watching it through the{' '}
             {ROLLBACK_WINDOW_S} s rollback window
             {update.seenDown ? ' (offline now)' : ''}…
+          </div>
+        )}
+        {sentImage && update.phase !== 'idle' && (
+          <div className="font-mono text-[11px] text-inkdim">
+            sent {sentImage.project} {sentImage.version} · built {sentImage.built} ·
+            IDF {sentImage.idf} · {sentImage.elf_sha256}
           </div>
         )}
         {update.phase === 'done' && (

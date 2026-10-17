@@ -1735,6 +1735,7 @@ def apply_result(result: CalibrationResult) -> None:
         # been applied — and records which mechanics it describes.
         calibrated=True,
         calib_rig_id=model.rig_id,
+        calib_encoder_zero=dict(model.encoder_zero) or None,
     )
     if result.intrinsics_from_photos and result.camera_fx is not None:
         model.update(
