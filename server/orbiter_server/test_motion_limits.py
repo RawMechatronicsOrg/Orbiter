@@ -41,8 +41,23 @@ def test_axes_info_carries_the_travel_and_the_drive() -> None:
     assert "min_deg" not in info["az"]
     assert info["az"]["steps_per_deg_nominal"] == pytest.approx(62.2, abs=0.05)
     assert info["el"]["steps_per_deg_nominal"] == pytest.approx(88.9, abs=0.05)
-    assert AXES["az"].deg_per_s(2100) == pytest.approx(2100 / 61.1)
+    assert info["az"]["steps_per_deg"] == info["az"]["steps_per_deg_nominal"]
+    assert info["az"]["motor_calibrated"] is None  # firmware reported nothing
     assert model.axes == info
+
+
+def test_axes_follow_the_firmware_motor_calibration() -> None:
+    info = axes_info({
+        "active": False,
+        "az": {"valid": True, "steps_per_deg": 61.08, "max_speed_dps": 41.5, "dir_sign": -1},
+        "el": {"valid": False, "steps_per_deg": 0.0, "max_speed_dps": 0.0, "dir_sign": 1},
+    })
+    assert info["az"]["motor_calibrated"] is True
+    assert info["az"]["steps_per_deg"] == 61.08
+    assert info["az"]["max_speed_dps"] == 41.5
+    assert info["el"]["motor_calibrated"] is False
+    assert info["el"]["steps_per_deg"] == AXES["el"].steps_per_deg_nominal
+    assert info["el"]["max_speed_dps"] is None
 
 
 def test_speed_knobs_clamp_to_the_published_band() -> None:

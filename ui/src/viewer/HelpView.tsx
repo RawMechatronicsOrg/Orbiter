@@ -94,20 +94,22 @@ export function HelpView() {
         <Section title="The workflow — do this in order">
           <Steps>
             <li>
-              <Tag>Motor calibration</Tag> (firmware): each axis measures its
-              steps per degree and top speed. This is being added to the
-              firmware; until then the server uses steps per degree measured on
-              the bench, and <Tag>Motion speed</Tag> shows them as °/s next to
-              each step rate.
+              <Tag>Calibrate the motors</Tag> (right bar → Machine config → Step 1):
+              the firmware measures each axis — steps per degree, which way it
+              turns, its top speed and an angle-deviation profile — turning it
+              full circle for 2–4 minutes. Take the arm off before calibrating
+              EL. Until an axis has a result its moves are refused: the
+              firmware would drive it the wrong way. <Tag>Motion speed</Tag>{' '}
+              then shows °/s from the measured steps per degree.
             </li>
             <li>
-              <Tag>Zero the encoders</Tag> (right bar → Machine config → Step 0):
+              <Tag>Zero the encoders</Tag> (right bar → Machine config → Step 2):
               level the arm and press <Tag>Zero EL</Tag>; optionally{' '}
               <Tag>Zero AZ</Tag> to name the platform heading 0°. The geometry
               calibration stays blocked until the EL zero is set.
             </li>
             <li>
-              <Tag>Calibrate geometry</Tag> (Steps 1–2): set the ChArUco board,
+              <Tag>Calibrate geometry</Tag> (Steps 3–4): set the ChArUco board,
               pick an accuracy and <Tag>Calibrate from board</Tag>. The rig
               sweeps poses, detects the board, and solves where the camera sits
               at each angle.

@@ -15,7 +15,7 @@ import { useState } from 'react';
 import { useViewerStore } from './modelStore';
 import type { Commands } from './commands';
 import { NavBall } from './NavBall';
-import { cls, elTravel, num, parseNum, travelText } from './ui';
+import { cls, elTravel, motorBlock, num, parseNum, travelText } from './ui';
 import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
 
@@ -62,14 +62,19 @@ export function PositionOverlay({ commands }: { commands: Commands }) {
   const liveEl = num(model, 'el');
   const atElMax = travel != null && liveEl >= travel.max - 0.05;
   const atElMin = travel != null && liveEl <= travel.min + 0.05;
+  // Until an axis is motor-calibrated the firmware drives it the wrong way;
+  // the server refuses such moves, so the controls do too and say why.
+  const azBlock = motorBlock(model, 'az');
+  const elBlock = motorBlock(model, 'el');
   const moveAz = parseNum(az);
   const moveEl = parseNum(el);
   const moveError =
-    moveAz == null || moveEl == null
+    azBlock ?? elBlock ??
+    (moveAz == null || moveEl == null
       ? 'enter az and el in degrees'
       : travel && (moveEl < travel.min || moveEl > travel.max)
         ? `el outside ${travelText(travel)}`
-        : null;
+        : null);
   const motorsOn = model.motors_on === true;
   const targetAz = model.move_target_az as number | null | undefined;
   const targetEl = model.move_target_el as number | null | undefined;
@@ -155,14 +160,15 @@ export function PositionOverlay({ commands }: { commands: Commands }) {
                         rounded-xl border border-cardline bg-black/20 p-2">
           <div />
           <Button variant="secondary" size="icon" onClick={() => jogEl(+1)}
-                  disabled={atElMax}
-                  title={atElMax ? 'EL at its upper limit' : `+${stepN()}° EL`}>
+                  disabled={atElMax || elBlock != null}
+                  title={elBlock ?? (atElMax ? 'EL at its upper limit' : `+${stepN()}° EL`)}>
             ▲
           </Button>
           <div />
 
           <Button variant="secondary" size="icon" onClick={() => jogAz(-1)}
-                  title={`−${stepN()}° AZ`}>
+                  disabled={azBlock != null}
+                  title={azBlock ?? `−${stepN()}° AZ`}>
             ◀
           </Button>
           <Input
@@ -173,14 +179,15 @@ export function PositionOverlay({ commands }: { commands: Commands }) {
             title="degrees per jog"
           />
           <Button variant="secondary" size="icon" onClick={() => jogAz(+1)}
-                  title={`+${stepN()}° AZ`}>
+                  disabled={azBlock != null}
+                  title={azBlock ?? `+${stepN()}° AZ`}>
             ▶
           </Button>
 
           <div />
           <Button variant="secondary" size="icon" onClick={() => jogEl(-1)}
-                  disabled={atElMin}
-                  title={atElMin ? 'EL at its lower limit' : `−${stepN()}° EL`}>
+                  disabled={atElMin || elBlock != null}
+                  title={elBlock ?? (atElMin ? 'EL at its lower limit' : `−${stepN()}° EL`)}>
             ▼
           </Button>
           <div />
@@ -205,6 +212,9 @@ export function PositionOverlay({ commands }: { commands: Commands }) {
           </div>
           {travel && (
             <div className="text-[10px] text-inkmute">EL {travelText(travel)}</div>
+          )}
+          {(azBlock ?? elBlock) && (
+            <div className="text-[10px] text-amber-300">{azBlock ?? elBlock}</div>
           )}
           <Button
             size="sm"

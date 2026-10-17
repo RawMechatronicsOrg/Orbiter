@@ -226,7 +226,7 @@ class ModelState:
     # Last "Test accuracy" result — a human string for the UI (runtime only).
     calib_test_msg: str = ""
     # True once the EL encoder zero has been set from the UI (Machine config →
-    # Step 0 · Zero EL), False again after it is reset (encoder_init.py).
+    # Step 2 · Zero EL), False again after it is reset (encoder_init.py).
     # Until then the EL encoder reads an arbitrary angle and absolute moves
     # (calibration sweep) are refused.
     encoder_zero_initialized: bool = False
@@ -244,8 +244,14 @@ class ModelState:
     # loads (geom.rig_model.rig_identity). Set at startup; not persisted.
     rig_id: str = ""
 
+    # The firmware's motor self-calibration summary (GET /state → motor_cal):
+    # {active, az: {valid, steps_per_deg, max_speed_dps, dir_sign}, el: ...}.
+    # None while the firmware has not reported one (older builds). A move on
+    # an axis without a valid result is refused (esp_proxy.move).
+    motor_cal: dict[str, Any] | None = None
     # Per-axis drive facts + EL travel for the UI (drive.axes_info): steps
-    # per degree for the °/s readouts, the speed-knob band, the EL limits.
+    # per degree for the °/s readouts (from motor_cal when measured), the
+    # speed-knob band, the EL limits.
     axes: dict[str, Any] = field(default_factory=axes_info)
 
     # ── motion speed (persisted) ───────────────────────────────────────────

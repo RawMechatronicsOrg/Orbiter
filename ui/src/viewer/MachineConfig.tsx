@@ -5,11 +5,13 @@
  *    the mechanics this server models (`calib_rig_id === rig_id`), amber when
  *    it comes from other mechanics (with *Reset calibration*), and an amber
  *    "not calibrated" warning when there is none.
- *  - **Step 0 · Zero encoders** — the firmware's encoder zero offsets. The EL
+ *  - **Step 1 · Motor calibration** — the firmware measures each axis (steps
+ *    per degree, direction, top speed); moves wait for it (MotorCalibration).
+ *  - **Step 2 · Zero encoders** — the firmware's encoder zero offsets. The EL
  *    zero gates the calibration sweep (`encoder_zero_initialized`).
- *  - **Step 1 · Board** — the ChArUco params (squares, lengths, ArUco dict),
+ *  - **Step 3 · Board** — the ChArUco params (squares, lengths, ArUco dict),
  *    the only geometry input entered by hand; pushed with *Apply board*.
- *  - **Step 2 · Calibration** — a sweep of poses captures a photo at each,
+ *  - **Step 4 · Calibration** — a sweep of poses captures a photo at each,
  *    detects the board, runs `cv2.calibrateHandEye` and applies the derived
  *    geometry. Presets (fast / normal / full) trade time for accuracy.
  *  - **Motion speed** — per-axis top step rate (Hz) with the output °/s,
@@ -28,6 +30,7 @@ import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
 import { Card, CardContent, CardTitle } from '../components/ui/card';
 import { GeometryStateModal } from './GeometryStateModal';
+import { MotorCalibration } from './MotorCalibration';
 
 type CalPreset = 'fast' | 'normal' | 'full';
 
@@ -63,7 +66,7 @@ const SubLabel = ({ children }: { children: string }) => (
 
 /** Progressive-disclosure section: a clickable header that reveals its body.
  *  Secondary panels (derived geometry, connections, advanced) start collapsed
- *  so a new operator sees the primary Step 1 → Step 2 flow first. */
+ *  so a new operator sees the primary Step 1 → Step 4 flow first. */
 function Collapsible({
   title,
   children,
@@ -182,7 +185,7 @@ function SpeedKnob({
         <span
           className="font-mono text-[13px] text-ink"
           title={
-            `${axis.steps_per_deg} µsteps/° (${axis.steps_per_deg_source}); ` +
+            `${axis.steps_per_deg.toFixed(2)} µsteps/° (${axis.steps_per_deg_source}); ` +
             `nominal ${axis.steps_per_deg_nominal.toFixed(1)}`
           }
         >
@@ -198,6 +201,12 @@ function SpeedKnob({
         onChange={(e) => onSlide(Number(e.target.value))}
         className="w-full cursor-pointer accent-accent"
       />
+      {axis.max_speed_dps != null && draft / axis.steps_per_deg > axis.max_speed_dps && (
+        <div className="text-[11px] text-amber-300">
+          Above the measured top speed ({axis.max_speed_dps.toFixed(1)} °/s) — the
+          motor may stall.
+        </div>
+      )}
       <div className="text-[11px] text-inkmute">{hint}</div>
     </div>
   );
@@ -284,7 +293,7 @@ export function MachineConfig({ commands }: { commands: Commands }) {
   const moveHzAz = useViewerStore((s) => num(s.model, 'move_hz_max_az', 0));
   const moveHzEl = useViewerStore((s) => num(s.model, 'move_hz_max_el', 0));
 
-  // Step 0 · encoder zero: the live angles (what is about to become 0), the
+  // Step 2 · encoder zero: the live angles (what is about to become 0), the
   // raw zero offsets the firmware holds, and whether the EL zero is set —
   // the calibration sweep needs it (the server refuses without it).
   const liveAz = useViewerStore((s) => num(s.model, 'az', 0));
@@ -299,7 +308,7 @@ export function MachineConfig({ commands }: { commands: Commands }) {
   const rawZero = (k: string) =>
     typeof encZero?.[k] === 'number' ? `${(encZero[k] as number).toFixed(2)}°` : '—';
   const calibrateBlocked = calibrating || !zeroReady;
-  const calibrateTitle = zeroReady ? undefined : 'Zero the EL encoder first (Step 0)';
+  const calibrateTitle = zeroReady ? undefined : 'Zero the EL encoder first (Step 2)';
 
   const boardSx    = useViewerStore((s) => num(s.model, 'charuco_squares_x', 8));
   const boardSy    = useViewerStore((s) => num(s.model, 'charuco_squares_y', 8));
@@ -395,7 +404,7 @@ export function MachineConfig({ commands }: { commands: Commands }) {
       {/* ── Status — the first thing you see ── */}
       {calState === 'current' ? (
         <div className="mb-3 rounded-md border border-emerald-500/50 bg-emerald-500/10 px-3 py-2 text-[12px] text-emerald-300">
-          ✓ Calibrated — camera poses are solved. Re-run Step 2 if you change
+          ✓ Calibrated — camera poses are solved. Re-run Step 4 if you change
           the board or rig.
         </div>
       ) : calState === 'stale' ? (
@@ -408,7 +417,7 @@ export function MachineConfig({ commands }: { commands: Commands }) {
             <span className="font-mono">{calibRigId ?? 'unknown (unstamped)'}</span>,
             this server models rig <span className="font-mono">{rigId || '?'}</span>.
             Its mount and corrections still drive the camera poses, and scans
-            are refused until you recalibrate (Step 2) or reset it.
+            are refused until you recalibrate (Step 4) or reset it.
           </div>
           <div className="mt-2 flex gap-2">
             <Button
@@ -428,7 +437,7 @@ export function MachineConfig({ commands }: { commands: Commands }) {
           </div>
           <div className="mt-1 text-[12px] text-amber-100/90">
             The rig can't compute accurate camera poses yet. Set the board
-            (Step 1), then pick an accuracy and Calibrate (Step 2):
+            (Step 3), then pick an accuracy and Calibrate (Step 4):
           </div>
           <div className="mt-2">
             <Button
@@ -441,7 +450,7 @@ export function MachineConfig({ commands }: { commands: Commands }) {
             </Button>
             {!zeroReady && (
               <div className="mt-1 text-[11px] text-amber-100/80">
-                Zero the EL encoder first (Step 0 below).
+                Zero the EL encoder first (Step 2 below).
               </div>
             )}
           </div>
@@ -451,9 +460,11 @@ export function MachineConfig({ commands }: { commands: Commands }) {
         </div>
       )}
 
-      {/* ── Step 0 · encoder zero — before anything moves to absolute poses ── */}
+      <MotorCalibration commands={commands} />
+
+      {/* ── Step 2 · encoder zero — before anything moves to absolute poses ── */}
       <Card className="my-3 border-cardline/80 bg-black/20">
-        <CardTitle className="mb-2">Step 0 · Zero encoders</CardTitle>
+        <CardTitle className="mb-2">Step 2 · Zero encoders</CardTitle>
         <CardContent>
           <div className="text-[12px] text-inkdim">
             Level the arm and press <b>Zero EL</b>: the firmware takes the
@@ -518,9 +529,9 @@ export function MachineConfig({ commands }: { commands: Commands }) {
         </CardContent>
       </Card>
 
-      {/* ── Step 1 · ChArUco board (the ONLY manual input) ── */}
+      {/* ── Step 3 · ChArUco board (the ONLY manual input) ── */}
       <Card className="my-3 border-cardline/80 bg-black/20">
-        <CardTitle className="mb-2">Step 1 · ChArUco board</CardTitle>
+        <CardTitle className="mb-2">Step 3 · ChArUco board</CardTitle>
         <CardContent>
           {/* Currently ACTIVE board — straight from the model (what the solver
               actually uses), distinct from the editable drafts below. */}
@@ -576,8 +587,8 @@ export function MachineConfig({ commands }: { commands: Commands }) {
         </CardContent>
       </Card>
 
-      {/* ── Step 2 · calibration ── */}
-      <SubLabel>Step 2 · Calibration</SubLabel>
+      {/* ── Step 4 · calibration ── */}
+      <SubLabel>Step 4 · Calibration</SubLabel>
       <CardContent>
         {/* Accuracy step — denser sweep = slower but more accurate. */}
         <div className="text-[11px] uppercase tracking-[0.1em] text-inkdim">
@@ -661,7 +672,7 @@ export function MachineConfig({ commands }: { commands: Commands }) {
         </CardContent>
       </Collapsible>
 
-      {/* ── derived geometry — collapsed (read-only result of Step 2) ── */}
+      {/* ── derived geometry — collapsed (read-only result of Step 4) ── */}
       <Collapsible title="Geometry (derived)">
         <CardContent>
           <ReadOnlyRow
@@ -672,7 +683,7 @@ export function MachineConfig({ commands }: { commands: Commands }) {
           <ReadOnlyRow label="camera tilt"   value={`${camTilt.toFixed(2)}°`} />
           <ReadOnlyRow label="camera pan"    value={`${camPan.toFixed(2)}°`} />
           <div className="mt-2 text-[11px] text-inkmute">
-            Solved by the ChArUco hand-eye calibration (Step 2); until then
+            Solved by the ChArUco hand-eye calibration (Step 4); until then
             the rig is drawn from the CAD model. Overrides: Advanced →
             Geometry state.
           </div>

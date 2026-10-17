@@ -6,6 +6,8 @@ the firmware's own read-only endpoints and stream an update image to it:
   * `GET  /firmware/health`  — firmware `GET /health` (chip, IDF, uptime, heap)
   * `GET  /firmware/encoder` — firmware `GET /test/encoder` (per-axis AS5600
     reading, magnet status, idle levels of the I2C lines)
+  * `GET  /firmware/motor`   — firmware `GET /motor/calibration` (the motor
+    self-calibration run in flight and each axis' stored result)
   * `POST /firmware/ota`     — body = the raw app image (`build/orbiter.bin`),
     streamed to firmware `POST /ota`; its status code and message come back
     unchanged.
@@ -52,11 +54,22 @@ async def firmware_health() -> dict[str, Any]:
 
 @router.get("/encoder")
 async def firmware_encoder() -> dict[str, Any]:
-    """Per-axis encoder diagnostics: `{azimuth, elevation}`, each
-    `{ok, raw, angle_deg}` or `{ok: false, magnet_missing, magnet_weak,
-    magnet_strong}`, always with `lines: {sda, scl, external_pullups}` —
+    """Per-axis encoder diagnostics: `{azimuth, elevation}`, each `{ok, raw,
+    angle_deg, magnet_missing, magnet_weak, magnet_strong, agc, magnitude}`
+    (the reading only when `ok`) and `lines: {sda, scl, external_pullups}` —
     1 high, 0 LOW, -1 unknown."""
     return await _proxy_get("/test/encoder")
+
+
+@router.get("/motor")
+async def firmware_motor() -> dict[str, Any]:
+    """The motor self-calibration: `run` {active, axis, phase, progress,
+    speed_dps, message} and per axis {valid, steps_per_deg, max_speed_dps,
+    dir_sign, compensation, profile_*...}. Mirrored into `model.motor_cal`
+    so the axes' steps/° follow it without waiting for a /state read."""
+    data = await _proxy_get("/motor/calibration")
+    esp.apply_motor_calibration(data)
+    return data
 
 
 @router.post("/ota")

@@ -1,7 +1,7 @@
 """Encoder-zero bookkeeping.
 
 The rig's encoder zeros are set **manually** from the UI (Machine config →
-Step 0 · Zero encoders): level the arm and press "Zero EL", and the firmware
+Step 2 · Zero encoders): level the arm and press "Zero EL", and the firmware
 records the current elevation as 0; "Zero AZ" does the same for the platform
 heading. The zeros live in the firmware's NVS (`POST /calibrate`).
 

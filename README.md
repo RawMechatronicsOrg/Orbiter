@@ -530,6 +530,7 @@ docker run --rm -p 8000:8000 \
 | POST   | `/stereo/upstream/format/{cam_id}` | Set a camera's size, FourCC, fps.                                    |
 | GET    | `/firmware/health`                | The firmware's `GET /health` (chip, IDF, uptime, heap), proxied.      |
 | GET    | `/firmware/encoder`               | The firmware's `GET /test/encoder`: AS5600 readings, magnet status, I2C line levels. |
+| GET    | `/firmware/motor`                 | The firmware's `GET /motor/calibration`: the motor self-calibration run and each axis' result. |
 | POST   | `/firmware/ota`                   | Body = `firmware/build/orbiter.bin`; streamed to the firmware's `POST /ota`, its status relayed. |
 | GET    | `/command`                        | The command names the server accepts.                                 |
 | POST   | `/command/{name}`                 | Run a command over HTTP — the same handlers as the WS channel; the native workbench uses it (`set_stereo_rig`, …). |

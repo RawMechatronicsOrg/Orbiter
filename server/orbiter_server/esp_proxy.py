@@ -29,6 +29,7 @@ import httpx
 import websockets
 
 from config import settings
+from drive import axes_info, axis_calibrated
 from geom.angles import EL_MAX, EL_MIN
 from orbiter_model import ModelState, model
 
@@ -257,6 +258,10 @@ class EspProxy:
                 "status": frame.get("status"),
                 "result": frame.get("result"),
             })
+            result = frame.get("result")
+            if isinstance(result, dict) and "steps_per_deg" in result:
+                # A motor calibration ended: its new result is only in /state.
+                self._hydrate_task = asyncio.create_task(self._hydrate())
 
         elif kind == "log":
             cb = self.on_log
@@ -360,6 +365,10 @@ class EspProxy:
         enc = data.get(_FW_ENCODER_ZERO_KEY)
         if isinstance(enc, dict) and enc:
             patch["encoder_zero"] = enc
+        motor_cal = data.get("motor_cal")
+        if isinstance(motor_cal, dict):
+            patch.update(self._motor_cal_patch(
+                bool(motor_cal.get("active")), motor_cal.get("az"), motor_cal.get("el")))
         runner = data.get("runner")
         if isinstance(runner, dict) and runner.get("id"):
             patch["runner"] = {
@@ -370,6 +379,42 @@ class EspProxy:
         self.model.update(**patch)
         if "el" in patch:
             self._guard_el_spin(patch["el"])
+
+    @staticmethod
+    def _motor_cal_patch(active: bool, az: Any, el: Any) -> dict[str, Any]:
+        """`motor_cal` + the `axes` derived from it, from either /state or
+        GET /motor/calibration (which carries more per axis)."""
+        def summary(axis: Any) -> dict[str, Any]:
+            axis = axis if isinstance(axis, dict) else {}
+            return {key: axis.get(key) for key in
+                    ("valid", "steps_per_deg", "max_speed_dps", "dir_sign")}
+
+        motor_cal = {"active": active, "az": summary(az), "el": summary(el)}
+        return {"motor_cal": motor_cal, "axes": axes_info(motor_cal)}
+
+    def apply_motor_calibration(self, report: dict[str, Any]) -> None:
+        """Mirror a `GET /motor/calibration` report into the model."""
+        run = report.get("run") if isinstance(report.get("run"), dict) else {}
+        self.model.update(**self._motor_cal_patch(
+            bool(run.get("active")), report.get("az"), report.get("el")))
+
+    def _check_motor_cal(self, axes: list[str]) -> None:
+        """Refuse a closed-loop move the firmware cannot drive yet. Until an
+        axis is motor-calibrated the firmware assumes a direction that the
+        bench measured wrong on both axes: the move runs away from its target
+        until it times out (on EL, toward the cross rail)."""
+        mc = self.model.motor_cal
+        if not mc:
+            return  # firmware without motor calibration: nothing to check
+        if mc.get("active"):
+            raise EspError("a motor calibration is running — wait for it or cancel it")
+        missing = [a.upper() for a in axes if not axis_calibrated(mc, a)]
+        if missing:
+            raise EspError(
+                f"{' and '.join(missing)} not motor-calibrated — a closed-loop move "
+                "would run away from its target. Calibrate the motor first "
+                "(Machine config → Step 1)."
+            )
 
     def _guard_el_spin(self, el: float) -> None:
         """Stop an EL spin that is heading out of the travel. Direction comes
@@ -574,6 +619,8 @@ class EspProxy:
         timeout_ms: int = 30_000,
     ) -> dict[str, Any]:
         """Submit a /move (202 + task_id). Does not wait — see `move_and_await`."""
+        self._check_motor_cal(
+            [a for a, v in (("az", azimuth_deg), ("el", elevation_deg)) if v is not None])
         body: dict[str, Any] = {"timeout_ms": timeout_ms}
         if azimuth_deg is not None:
             body["azimuth_deg"] = azimuth_deg
@@ -665,6 +712,19 @@ class EspProxy:
 
     async def spin_stop(self, axis: str = "both") -> dict[str, Any]:
         return await self._post("/spin/stop", {"axis": axis})
+
+    async def motor_calibrate(self, axis: str, arm_removed: bool) -> dict[str, Any]:
+        """Start the firmware's motor self-calibration of one axis (202 +
+        task_id; ~2-4 min, progress on GET /motor/calibration). Every phase
+        turns the axis full circle."""
+        return await self._post("/motor/calibrate", {"axis": axis, "arm_removed": arm_removed})
+
+    async def motor_calibrate_cancel(self) -> dict[str, Any]:
+        return await self._post("/motor/calibrate/cancel", {})
+
+    async def motor_compensation(self, axis: str, enabled: bool) -> dict[str, Any]:
+        """Apply (or not) the axis' measured angle-deviation profile."""
+        return await self._post("/motor/compensation", {"axis": axis, "enabled": enabled})
 
     async def reboot(self) -> dict[str, Any]:
         """Ask the firmware to restart. The device acks 200 then reboots

@@ -401,7 +401,7 @@ async def _cmd_calibrate_geometry(args: dict[str, Any]) -> dict[str, Any]:
         raise CommandError(
             "the EL encoder zero is not set — the sweep moves to absolute "
             "elevations, and an unzeroed encoder reads an arbitrary angle. "
-            "Level the arm and press Zero EL (Machine config → Step 0) first."
+            "Level the arm and press Zero EL (Machine config → Step 2) first."
         )
     do_apply = bool(args.get("apply", True))
     preset = str(args.get("preset", "fast"))
@@ -536,7 +536,7 @@ async def _cmd_jog(args: dict[str, Any]) -> dict[str, Any]:
         if not is_el_valid(model.el):
             raise CommandError(
                 f"jog: EL reads {model.el:.1f}°, outside the travel {_EL_TRAVEL} — "
-                "zero the EL encoder (Machine config → Step 0)"
+                "zero the EL encoder (Machine config → Step 2)"
             )
         target = clamp_el(target)
         if abs(target - model.el) < 0.05:
@@ -557,7 +557,7 @@ _ZERO_MODES = ("current", "explicit", "reset")
 
 
 async def _cmd_calibrate_encoder(args: dict[str, Any]) -> dict[str, Any]:
-    """Set or reset the firmware encoder zero (Machine config → Step 0).
+    """Set or reset the firmware encoder zero (Machine config → Step 2).
 
     `{axis: az|el|both, mode: current|explicit|reset}`: `current` takes the
     present encoder reading as 0, `explicit` takes `az_raw_deg`/`el_raw_deg`,
@@ -610,7 +610,7 @@ async def _cmd_spin(args: dict[str, Any]) -> dict[str, Any]:
     if axis == "el":
         if not model.encoder_zero_initialized:
             raise CommandError(
-                "spin: zero the EL encoder first (Machine config → Step 0) — the "
+                "spin: zero the EL encoder first (Machine config → Step 2) — the "
                 "travel guard reads it"
             )
         if not is_el_valid(model.el):
@@ -624,6 +624,42 @@ async def _cmd_spin_stop(args: dict[str, Any]) -> dict[str, Any]:
     if axis not in _ZERO_AXES:
         raise CommandError("spin_stop: axis must be 'az', 'el' or 'both'")
     return await esp.spin_stop(axis)
+
+
+async def _cmd_motor_calibrate(args: dict[str, Any]) -> dict[str, Any]:
+    """Run the firmware's motor self-calibration on one axis (Machine config →
+    Step 1): `{axis: az|el, arm_removed: bool}`. It measures steps per degree,
+    direction and top speed, turning the axis full circle in every phase — so
+    EL only with the arm removed. Returns the firmware's 202 at once; the run
+    takes minutes and reports on GET /firmware/motor."""
+    axis = str(args.get("axis", ""))
+    if axis not in AXES:
+        raise CommandError("motor_calibrate: axis must be 'az' or 'el'")
+    arm_removed = args.get("arm_removed") is True
+    if axis == "el" and not arm_removed:
+        raise CommandError(
+            "motor_calibrate: EL turns full circles — remove the arm and confirm "
+            "arm_removed"
+        )
+    if model.scan_running:
+        raise CommandError("motor_calibrate: a scan is running")
+    return await esp.motor_calibrate(axis, arm_removed)
+
+
+async def _cmd_motor_calibrate_cancel(_args: dict[str, Any]) -> dict[str, Any]:
+    """Stop a motor calibration in flight; the previous result stays."""
+    return await esp.motor_calibrate_cancel()
+
+
+async def _cmd_motor_compensation(args: dict[str, Any]) -> dict[str, Any]:
+    """`{axis: az|el, enabled: bool}` — apply the axis' measured
+    angle-deviation profile or not."""
+    axis = str(args.get("axis", ""))
+    if axis not in AXES:
+        raise CommandError("motor_compensation: axis must be 'az' or 'el'")
+    if not isinstance(args.get("enabled"), bool):
+        raise CommandError("motor_compensation: enabled must be true or false")
+    return await esp.motor_compensation(axis, args["enabled"])
 
 
 async def _cmd_reboot_firmware(_args: dict[str, Any]) -> dict[str, Any]:
@@ -815,6 +851,9 @@ _COMMANDS: dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]] = {
     "motors": _cmd_motors,
     "spin": _cmd_spin,
     "spin_stop": _cmd_spin_stop,
+    "motor_calibrate": _cmd_motor_calibrate,
+    "motor_calibrate_cancel": _cmd_motor_calibrate_cancel,
+    "motor_compensation": _cmd_motor_compensation,
     "calibrate_encoder": _cmd_calibrate_encoder,
     "reboot_firmware": _cmd_reboot_firmware,
     # scan-loop / capture

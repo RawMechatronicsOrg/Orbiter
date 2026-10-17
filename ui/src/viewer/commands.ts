@@ -36,6 +36,12 @@ export interface Commands {
    *  and stops one heading out of the travel. */
   spin(axis: 'az' | 'el', dir: 'cw' | 'ccw', stepHz: number): void;
   spinStop(axis: Axis): void;
+  /** Firmware motor self-calibration of one axis (Machine config → Step 1).
+   *  EL turns full circles, so the server refuses it without `armRemoved`. */
+  motorCalibrate(axis: 'az' | 'el', armRemoved: boolean): void;
+  motorCalibrateCancel(): void;
+  /** Apply (or not) the axis' measured angle-deviation profile. */
+  motorCompensation(axis: 'az' | 'el', enabled: boolean): void;
   /** Set or reset the firmware encoder zero (`calibrate_encoder`):
    *  `current` takes the present reading as 0, `reset` restores the
    *  firmware's default zero. Not the geometry calibration (Machine config →
@@ -111,6 +117,11 @@ export function makeCommands(client: WsClient): Commands {
     spin: (axis, dir, stepHz) =>
       client.sendCommand('spin', { axis, dir, step_hz: Math.round(stepHz) }),
     spinStop: (axis) => client.sendCommand('spin_stop', { axis }),
+    motorCalibrate: (axis, armRemoved) =>
+      client.sendCommand('motor_calibrate', { axis, arm_removed: armRemoved }),
+    motorCalibrateCancel: () => client.sendCommand('motor_calibrate_cancel'),
+    motorCompensation: (axis, enabled) =>
+      client.sendCommand('motor_compensation', { axis, enabled }),
     zeroEncoder: (axis, mode = 'current') =>
       client.sendCommand('calibrate_encoder', { axis, mode }),
     rebootFirmware: () => client.sendCommand('reboot_firmware'),

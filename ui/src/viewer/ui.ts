@@ -7,17 +7,33 @@ export const num = (m: Record<string, unknown>, k: string, d = 0): number => {
 };
 
 /** Per-axis drive facts the server publishes as `model.axes` (drive.py):
- *  steps per degree for °/s readouts, the speed-knob band (Hz), and for EL
+ *  steps per degree for °/s readouts (measured by the firmware's motor
+ *  calibration when the axis has one), the speed-knob band (Hz), and for EL
  *  the travel limits. */
 export interface AxisInfo {
   steps_per_deg: number;
   steps_per_deg_nominal: number;
   steps_per_deg_source: string;
+  /** null = the firmware reports no motor calibration at all. */
+  motor_calibrated: boolean | null;
+  /** Measured top speed (°/s), when motor-calibrated. */
+  max_speed_dps: number | null;
   hz_min: number;
   hz_max: number;
   hz_default: number;
   min_deg?: number;
   max_deg?: number;
+}
+
+/** Why closed-loop moves on `axis` are refused right now (the server's
+ *  esp_proxy.move rule), or null when they are allowed. */
+export function motorBlock(m: Record<string, unknown>, axis: 'az' | 'el'): string | null {
+  if ((m.motor_cal as { active?: boolean } | null | undefined)?.active === true) {
+    return 'a motor calibration is running';
+  }
+  return axisInfo(m, axis)?.motor_calibrated === false
+    ? `${axis.toUpperCase()} is not motor-calibrated (Machine config → Step 1)`
+    : null;
 }
 
 /** `model.axes[axis]`, or null before the server has sent it. */

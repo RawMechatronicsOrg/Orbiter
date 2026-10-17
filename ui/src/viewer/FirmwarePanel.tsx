@@ -72,6 +72,8 @@ function diagnose(a: EncoderAxis): string[] {
     out.push('No external pull-ups: the sensor board has no supply.');
   }
   if (a.magnet_missing) out.push('No magnet detected.');
+  // AGC runs 0..128 at 3V3, ~64 at a good gap; pinned at the top = too far.
+  else if (a.agc != null && a.agc >= 120) out.push('AGC at its ceiling — the magnet is too far.');
   if (a.magnet_weak) out.push('Magnet too weak — too far from the chip.');
   if (a.magnet_strong) out.push('Magnet too strong — too close to the chip.');
   if (!a.ok && out.length === 0) out.push('The chip does not answer on its bus.');
@@ -226,6 +228,9 @@ export function FirmwareCard({ commands }: { commands: Commands }) {
   const spinningAz = useViewerStore((s) => s.model.spinning_az === true);
   const spinningEl = useViewerStore((s) => s.model.spinning_el === true);
   const elZeroSet = useViewerStore((s) => s.model.encoder_zero_initialized === true);
+  const motorCalActive = useViewerStore(
+    (s) => (s.model.motor_cal as { active?: boolean } | null | undefined)?.active === true,
+  );
   const azAxis = useViewerStore((s) => axisInfo(s.model, 'az'));
   const elAxis = useViewerStore((s) => axisInfo(s.model, 'el'));
 
@@ -333,7 +338,8 @@ export function FirmwareCard({ commands }: { commands: Commands }) {
   const band = spinAxis === 'az' ? azAxis : elAxis;
   const hz = band ? Math.min(band.hz_max, Math.max(band.hz_min, spinHz[spinAxis])) : spinHz[spinAxis];
   const spinning = spinAxis === 'az' ? spinningAz : spinningEl;
-  const spinBlocked = !espOnline || scanRunning || updating || (spinAxis === 'el' && !elZeroSet);
+  const spinBlocked =
+    !espOnline || scanRunning || updating || motorCalActive || (spinAxis === 'el' && !elZeroSet);
 
   return (
     <Card>
@@ -398,7 +404,7 @@ export function FirmwareCard({ commands }: { commands: Commands }) {
         />
         <Button
           size="sm"
-          disabled={!file || !espOnline || scanRunning || updating}
+          disabled={!file || !espOnline || scanRunning || updating || motorCalActive}
           onClick={() => void upload()}
           title="Send firmware/build/orbiter.bin to POST /ota"
         >
@@ -480,7 +486,7 @@ export function FirmwareCard({ commands }: { commands: Commands }) {
             size="sm"
             variant="success"
             disabled={spinBlocked || spinning}
-            title={spinAxis === 'el' && !elZeroSet ? 'Zero the EL encoder first (Step 0)' : undefined}
+            title={spinAxis === 'el' && !elZeroSet ? 'Zero the EL encoder first (Step 2)' : undefined}
             onClick={() => commands.spin(spinAxis, spinDir, hz)}
           >
             ▶ Spin {spinAxis.toUpperCase()}

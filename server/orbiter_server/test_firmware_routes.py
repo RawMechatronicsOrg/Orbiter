@@ -14,7 +14,8 @@ from fastapi.testclient import TestClient
 
 import commands
 from config import settings
-from esp_proxy import esp
+from drive import axes_info
+from esp_proxy import EspError, esp
 from geom.angles import EL_MIN
 from orbiter_model import model
 from routes import firmware
@@ -30,6 +31,26 @@ ENCODER = {
                   "lines": {"sda": 0, "scl": 1, "external_pullups": 0}},
 }
 IMAGE = bytes([0xE9]) + b"\x00" * 1023
+
+
+def axis_result(valid: bool, spd: float = 0.0) -> dict[str, Any]:
+    return {"valid": valid, "steps_per_deg": spd, "max_speed_dps": 40.0 if valid else 0.0,
+            "dir_sign": -1, "compensation": True, "has_profile": valid,
+            "profile_peak_deg": 0.4, "profile_rms_deg": 0.2, "profile_deg": [0.0] * 72}
+
+
+MOTOR = {"run": {"active": False, "axis": "az", "phase": "done", "progress": 1.0,
+                 "speed_dps": 0.0, "message": "done"},
+         "az": axis_result(True, 61.08), "el": axis_result(False)}
+STATE = {"state": "idle", "motors_enabled": True, "spinning_az": False, "spinning_el": False,
+         "azimuth": {"angle_deg": 1.0}, "elevation": {"angle_deg": 2.0},
+         "calibration": {"az_zero_raw_deg": 0.0, "el_zero_raw_deg": 138.296},
+         "runner": {"id": 7, "kind": "motor_cal", "status": "done", "result": {}},
+         "motor_cal": {"active": False,
+                       "az": {"valid": True, "steps_per_deg": 61.2, "max_speed_dps": 40.0,
+                              "dir_sign": -1},
+                       "el": {"valid": True, "steps_per_deg": 90.0, "max_speed_dps": 6.0,
+                              "dir_sign": 1}}}
 
 
 class FakeFirmware:
@@ -51,6 +72,14 @@ class FakeFirmware:
             return httpx.Response(200, json=HEALTH)
         if route == ("GET", "/test/encoder"):
             return httpx.Response(200, json=ENCODER)
+        if route == ("GET", "/motor/calibration"):
+            return httpx.Response(200, json=MOTOR)
+        if route == ("GET", "/state"):
+            return httpx.Response(200, json=STATE)
+        if route in (("POST", "/move"), ("POST", "/motor/calibrate")):
+            return httpx.Response(202, json={"status": "accepted", "task_id": 8})
+        if route in (("POST", "/motor/calibrate/cancel"), ("POST", "/motor/compensation")):
+            return httpx.Response(200, json={"status": "ok"})
         if route == ("POST", "/ota"):
             status, data = self.ota_reply
             return httpx.Response(status, json=data)
@@ -73,7 +102,7 @@ def fw(tmp_path, monkeypatch):
     monkeypatch.setattr(esp, "_last_el", None)
     yield fake
     model.update(scan_running=False, spinning_az=False, spinning_el=False,
-                 encoder_zero_initialized=False, el=0.0)
+                 encoder_zero_initialized=False, el=0.0, motor_cal=None, axes=axes_info())
 
 
 @pytest.fixture
@@ -155,3 +184,55 @@ def test_pose_frames_keep_the_spin_flags_and_guard_el(fw) -> None:
 
     asyncio.run(spin_up())
     assert fw.posted("/spin/stop") == [{"axis": "el"}]
+
+
+def test_motor_report_drives_the_axes(client) -> None:
+    r = client.get("/firmware/motor")
+    assert r.status_code == 200
+    assert r.json()["run"]["phase"] == "done"
+    assert model.motor_cal["az"]["valid"] is True
+    assert model.axes["az"]["steps_per_deg"] == 61.08
+    assert model.axes["az"]["motor_calibrated"] is True
+    assert model.axes["el"]["motor_calibrated"] is False
+
+
+def test_a_motor_calibration_task_frame_refreshes_from_state(fw) -> None:
+    async def finish() -> None:
+        esp._handle_frame(json.dumps({"kind": "task", "task_id": 7, "status": "done",
+                                      "result": {"axis": "el", "phase": "done",
+                                                 "steps_per_deg": 90.0}}))
+        await esp._hydrate_task
+
+    asyncio.run(finish())
+    assert model.axes["el"]["steps_per_deg"] == 90.0
+    assert model.axes["el"]["max_speed_dps"] == 6.0
+
+
+def test_moves_wait_for_the_motor_calibration(fw) -> None:
+    async def move(**kw: float) -> None:
+        await esp.move(**kw)
+
+    asyncio.run(move(azimuth_deg=10.0))  # firmware reports no motor_cal: no check
+    esp.apply_motor_calibration(MOTOR)   # AZ calibrated, EL not
+    asyncio.run(move(azimuth_deg=20.0))
+    with pytest.raises(EspError, match="EL not motor-calibrated"):
+        asyncio.run(move(azimuth_deg=20.0, elevation_deg=5.0))
+    esp.apply_motor_calibration({**MOTOR, "run": {**MOTOR["run"], "active": True}})
+    with pytest.raises(EspError, match="running"):
+        asyncio.run(move(azimuth_deg=30.0))
+    assert [b["azimuth_deg"] for b in fw.posted("/move")] == [10.0, 20.0]
+
+
+def test_motor_calibration_commands(fw) -> None:
+    with pytest.raises(commands.CommandError, match="remove the arm"):
+        asyncio.run(commands.dispatch("motor_calibrate", {"axis": "el"}))
+    asyncio.run(commands.dispatch("motor_calibrate", {"axis": "el", "arm_removed": True}))
+    asyncio.run(commands.dispatch("motor_calibrate", {"axis": "az"}))
+    asyncio.run(commands.dispatch("motor_calibrate_cancel", {}))
+    with pytest.raises(commands.CommandError):
+        asyncio.run(commands.dispatch("motor_compensation", {"axis": "az", "enabled": "yes"}))
+    asyncio.run(commands.dispatch("motor_compensation", {"axis": "az", "enabled": False}))
+    assert fw.posted("/motor/calibrate") == [{"axis": "el", "arm_removed": True},
+                                            {"axis": "az", "arm_removed": False}]
+    assert fw.posted("/motor/compensation") == [{"axis": "az", "enabled": False}]
+    assert len(fw.posted("/motor/calibrate/cancel")) == 1

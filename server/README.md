@@ -63,6 +63,7 @@ docker run --rm -p 8000:8000 \
 | `GET`  | `/camera/stream/status` | Camera connection status. |
 | `GET`  | `/firmware/health` | The firmware's `GET /health`, proxied. |
 | `GET`  | `/firmware/encoder` | The firmware's `GET /test/encoder`, proxied. |
+| `GET`  | `/firmware/motor` | The firmware's `GET /motor/calibration` (motor self-calibration run + per-axis results), proxied and mirrored into `model.motor_cal`. |
 | `POST` | `/firmware/ota` | Body = `firmware/build/orbiter.bin`, streamed to the firmware's `POST /ota`; its status is relayed. |
 | `GET`  | `/command` | The command names the server accepts. |
 | `POST` | `/command/{name}` | Run a command over HTTP (same handlers as the WS channel). |
