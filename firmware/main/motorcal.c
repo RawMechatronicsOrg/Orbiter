@@ -8,6 +8,7 @@
 #include "freertos/task.h"
 #include "nvs.h"
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 static const char *TAG = "motorcal";
@@ -51,12 +52,17 @@ static const char *TAG = "motorcal";
  * geared-down axis gets fewer turns rather than a twenty-minute phase; ramps
  * into cruise from the rate COARSE proved the axis starts at. */
 #define REFINE_REVS           25u
-#define REFINE_MIN_REVS       5u
+/*
+ * Two, not the pendulum's five: behind a 7:1 or 10:1 belt one output turn is
+ * 22 400 / 32 000 microsteps, and the encoder's 0.088 deg over even 720 deg is
+ * 0.01% — while five turns at a geared axis's 6 deg/s cruise take five minutes.
+ */
+#define REFINE_MIN_REVS       2u
 #define REFINE_BUDGET_S       180.0f
 #define REFINE_CRUISE_FRAC    0.80f   /* of the calibrated max speed          */
 #define REFINE_START_HZ       COARSE_HZ
 #define REFINE_ACCEL_DPS2     300.0f
-#define REFINE_TIMEOUT_MS     ((int)(REFINE_BUDGET_S * 1000) + 30000)
+#define REFINE_TIMEOUT_MIN_MS ((int)(REFINE_BUDGET_S * 1000) + 30000)
 
 /* PROFILE: slow enough that every 5 deg bin collects samples at the tick rate,
  * floored so one revolution stays inside the timeout. */
@@ -155,6 +161,7 @@ static int64_t  s_rung_start_us;
 static double   s_refine_target_deg;
 static int64_t  s_refine_ramp_us;
 static uint16_t s_refine_revs;
+static int      s_refine_timeout_ms;   /* from the planned turns and cruise */
 
 /* PROFILE phase: per-bin sums of the two raw quantities (measured sweep and
  * pulses), reduced once the sweep closes — see profile_reduce. */
@@ -321,7 +328,17 @@ static void speed_finish(void)
     s_refine_revs       = (uint16_t)((affordable > REFINE_REVS) ? REFINE_REVS : affordable);
     s_refine_target_deg = 360.0 * (double)s_refine_revs;
 
-    enter_phase(MOTORCAL_REFINE, "measuring steps per degree over many turns");
+    /* The minimum turn count can outlast the budget on a slow axis, so the
+     * time limit follows the plan: its duration at cruise, x1.5, + 30 s. */
+    int planned_ms = (cruise > 0.0f)
+                   ? (int)(s_refine_target_deg / (double)cruise * 1500.0) + 30000 : 0;
+    s_refine_timeout_ms = (planned_ms > REFINE_TIMEOUT_MIN_MS) ? planned_ms : REFINE_TIMEOUT_MIN_MS;
+
+    char msg[96];
+    snprintf(msg, sizeof(msg), "max %.1f deg/s (edge %u Hz); %u turns at %.1f deg/s",
+             (double)s_run.max_speed_dps, (unsigned)s_last_good_hz,
+             (unsigned)s_refine_revs, (double)cruise);
+    enter_phase(MOTORCAL_REFINE, msg);
 }
 
 static void tick_speed(void)
@@ -423,7 +440,7 @@ static void tick_speed(void)
 
 static void tick_refine(void)
 {
-    if (phase_timed_out(REFINE_TIMEOUT_MS)) {
+    if (phase_timed_out(s_refine_timeout_ms)) {
         fail("multi-turn measurement did not finish in time");
         return;
     }
