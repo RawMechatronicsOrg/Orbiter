@@ -613,8 +613,18 @@ esp_err_t handler_ota(httpd_req_t *req)
 esp_err_t handler_test_encoder(httpd_req_t *req)
 {
     /* Sizes account for the extended AZ error JSON (magnet_* synonyms). */
-    char buf[400];
-    char az_part[180], el_part[180];
+    char buf[640];
+    char az_part[240], el_part[240];
+    char az_lines[64], el_lines[64];
+    {
+        int sda, scl, pu;
+        encoder_line_levels(ENC_AZ, &sda, &scl, &pu);
+        snprintf(az_lines, sizeof(az_lines),
+                 "\"lines\":{\"sda\":%d,\"scl\":%d,\"external_pullups\":%d}", sda, scl, pu);
+        encoder_line_levels(ENC_EL, &sda, &scl, &pu);
+        snprintf(el_lines, sizeof(el_lines),
+                 "\"lines\":{\"sda\":%d,\"scl\":%d,\"external_pullups\":%d}", sda, scl, pu);
+    }
 
     uint16_t raw; float deg;
 
@@ -622,8 +632,8 @@ esp_err_t handler_test_encoder(httpd_req_t *req)
     if (encoder_read_raw(ENC_AZ, &raw) == ESP_OK) {
         deg = (float)raw * (360.0f / 4096.0f);
         snprintf(az_part, sizeof(az_part),
-                 "\"azimuth\":{\"ok\":true,\"raw\":%u,\"angle_deg\":%.3f}",
-                 raw, (double)deg);
+                 "\"azimuth\":{\"ok\":true,\"raw\":%u,\"angle_deg\":%.3f,%s}",
+                 raw, (double)deg, az_lines);
         ESP_LOGI(TAG, "encoder AZ: raw=%u angle=%.3f", raw, (double)deg);
     } else {
         uint8_t flags = 0;
@@ -634,9 +644,9 @@ esp_err_t handler_test_encoder(httpd_req_t *req)
          * Expose synonyms alongside legacy frerr/invcmd/parity. */
         snprintf(az_part, sizeof(az_part),
                  "\"azimuth\":{\"ok\":false,\"frerr\":%d,\"invcmd\":%d,\"parity\":%d,"
-                 "\"magnet_missing\":%d,\"magnet_weak\":%d,\"magnet_strong\":%d}",
+                 "\"magnet_missing\":%d,\"magnet_weak\":%d,\"magnet_strong\":%d,%s}",
                  (flags >> 0) & 1, (flags >> 1) & 1, (flags >> 2) & 1,
-                 (flags >> 0) & 1, (flags >> 1) & 1, (flags >> 2) & 1);
+                 (flags >> 0) & 1, (flags >> 1) & 1, (flags >> 2) & 1, az_lines);
         ESP_LOGW(TAG, "encoder AZ: read failed");
     }
 
@@ -644,8 +654,8 @@ esp_err_t handler_test_encoder(httpd_req_t *req)
     if (encoder_read_raw(ENC_EL, &raw) == ESP_OK) {
         deg = (float)raw * (360.0f / 4096.0f);
         snprintf(el_part, sizeof(el_part),
-                 "\"elevation\":{\"ok\":true,\"raw\":%u,\"angle_deg\":%.3f}",
-                 raw, (double)deg);
+                 "\"elevation\":{\"ok\":true,\"raw\":%u,\"angle_deg\":%.3f,%s}",
+                 raw, (double)deg, el_lines);
         ESP_LOGI(TAG, "encoder EL: raw=%u angle=%.3f", raw, (double)deg);
     } else {
         uint8_t flags = 0;
@@ -653,9 +663,9 @@ esp_err_t handler_test_encoder(httpd_req_t *req)
         encoder_read_diag(ENC_EL);
         snprintf(el_part, sizeof(el_part),
                  "\"elevation\":{\"ok\":false,\"frerr\":%d,\"invcmd\":%d,\"parity\":%d,"
-                 "\"magnet_missing\":%d,\"magnet_weak\":%d,\"magnet_strong\":%d}",
+                 "\"magnet_missing\":%d,\"magnet_weak\":%d,\"magnet_strong\":%d,%s}",
                  (flags >> 0) & 1, (flags >> 1) & 1, (flags >> 2) & 1,
-                 (flags >> 0) & 1, (flags >> 1) & 1, (flags >> 2) & 1);
+                 (flags >> 0) & 1, (flags >> 1) & 1, (flags >> 2) & 1, el_lines);
         ESP_LOGW(TAG, "encoder EL: read failed");
     }
 

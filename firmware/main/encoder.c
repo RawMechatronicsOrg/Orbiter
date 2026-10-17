@@ -37,7 +37,10 @@ static const char *TAG = "encoder";
 #define AS5600_COUNTS   (1 << AS5600_BITS)    /* 4096 */
 #define AS5600_HALF     (AS5600_COUNTS / 2)   /* 2048 */
 
-static as5600_t s_enc[2];   /* indexed by enc_axis_t */
+static as5600_t s_enc[2] = {   /* indexed by enc_axis_t */
+    { .idle_sda = -1, .idle_scl = -1, .idle_ext_pullups = -1 },
+    { .idle_sda = -1, .idle_scl = -1, .idle_ext_pullups = -1 },
+};
 
 /*
  * Bus serialization mutex — guards every public read against concurrent access.
@@ -204,6 +207,14 @@ esp_err_t encoder_read_diag(enc_axis_t axis)
     esp_err_t ret = as5600_log_diag(axis);
     enc_io_unlock();
     return ret;
+}
+
+void encoder_line_levels(enc_axis_t axis, int *sda, int *scl, int *ext_pullups)
+{
+    const as5600_t *s = enc_for(axis);
+    if (sda)         *sda         = s ? s->idle_sda : -1;
+    if (scl)         *scl         = s ? s->idle_scl : -1;
+    if (ext_pullups) *ext_pullups = s ? s->idle_ext_pullups : -1;
 }
 
 esp_err_t encoder_read_angle(enc_axis_t axis, float *out_deg)

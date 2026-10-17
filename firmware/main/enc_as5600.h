@@ -18,6 +18,12 @@ extern "C" {
 typedef struct {
     i2c_master_bus_handle_t bus;
     i2c_master_dev_handle_t dev;
+    /* Bus lines as read just before the I2C driver took them (see
+     * as5600_init): 1 = high, 0 = LOW, -1 = not checked. ext_pullups is 1
+     * when both lines stay high without the internal pull-ups. */
+    int8_t idle_sda;
+    int8_t idle_scl;
+    int8_t idle_ext_pullups;
 } as5600_t;
 
 /** Initialise a private I2C master bus on these pins and attach the AS5600. */

@@ -2,7 +2,9 @@
 #include "sdkconfig.h"
 
 #include "driver/i2c_master.h"
+#include "driver/gpio.h"
 #include "esp_log.h"
+#include "log_bus.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "rom/ets_sys.h"
@@ -32,10 +34,71 @@ static const char *TAG = "as5600";
 #define AS5600_RETRIES        3
 #define AS5600_RETRY_GAP_US   200
 
+/*
+ * Read both lines before the I2C driver owns them, so a dead bus says why:
+ *   a line LOW with the internal pull-up on  -> shorted to GND, wired to a
+ *                                              ground or DIR pin, or held down
+ *                                              by an unpowered chip's clamp
+ *                                              diode (a sensor without VCC)
+ *   both high only while the internal pull-ups are on -> no external pull-ups
+ *                                              (sensor board without 3V3/GND)
+ * Ported from ActuatorController, where it ended an afternoon of guessing.
+ */
+static void log_idle_levels(as5600_t *s, int sda_gpio, int scl_gpio)
+{
+    s->idle_sda = s->idle_scl = s->idle_ext_pullups = -1;
+    gpio_config_t io = {
+        .pin_bit_mask = (1ULL << sda_gpio) | (1ULL << scl_gpio),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    if (gpio_config(&io) != ESP_OK) return;
+
+    ets_delay_us(200);   /* let the weak internal pull-ups win */
+    int sda_pu = gpio_get_level(sda_gpio);
+    int scl_pu = gpio_get_level(scl_gpio);
+    s->idle_sda = (int8_t)sda_pu;
+    s->idle_scl = (int8_t)scl_pu;
+
+    if (!sda_pu || !scl_pu) {
+        LOGX_EMIT_E(TAG, "SDA=%d(%s) SCL=%d(%s) — a line is held LOW. Shorted to "
+                         "GND, wired to a ground or DIR pin, or a chip on it has no VCC.",
+                    sda_gpio, sda_pu ? "high" : "LOW",
+                    scl_gpio, scl_pu ? "high" : "LOW");
+        return;
+    }
+
+    /* Both high — but by whose pull-up? */
+    io.pull_up_en = GPIO_PULLUP_DISABLE;
+    if (gpio_config(&io) != ESP_OK) return;
+    ets_delay_us(500);   /* an external pull-up wins this quickly */
+    int sda_hi_z = gpio_get_level(sda_gpio);
+    int scl_hi_z = gpio_get_level(scl_gpio);
+    s->idle_ext_pullups = (int8_t)(sda_hi_z && scl_hi_z);
+
+    /* Leave the pins as we found them for the I2C driver. */
+    io.pull_up_en = GPIO_PULLUP_ENABLE;
+    gpio_config(&io);
+
+    if (sda_hi_z && scl_hi_z) {
+        LOGX_EMIT_I(TAG, "SDA=%d SCL=%d idle high, external pull-ups present",
+                    sda_gpio, scl_gpio);
+    } else {
+        LOGX_EMIT_E(TAG, "SDA=%d SCL=%d held up ONLY by the internal ~45k pull-ups "
+                         "(hi-Z reads sda=%d scl=%d). Check 3V3/GND to the sensor "
+                         "board, or fit 2.2-4.7k pull-ups to 3V3.",
+                    sda_gpio, scl_gpio, sda_hi_z, scl_hi_z);
+    }
+}
+
 esp_err_t as5600_init(as5600_t *s, int sda_gpio, int scl_gpio)
 {
     if (!s) return ESP_ERR_INVALID_ARG;
     if (s->dev) return ESP_OK;  /* idempotent */
+
+    log_idle_levels(s, sda_gpio, scl_gpio);
 
     i2c_master_bus_config_t bus_cfg = {
         .clk_source                   = I2C_CLK_SRC_DEFAULT,

@@ -47,3 +47,11 @@ esp_err_t encoder_read_errors(enc_axis_t axis, uint8_t *out_flags);
  *   "Orbiter Configuration" → ORBITER_AS5600_I2C_TRACE
  */
 esp_err_t encoder_read_diag(enc_axis_t axis);
+
+/**
+ * The axis's I2C lines as found at boot, before the bus started:
+ * 1 = high, 0 = LOW (held down), -1 = not checked. `ext_pullups` is 1 when
+ * both lines stayed high with the internal pull-ups off. A LOW line explains
+ * an encoder that never answers.
+ */
+void encoder_line_levels(enc_axis_t axis, int *sda, int *scl, int *ext_pullups);
