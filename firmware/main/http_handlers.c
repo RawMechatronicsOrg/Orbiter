@@ -10,6 +10,8 @@
 #include "esp_idf_version.h"
 #include "esp_system.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "esp_app_format.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,6 +55,7 @@ static esp_err_t send_json(httpd_req_t *req, const char *json, int status)
             status == 202 ? "202 Accepted"        :
             status == 408 ? "408 Request Timeout" :
             status == 409 ? "409 Conflict"        :
+            status == 413 ? "413 Content Too Large" :
             status == 400 ? "400 Bad Request"     :
                             "500 Internal Server Error");
     }
@@ -466,23 +469,143 @@ static void reboot_timer_cb(void *arg)
     esp_restart();
 }
 
-esp_err_t handler_reboot(httpd_req_t *req)
+/* Restart ~500 ms from now. ESP_ERR_INVALID_STATE means one is already pending. */
+static esp_err_t schedule_reboot(void)
 {
-    LOGX_EMIT_W(TAG, "POST /reboot → firmware restart in 500 ms");
-
     static esp_timer_handle_t reboot_timer = NULL;
     if (reboot_timer == NULL) {
         const esp_timer_create_args_t args = {
             .callback = reboot_timer_cb,
             .name     = "reboot",
         };
-        if (esp_timer_create(&args, &reboot_timer) != ESP_OK)
-            return send_json(req,
-                "{\"status\":\"error\",\"message\":\"reboot timer create failed\"}", 500);
+        esp_err_t err = esp_timer_create(&args, &reboot_timer);
+        if (err != ESP_OK) return err;
     }
-    /* ESP_ERR_INVALID_STATE here just means a reboot is already pending. */
-    esp_timer_start_once(reboot_timer, 500000 /* µs = 500 ms */);
+    esp_err_t err = esp_timer_start_once(reboot_timer, 500000 /* µs = 500 ms */);
+    return err == ESP_ERR_INVALID_STATE ? ESP_OK : err;
+}
+
+esp_err_t handler_reboot(httpd_req_t *req)
+{
+    LOGX_EMIT_W(TAG, "POST /reboot → firmware restart in 500 ms");
+    if (schedule_reboot() != ESP_OK)
+        return send_json(req,
+            "{\"status\":\"error\",\"message\":\"reboot timer create failed\"}", 500);
     return send_json(req, "{\"status\":\"ok\",\"message\":\"rebooting\"}", 200);
+}
+
+/* ── POST /ota ──────────────────────────────────────────────────────────── */
+
+/*
+ * Firmware update over Wi-Fi. The request body is the raw app image
+ * (build/orbiter.bin), streamed into the inactive OTA slot:
+ *
+ *   curl --data-binary @build/orbiter.bin http://<esp-ip>/ota
+ *
+ * On success that slot becomes the boot partition and the device restarts.
+ * The new image starts in PENDING_VERIFY; app_main confirms it once the HTTP
+ * server is up, and if that does not happen in time the bootloader goes back
+ * to the previous image (see ota_confirm_* in orbiter_main.c). So a build
+ * that cannot join Wi-Fi still leaves the device reachable.
+ */
+#define OTA_CHUNK          4096
+#define OTA_MAX_TIMEOUTS   5      /* consecutive recv timeouts before giving up */
+
+static esp_err_t ota_fail(httpd_req_t *req, const char *step, esp_err_t err, int status)
+{
+    char msg[160];
+    LOGX_EMIT_E(TAG, "POST /ota failed at %s: %s", step, esp_err_to_name(err));
+    snprintf(msg, sizeof(msg),
+             "{\"status\":\"error\",\"message\":\"%s failed: %s\"}",
+             step, esp_err_to_name(err));
+    return send_json(req, msg, status);
+}
+
+/* The image must be this project: refuse e.g. the pendulum firmware by mistake. */
+static bool ota_image_is_ours(const char *head, size_t len)
+{
+    const size_t off = sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t);
+    if (len < off + sizeof(esp_app_desc_t)) return false;
+    const esp_app_desc_t *incoming = (const esp_app_desc_t *)(head + off);
+    const esp_app_desc_t *running  = esp_app_get_description();
+    return incoming->magic_word == ESP_APP_DESC_MAGIC_WORD &&
+           strncmp(incoming->project_name, running->project_name,
+                   sizeof(incoming->project_name)) == 0;
+}
+
+esp_err_t handler_ota(httpd_req_t *req)
+{
+    motion_state_t st = motion_get_state();
+    if (st == MOTION_MOVING || st == MOTION_SPINNING)
+        return send_json(req,
+            "{\"status\":\"error\",\"message\":\"axes are moving, stop them first\"}", 409);
+    if (req->content_len == 0)
+        return send_json(req,
+            "{\"status\":\"error\",\"message\":\"empty body, send build/orbiter.bin\"}", 400);
+
+    const esp_partition_t *slot = esp_ota_get_next_update_partition(NULL);
+    if (!slot)
+        return send_json(req,
+            "{\"status\":\"error\",\"message\":\"no OTA slot, flash the OTA partition table over USB once\"}", 500);
+    if (req->content_len > slot->size)
+        return send_json(req,
+            "{\"status\":\"error\",\"message\":\"image is larger than the OTA slot\"}", 413);
+
+    /* Flash writes stall non-IRAM interrupts, the step timer among them:
+     * no driver may be holding or stepping while the image is written. */
+    motion_set_motors(false);
+    LOGX_EMIT_W(TAG, "POST /ota → %u bytes into %s",
+                (unsigned)req->content_len, slot->label);
+
+    char *buf = malloc(OTA_CHUNK);
+    if (!buf) return ota_fail(req, "malloc", ESP_ERR_NO_MEM, 500);
+
+    esp_ota_handle_t ota = 0;
+    bool        begun    = false;
+    esp_err_t   err      = ESP_OK;
+    const char *step     = "receive";
+    size_t      left     = req->content_len;
+    int         timeouts = 0;
+
+    while (left > 0) {
+        int n = httpd_req_recv(req, buf, left < OTA_CHUNK ? left : OTA_CHUNK);
+        if (n == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts < OTA_MAX_TIMEOUTS) continue;
+        if (n <= 0) { err = ESP_ERR_TIMEOUT; break; }
+        timeouts = 0;
+
+        if (!begun) {
+            /* The first chunk carries the app descriptor. */
+            if (!ota_image_is_ours(buf, (size_t)n)) {
+                free(buf);
+                return send_json(req,
+                    "{\"status\":\"error\",\"message\":\"not an Orbiter firmware image\"}", 400);
+            }
+            step = "esp_ota_begin";
+            err = esp_ota_begin(slot, OTA_WITH_SEQUENTIAL_WRITES, &ota);
+            if (err != ESP_OK) break;
+            begun = true;
+        }
+        step = "esp_ota_write";
+        err = esp_ota_write(ota, buf, n);
+        if (err != ESP_OK) break;
+        left -= (size_t)n;
+    }
+    free(buf);
+
+    if (err != ESP_OK) {
+        if (begun) esp_ota_abort(ota);
+        return ota_fail(req, step, err, 500);
+    }
+    err = esp_ota_end(ota);   /* verifies the image checksum and hash */
+    if (err != ESP_OK) return ota_fail(req, "esp_ota_end", err, 400);
+    err = esp_ota_set_boot_partition(slot);
+    if (err != ESP_OK) return ota_fail(req, "esp_ota_set_boot_partition", err, 500);
+
+    LOGX_EMIT_W(TAG, "POST /ota → image OK in %s, restarting in 500 ms", slot->label);
+    if (schedule_reboot() != ESP_OK)
+        return send_json(req,
+            "{\"status\":\"ok\",\"message\":\"updated, reboot to run it\"}", 200);
+    return send_json(req, "{\"status\":\"ok\",\"message\":\"updated, rebooting\"}", 200);
 }
 
 /* ── GET /test/encoder ──────────────────────────────────────────────────── */
@@ -491,7 +614,7 @@ esp_err_t handler_test_encoder(httpd_req_t *req)
 {
     /* Sizes account for the extended AZ error JSON (magnet_* synonyms). */
     char buf[400];
-    char az_part[180], el_part[120];
+    char az_part[180], el_part[180];
 
     uint16_t raw; float deg;
 
@@ -517,9 +640,9 @@ esp_err_t handler_test_encoder(httpd_req_t *req)
         ESP_LOGW(TAG, "encoder AZ: read failed");
     }
 
-    /* ── Elevation encoder (AS5048A over SPI, CS=GPIO17, 14-bit) ── */
+    /* ── Elevation encoder (AS5600 over I2C, 12-bit) ── */
     if (encoder_read_raw(ENC_EL, &raw) == ESP_OK) {
-        deg = (float)raw * (360.0f / 16384.0f);
+        deg = (float)raw * (360.0f / 4096.0f);
         snprintf(el_part, sizeof(el_part),
                  "\"elevation\":{\"ok\":true,\"raw\":%u,\"angle_deg\":%.3f}",
                  raw, (double)deg);
@@ -529,7 +652,9 @@ esp_err_t handler_test_encoder(httpd_req_t *req)
         encoder_read_errors(ENC_EL, &flags);
         encoder_read_diag(ENC_EL);
         snprintf(el_part, sizeof(el_part),
-                 "\"elevation\":{\"ok\":false,\"frerr\":%d,\"invcmd\":%d,\"parity\":%d}",
+                 "\"elevation\":{\"ok\":false,\"frerr\":%d,\"invcmd\":%d,\"parity\":%d,"
+                 "\"magnet_missing\":%d,\"magnet_weak\":%d,\"magnet_strong\":%d}",
+                 (flags >> 0) & 1, (flags >> 1) & 1, (flags >> 2) & 1,
                  (flags >> 0) & 1, (flags >> 1) & 1, (flags >> 2) & 1);
         ESP_LOGW(TAG, "encoder EL: read failed");
     }

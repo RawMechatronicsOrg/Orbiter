@@ -1,12 +1,11 @@
-# Orbiter — quiet defaults (UART not flooded; SPI per-frame trace off).
-# SPI trace: menuconfig → Orbiter Configuration → Verbose AS5048A SPI trace
+# Orbiter — quiet defaults (UART not flooded; I2C per-frame trace off).
+# I2C trace: menuconfig → Orbiter Configuration → Verbose AS5600 I2C trace
 
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LOG_MAXIMUM_EQUALS_DEFAULT=y
 CONFIG_LOG_DEFAULT_LEVEL=3
 CONFIG_LOG_MAXIMUM_LEVEL=3
 
-# CONFIG_ORBITER_ENCODER_SPI_TRACE is not set
 # CONFIG_ORBITER_AS5600_I2C_TRACE is not set
 
 # Required for /ws/log streaming firmware events to the browser UI.
@@ -30,3 +29,11 @@ CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD=y
 # trigger ENOBUFS on the next accept(). 20 is the maximum the LWIP
 # layer is happy with on ESP32 without bigger heap pressure.
 CONFIG_LWIP_MAX_SOCKETS=20
+
+# Firmware updates over Wi-Fi (POST /ota): two OTA slots on the 4 MB flash
+# (partitions.csv). Rollback: an update that does not reach a running HTTP
+# server within OTA_CONFIRM_TIMEOUT_S (orbiter_main.c) boots the old image.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y

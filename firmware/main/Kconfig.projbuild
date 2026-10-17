@@ -1,5 +1,27 @@
 menu "Orbiter Configuration"
 
+    choice ORBITER_BOARD
+        prompt "Board wiring"
+        default ORBITER_BOARD_WIRED
+        help
+            Which stepper wiring the firmware drives. The two encoders are on
+            the same pins on both (AZ AS5600 SDA 22 / SCL 23, EL AS5600
+            SDA 4 / SCL 16).
+
+        config ORBITER_BOARD_WIRED
+            bool "Wired bench (v1 pins)"
+            help
+                A4988 carriers on jumper wires, as in docs/HARDWARE.md:
+                AZ STEP/DIR 25/26, EL STEP/DIR 27/33, shared ENABLE 32.
+
+        config ORBITER_BOARD_SIMPLE
+            bool "Orbiter-Simple carrier"
+            help
+                The Orbiter-Simple PCB: AZ STEP/DIR 26/25, EL STEP/DIR 18/19,
+                shared ENABLE 27. Its load outputs (OUT A-D on 12/2/5/17) and
+                DSLR remote (32/33) are driven low at boot.
+    endchoice
+
     config ORBITER_WIFI_SSID
         string "WiFi SSID"
         default "your-ssid"
@@ -39,18 +61,11 @@ menu "Orbiter Configuration"
             Upper limit of the elevation axis, in degrees (90 = arm vertical).
             Hard-enforced by /move.
 
-    config ORBITER_ENCODER_SPI_TRACE
-        bool "Verbose AS5048A SPI trace (UART)"
-        default n
-        help
-            Log every 16-bit SPI frame at INFO (tx/rx, MISO bytes, parity, EF).
-            Angle reads also log rsp1/rsp2 summary per attempt. Rebuild after change.
-
     config ORBITER_AS5600_I2C_TRACE
         bool "Verbose AS5600 I2C trace (UART)"
         default n
         help
-            Log every I2C register read on the AS5600 (AZ encoder) at INFO,
+            Log every I2C register read on both AS5600 encoders at INFO,
             including retry attempts and error codes. Rebuild after change.
 
 endmenu
