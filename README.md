@@ -1,4 +1,4 @@
-# Orbiter v0.3
+# Orbiter v0.4
 
 A two-axis camera turntable for taking calibrated photo sets of small objects,
 controlled over Wi-Fi from a browser. Think of it as a **bench-top hemisphere
@@ -12,6 +12,38 @@ need, throw out the rest, adapt it to whatever you have on the shelf.
 This README is the consolidated single-page reference. Per-subsystem deep
 dives live in `docs/` and in each subsystem's own `README.md`; treat those as
 authoritative when you need depth.
+
+**New in v0.4** — the v2 rig runs, end to end, on the bench
+
+- **The software follows the v2 mechanics**: the server's rig model and the
+  3D viewer load `cad/v2/assembly/Orbiter.glb` and spin its rotor nodes, the
+  elevation travel is −25…+90° (a `menuconfig` setting the firmware enforces
+  and the UI shows and respects), and the docs describe the v2 build.
+- **Firmware** reads an AS5600 on each axis (one I²C bus per sensor;
+  `/test/encoder` reports each bus's line levels and each magnet's field),
+  takes its stepper pins from a **Board wiring** choice — the jumper-wire
+  bench or the Orbiter-Simple carrier — and updates over Wi-Fi with
+  `POST /ota`, rolling back an image that does not come up
+  ([§10.1](#101-build--flash)). The elevation sign is a stored setting, and
+  `/spin` retunes a running axis, so a host can drive it by velocity.
+- **Motor self-calibration** per axis, ported from the ActuatorController
+  pendulum: microsteps per degree over 25 turns, which DIR raises the angle,
+  the highest step rate the rotor still tracks, and a 72-bin angle-deviation
+  profile that is subtracted from every reading. Closed-loop moves take their
+  direction and speed ceiling from it. On the bench it measured EL at
+  88.889 µsteps/° (10:1) and AZ at 62.78 µsteps/° — a 113:16 belt, not the
+  7:1 the drawings say.
+- **Calibration in steps in the web UI**: motor calibration, encoder zero,
+  the ChArUco board, the camera solve — each step gated on the one before,
+  and a geometry calibration stamped with the mechanics it was solved on.
+  Speeds read in °/s, plus encoder diagnostics and a firmware panel (health,
+  OTA upload, spin).
+- **The phone is a capture node**: the server shoots stills through
+  CameraStreamer — a locked manual profile, event-driven stills, the next
+  move overlapping the photo transfer — and a failed still fails the shot
+  instead of saving a placeholder.
+- **`tools/demo_motion.py`** plays motion patterns on the rig (a sinusoidal
+  speed, Lissajous figures, a helix, a swing, nods).
 
 **New in v0.3**
 
@@ -29,12 +61,8 @@ authoritative when you need depth.
 - **`cad/v2/` — the second-generation mechanics** as STL, STEP and FreeCAD
   ([`cad/v2/README.md`](cad/v2/README.md)): two near-identical rotary
   drive modules on an aluminium tube frame, 6008 bearings, taper inserts,
-  an AS5600 on both axes. The server's rig model, the 3D viewer and this
-  README follow v2 (its GLB is `cad/v2/assembly/Orbiter.glb`).
-- **Firmware** reads an AS5600 on each axis (one I²C bus per sensor), takes
-  its stepper pins from a **Board wiring** choice in `menuconfig` — the
-  jumper-wire bench or the Orbiter-Simple carrier — and updates over Wi-Fi
-  with `POST /ota` ([§10.1](#101-build--flash)).
+  an AS5600 on both axes. Design files only so far: the server, the
+  firmware and the rest of this README still describe the v1 rig.
 - The docker-compose stack starts on a fresh checkout.
 
 ## Contents

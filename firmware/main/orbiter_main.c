@@ -166,7 +166,7 @@ static void start_mdns(void)
     ESP_ERROR_CHECK(mdns_instance_name_set("Orbiter Turntable"));
 
     mdns_txt_item_t txt[] = {
-        {"version", "0.2"},
+        {"version", "0.3"},
         {"chip",    "esp32"},
     };
     const size_t txt_n = sizeof(txt) / sizeof(txt[0]);
@@ -339,7 +339,7 @@ void app_main(void)
 {
     carrier_outputs_off();
     log_bus_init();
-    ESP_LOGI(TAG, "=== Orbiter v0.2 starting ===");
+    ESP_LOGI(TAG, "=== Orbiter v0.3 starting ===");
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {

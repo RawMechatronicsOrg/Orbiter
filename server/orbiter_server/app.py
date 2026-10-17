@@ -87,7 +87,7 @@ app = FastAPI(
         "scan-session manifests, photo storage, live camera adapter, "
         "WebSocket scene graph."
     ),
-    version="0.3.0",
+    version="0.4.0",
     lifespan=lifespan,
 )
 

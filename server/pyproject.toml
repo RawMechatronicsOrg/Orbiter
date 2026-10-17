@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "orbiter-server"
-version = "0.3.0"
+version = "0.4.0"
 description = "FastAPI service for the Orbiter two-axis camera turntable."
 readme = "README.md"
 requires-python = ">=3.11"
