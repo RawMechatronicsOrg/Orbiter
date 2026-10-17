@@ -13,10 +13,13 @@ The surviving command surface drives the two-axis turntable, captures photos
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Awaitable, Callable
 
 import scan_task
+from drive import clamp_hz
 from esp_proxy import esp
+from geom.angles import EL_MAX, EL_MIN, clamp_el, is_el_valid
 from orbiter_model import model
 
 log = logging.getLogger("orbiter.cmd")
@@ -74,31 +77,19 @@ async def _cmd_set_motion_plan(args: dict[str, Any]) -> dict[str, Any]:
     return serialised
 
 
-# Per-axis closed-loop top step rate (Hz) bounds for the operator speed knobs.
-# Tighter than the firmware sanity clamp (CL_HZ_MIN..CL_HZ_OVERRIDE_MAX) and
-# matched to the UI slider ranges. AZ is the light axis (fast); EL carries the
-# whole arm, so it's capped lower to keep calibration/scan sweeps from
-# over-shooting (the reason the EL default was historically conservative).
-_MOVE_HZ_BOUNDS: dict[str, tuple[int, int]] = {
-    "az": (100, 4000),
-    "el": (50, 1000),
-}
-
-
 async def _cmd_set_move_speed(args: dict[str, Any]) -> dict[str, Any]:
     """Set the per-axis closed-loop top step rate — the Machine-config speed
     knobs. Payload (either or both key): ``{az_hz_max: int, el_hz_max: int}``
-    in Hz. Each value is clamped to its per-axis safe band and persisted on the
-    model; the next /move carries it to the firmware (see esp_proxy.move)."""
+    in Hz. Each value is clamped to its per-axis band (drive.AXES) and
+    persisted on the model; the next /move carries it to the firmware (see
+    esp_proxy.move)."""
     patch: dict[str, Any] = {}
     try:
         if "az_hz_max" in args:
-            lo, hi = _MOVE_HZ_BOUNDS["az"]
-            patch["move_hz_max_az"] = max(lo, min(hi, int(args["az_hz_max"])))
+            patch["move_hz_max_az"] = clamp_hz("az", float(args["az_hz_max"]))
         if "el_hz_max" in args:
-            lo, hi = _MOVE_HZ_BOUNDS["el"]
-            patch["move_hz_max_el"] = max(lo, min(hi, int(args["el_hz_max"])))
-    except (TypeError, ValueError) as exc:
+            patch["move_hz_max_el"] = clamp_hz("el", float(args["el_hz_max"]))
+    except (TypeError, ValueError, OverflowError) as exc:
         raise CommandError(f"set_move_speed: bad value: {exc}") from exc
     if not patch:
         raise CommandError("set_move_speed: provide az_hz_max and/or el_hz_max")
@@ -498,24 +489,59 @@ async def _cmd_save_scan_notes(args: dict[str, Any]) -> dict[str, Any]:
 
 # ── hardware commands (via the ESP proxy) ──────────────────────────────────
 
+_EL_TRAVEL = f"{EL_MIN:g}…{EL_MAX:+g}°"
+
+
+def _angle(args: dict[str, Any], key: str) -> float | None:
+    """A finite angle from the payload, or None when the key is absent/null
+    (that axis does not move)."""
+    value = args.get(key)
+    if value is None:
+        return None
+    try:
+        deg = float(value)
+    except (TypeError, ValueError) as exc:
+        raise CommandError(f"{key}: not a number: {value!r}") from exc
+    if not math.isfinite(deg):
+        raise CommandError(f"{key}: not a finite angle")
+    return deg
+
+
 async def _cmd_move(args: dict[str, Any]) -> dict[str, Any]:
-    az = args.get("az")
-    el = args.get("el")
-    return await esp.move_and_await(
-        azimuth_deg=None if az is None else float(az),
-        elevation_deg=None if el is None else float(el),
-    )
+    """Absolute move `{az?, el?}` (deg). EL must lie in its travel — the
+    firmware would answer 400, refuse it here with the range in the message."""
+    az = _angle(args, "az")
+    el = _angle(args, "el")
+    if az is None and el is None:
+        raise CommandError("move: give az and/or el")
+    if el is not None and not is_el_valid(el):
+        raise CommandError(f"move: el {el:g}° is outside the EL travel {_EL_TRAVEL}")
+    return await esp.move_and_await(azimuth_deg=az, elevation_deg=el)
 
 
 async def _cmd_jog(args: dict[str, Any]) -> dict[str, Any]:
-    """Bump one axis by a small delta. `{axis: 'az'|'el', delta_deg: float}`."""
+    """Bump one axis by a small delta. `{axis: 'az'|'el', delta_deg: float}`.
+
+    An EL jog that would leave the travel stops at the limit instead; one
+    that starts outside it (an unzeroed encoder reads anything) is refused
+    unless it ends inside."""
     axis = str(args.get("axis", "")).lower()
     if axis not in ("az", "el"):
         raise CommandError("jog: axis must be 'az' or 'el'")
-    delta = float(args.get("delta_deg", 0.0))
+    delta = _angle(args, "delta_deg") or 0.0
     if axis == "az":
         return await esp.move_and_await(azimuth_deg=model.az + delta)
-    return await esp.move_and_await(elevation_deg=model.el + delta)
+    target = model.el + delta
+    if not is_el_valid(target):
+        if not is_el_valid(model.el):
+            raise CommandError(
+                f"jog: EL reads {model.el:.1f}°, outside the travel {_EL_TRAVEL} — "
+                "zero the EL encoder (Machine config → Step 0)"
+            )
+        target = clamp_el(target)
+        if abs(target - model.el) < 0.05:
+            raise CommandError(f"jog: EL is at its {target:+g}° limit")
+    return await esp.move_and_await(elevation_deg=target)
 
 
 async def _cmd_motors(args: dict[str, Any]) -> dict[str, Any]:

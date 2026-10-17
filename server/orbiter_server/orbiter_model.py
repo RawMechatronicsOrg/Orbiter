@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from config import settings
+from drive import AXES, axes_info
 
 log = logging.getLogger("orbiter.model")
 
@@ -240,13 +241,17 @@ class ModelState:
     # loads (geom.rig_model.rig_identity). Set at startup; not persisted.
     rig_id: str = ""
 
+    # Per-axis drive facts + EL travel for the UI (drive.axes_info): steps
+    # per degree for the °/s readouts, the speed-knob band, the EL limits.
+    axes: dict[str, Any] = field(default_factory=axes_info)
+
     # ── motion speed (persisted) ───────────────────────────────────────────
     # Per-axis closed-loop top step rate (Hz) sent to the firmware with every
     # /move as az_hz_max / el_hz_max. The firmware clamps and falls back to its
     # compiled defaults (CL_HZ_MAX_AZ/EL) when these are 0. Operator-tunable via
-    # the Machine-config speed knobs; defaults match the doubled firmware caps.
-    move_hz_max_az: int = 2100
-    move_hz_max_el: int = 350
+    # the Machine-config speed knobs; defaults are the firmware caps.
+    move_hz_max_az: int = AXES["az"].hz_default
+    move_hz_max_el: int = AXES["el"].hz_default
 
     # ── scan plan + progress ───────────────────────────────────────────────
     # The MotionPlanner — the active scan-loop plan (discrete sweep).

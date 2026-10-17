@@ -22,7 +22,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { useViewerStore } from './modelStore';
 import type { Commands } from './commands';
-import { calibrationStatus, num } from './ui';
+import { axisInfo, calibrationStatus, degPerS, num, type AxisInfo } from './ui';
 import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
 import { Card, CardContent, CardTitle } from '../components/ui/card';
@@ -123,33 +123,26 @@ const BoardNumberRow = ({
   </label>
 );
 
-/** Per-axis speed-knob ranges (Hz). Must match the server clamp in
- *  commands.py (`_MOVE_HZ_BOUNDS`) so the slider can never request a value the
- *  server would reject. AZ is the light axis (fast); EL carries the whole arm,
- *  so it's capped lower to keep sweeps from over-shooting. Defaults match the
- *  doubled firmware caps (CL_HZ_MAX_AZ/EL). */
-const SPEED_KNOBS = {
-  az: { min: 100, max: 4000, step: 50, def: 2100 },
-  el: { min: 50, max: 1000, step: 25, def: 350 },
-} as const;
+/** Slider step per axis (Hz). The band itself comes from the server
+ *  (`model.axes`, drive.py) — the same numbers it clamps to. */
+const KNOB_STEP = { az: 50, el: 25 } as const;
 
-/** A motion-speed slider with a live Hz readout. Smooth while dragging (local
- *  draft), debounced commit to the server, and re-syncs from the model when the
- *  field is "clean" — the same dirty-flag pattern as the board inputs above. */
+/** A motion-speed slider with a live Hz + output °/s readout. Smooth while
+ *  dragging (local draft), debounced commit to the server, and re-syncs from
+ *  the model when the field is "clean" — the same dirty-flag pattern as the
+ *  board inputs above. */
 function SpeedKnob({
   label,
   hint,
   value,
-  min,
-  max,
+  axis,
   step,
   onCommit,
 }: {
   label: string;
   hint: string;
   value: number;
-  min: number;
-  max: number;
+  axis: AxisInfo;
   step: number;
   onCommit: (v: number) => void;
 }) {
@@ -185,12 +178,20 @@ function SpeedKnob({
     <div className="mb-2">
       <div className="flex items-baseline justify-between">
         <span className="text-[13px] text-inkdim">{label}</span>
-        <span className="font-mono text-[13px] text-ink">{draft} Hz</span>
+        <span
+          className="font-mono text-[13px] text-ink"
+          title={
+            `${axis.steps_per_deg} µsteps/° (${axis.steps_per_deg_source}); ` +
+            `nominal ${axis.steps_per_deg_nominal.toFixed(1)}`
+          }
+        >
+          {draft} Hz <span className="text-inkdim">≈ {degPerS(draft, axis)}</span>
+        </span>
       </div>
       <input
         type="range"
-        min={min}
-        max={max}
+        min={axis.hz_min}
+        max={axis.hz_max}
         step={step}
         value={draft}
         onChange={(e) => onSlide(Number(e.target.value))}
@@ -276,10 +277,12 @@ export function MachineConfig({ commands }: { commands: Commands }) {
   const camTilt    = useViewerStore((s) => num(s.model, 'camera_tilt_deg', 0));
   const camPan     = useViewerStore((s) => num(s.model, 'camera_pan_deg', 0));
 
-  // Per-axis closed-loop top step rate (Hz) — the speed knobs. Defaults match
-  // the doubled firmware caps until the server pushes the persisted values.
-  const moveHzAz = useViewerStore((s) => num(s.model, 'move_hz_max_az', SPEED_KNOBS.az.def));
-  const moveHzEl = useViewerStore((s) => num(s.model, 'move_hz_max_el', SPEED_KNOBS.el.def));
+  // Per-axis closed-loop top step rate (Hz) — the speed knobs — and the drive
+  // facts (band, steps/°) they are drawn with. Both arrive with the model.
+  const azAxis = useViewerStore((s) => axisInfo(s.model, 'az'));
+  const elAxis = useViewerStore((s) => axisInfo(s.model, 'el'));
+  const moveHzAz = useViewerStore((s) => num(s.model, 'move_hz_max_az', 0));
+  const moveHzEl = useViewerStore((s) => num(s.model, 'move_hz_max_el', 0));
 
   // Step 0 · encoder zero: the live angles (what is about to become 0), the
   // raw zero offsets the firmware holds, and whether the EL zero is set —
@@ -629,28 +632,31 @@ export function MachineConfig({ commands }: { commands: Commands }) {
       {/* ── motion speed — the per-axis closed-loop top step rate knobs ── */}
       <Collapsible title="Motion speed" defaultOpen>
         <CardContent>
-          <SpeedKnob
-            label="AZ max"
-            hint="Azimuth (turntable) — light axis, runs fast."
-            value={moveHzAz}
-            min={SPEED_KNOBS.az.min}
-            max={SPEED_KNOBS.az.max}
-            step={SPEED_KNOBS.az.step}
-            onCommit={(v) => commands.setMoveSpeed(v, undefined)}
-          />
-          <SpeedKnob
-            label="EL max"
-            hint="Elevation (arm) — carries the whole arm; keep moderate to avoid over-shoot."
-            value={moveHzEl}
-            min={SPEED_KNOBS.el.min}
-            max={SPEED_KNOBS.el.max}
-            step={SPEED_KNOBS.el.step}
-            onCommit={(v) => commands.setMoveSpeed(undefined, v)}
-          />
+          {azAxis && (
+            <SpeedKnob
+              label="AZ max"
+              hint="Azimuth (turntable) — light axis, runs fast."
+              value={moveHzAz}
+              axis={azAxis}
+              step={KNOB_STEP.az}
+              onCommit={(v) => commands.setMoveSpeed(v, undefined)}
+            />
+          )}
+          {elAxis && (
+            <SpeedKnob
+              label="EL max"
+              hint="Elevation (arm) — carries the whole arm; keep moderate to avoid over-shoot."
+              value={moveHzEl}
+              axis={elAxis}
+              step={KNOB_STEP.el}
+              onCommit={(v) => commands.setMoveSpeed(undefined, v)}
+            />
+          )}
           <div className="mt-1 text-[11px] text-inkmute">
-            Closed-loop top step rate (Hz) capping every move — manual jog,
-            calibration sweep, and scan. Sent to the firmware with each move;
-            0/blank would fall back to the firmware default.
+            Closed-loop top step rate capping every move — manual jog,
+            calibration sweep, and scan. The firmware takes driver step rates
+            (Hz, 1/16 microsteps); °/s is derived from the steps per degree
+            the server holds (hover a value for its source).
           </div>
         </CardContent>
       </Collapsible>

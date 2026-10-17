@@ -55,8 +55,9 @@ export interface Commands {
   resetCalibration(): void;
   setMotionPlan(plan: Record<string, unknown>): void;
   /** Set the per-axis closed-loop top step rate (Hz) — the Machine-config
-   *  speed knobs. Either or both axes; the server clamps to a safe band and
-   *  forwards the value to the firmware with the next /move. */
+   *  speed knobs. Either or both axes; the server clamps to the band it
+   *  publishes in `model.axes` and forwards the value to the firmware with the
+   *  next /move. */
   setMoveSpeed(azHzMax?: number, elHzMax?: number): void;
   setRenderPref(prefs: Record<string, boolean>): void;
   /** Update the binocular pair config (Stereo tab). Only the keys present are

@@ -15,7 +15,7 @@ import { useState } from 'react';
 import { useViewerStore } from './modelStore';
 import type { Commands } from './commands';
 import { NavBall } from './NavBall';
-import { cls, num } from './ui';
+import { cls, elTravel, num, parseNum, travelText } from './ui';
 import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
 
@@ -52,7 +52,24 @@ export function PositionOverlay({ commands }: { commands: Commands }) {
   // Show/hide the purple phone-IMU marker on the navball.
   const [showPhoneMarker, setShowPhoneMarker] = useState(true);
 
-  const stepN = () => parseFloat(step) || 5;
+  const stepN = () => {
+    const v = parseNum(step);
+    return v != null && v > 0 ? v : 5;
+  };
+  // EL travel published by the server (model.axes.el). Jog stops at it, the
+  // absolute move refuses outside it — the firmware would answer 400.
+  const travel = elTravel(model);
+  const liveEl = num(model, 'el');
+  const atElMax = travel != null && liveEl >= travel.max - 0.05;
+  const atElMin = travel != null && liveEl <= travel.min + 0.05;
+  const moveAz = parseNum(az);
+  const moveEl = parseNum(el);
+  const moveError =
+    moveAz == null || moveEl == null
+      ? 'enter az and el in degrees'
+      : travel && (moveEl < travel.min || moveEl > travel.max)
+        ? `el outside ${travelText(travel)}`
+        : null;
   const motorsOn = model.motors_on === true;
   const targetAz = model.move_target_az as number | null | undefined;
   const targetEl = model.move_target_el as number | null | undefined;
@@ -69,7 +86,9 @@ export function PositionOverlay({ commands }: { commands: Commands }) {
     commands.move(num(model, 'az') + dir * stepN(), undefined);
   };
   const jogEl = (dir: 1 | -1) => {
-    commands.move(undefined, num(model, 'el') + dir * stepN());
+    let target = liveEl + dir * stepN();
+    if (travel) target = Math.min(travel.max, Math.max(travel.min, target));
+    commands.move(undefined, target);
   };
 
   return (
@@ -114,6 +133,7 @@ export function PositionOverlay({ commands }: { commands: Commands }) {
         <NavBall
           az={num(model, 'az')}
           el={num(model, 'el')}
+          elMin={travel?.min}
           targetAz={hasTarget ? targetAz : null}
           targetEl={hasTarget ? targetEl : null}
           phoneEl={showPhoneMarker ? phoneEl : null}
@@ -135,7 +155,8 @@ export function PositionOverlay({ commands }: { commands: Commands }) {
                         rounded-xl border border-cardline bg-black/20 p-2">
           <div />
           <Button variant="secondary" size="icon" onClick={() => jogEl(+1)}
-                  title={`+${stepN()}° EL`}>
+                  disabled={atElMax}
+                  title={atElMax ? 'EL at its upper limit' : `+${stepN()}° EL`}>
             ▲
           </Button>
           <div />
@@ -158,7 +179,8 @@ export function PositionOverlay({ commands }: { commands: Commands }) {
 
           <div />
           <Button variant="secondary" size="icon" onClick={() => jogEl(-1)}
-                  title={`−${stepN()}° EL`}>
+                  disabled={atElMin}
+                  title={atElMin ? 'EL at its lower limit' : `−${stepN()}° EL`}>
             ▼
           </Button>
           <div />
@@ -178,9 +200,20 @@ export function PositionOverlay({ commands }: { commands: Commands }) {
               el
             </span>
             <Input className="h-8 font-mono text-[12px] tabular-nums" value={el}
+                   aria-invalid={moveError != null}
                    onChange={(e) => setEl(e.target.value)} />
           </div>
-          <Button size="sm" onClick={() => commands.move(parseFloat(az), parseFloat(el))}>
+          {travel && (
+            <div className="text-[10px] text-inkmute">EL {travelText(travel)}</div>
+          )}
+          <Button
+            size="sm"
+            disabled={moveError != null}
+            title={moveError ?? undefined}
+            onClick={() => {
+              if (moveAz != null && moveEl != null) commands.move(moveAz, moveEl);
+            }}
+          >
             Move
           </Button>
         </div>

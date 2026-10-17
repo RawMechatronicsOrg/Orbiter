@@ -6,6 +6,56 @@ export const num = (m: Record<string, unknown>, k: string, d = 0): number => {
   return typeof v === 'number' ? v : d;
 };
 
+/** Per-axis drive facts the server publishes as `model.axes` (drive.py):
+ *  steps per degree for °/s readouts, the speed-knob band (Hz), and for EL
+ *  the travel limits. */
+export interface AxisInfo {
+  steps_per_deg: number;
+  steps_per_deg_nominal: number;
+  steps_per_deg_source: string;
+  hz_min: number;
+  hz_max: number;
+  hz_default: number;
+  min_deg?: number;
+  max_deg?: number;
+}
+
+/** `model.axes[axis]`, or null before the server has sent it. */
+export function axisInfo(m: Record<string, unknown>, axis: 'az' | 'el'): AxisInfo | null {
+  const axes = m.axes as Record<string, AxisInfo> | undefined;
+  const a = axes?.[axis];
+  return a && typeof a.steps_per_deg === 'number' ? a : null;
+}
+
+/** EL travel from `model.axes.el` (the firmware's limits, geom/angles.py),
+ *  or null before the server has sent it. AZ turns without limit. */
+export function elTravel(m: Record<string, unknown>): { min: number; max: number } | null {
+  const el = axisInfo(m, 'el');
+  return el && typeof el.min_deg === 'number' && typeof el.max_deg === 'number'
+    ? { min: el.min_deg, max: el.max_deg }
+    : null;
+}
+
+/** `−25…+90°` — a travel range with typographic signs. */
+export function travelText(t: { min: number; max: number }): string {
+  const s = (v: number) => (v < 0 ? `−${-v}` : `+${v}`);
+  return `${s(t.min)}…${s(t.max)}°`;
+}
+
+/** Strict parse of a numeric text field: blank or junk → null (never NaN). */
+export function parseNum(s: string): number | null {
+  const t = s.trim().replace('−', '-');
+  if (t === '') return null;
+  const v = Number(t);
+  return Number.isFinite(v) ? v : null;
+}
+
+/** Output speed for a driver step rate, e.g. `34.4 °/s`. */
+export function degPerS(hz: number, a: AxisInfo): string {
+  const v = hz / a.steps_per_deg;
+  return `${v < 10 ? v.toFixed(2) : v.toFixed(1)} °/s`;
+}
+
 /** Geometry-calibration state — mirrors `ModelState.calibration_status`:
  *  `stale` = solved on other mechanics (another rig GLB) or before calibrations
  *  were stamped with one. */

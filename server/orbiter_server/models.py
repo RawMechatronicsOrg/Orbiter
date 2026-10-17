@@ -1,6 +1,9 @@
+import math
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from geom.angles import EL_MAX, EL_MIN, is_el_valid
 
 
 class Vec3(BaseModel):
@@ -186,15 +189,32 @@ CaptureAction = Literal[
 
 
 class DiscretePlan(BaseModel):
-    """Elevation rings x azimuth step, with a per-point checked action list."""
+    """Elevation rings x azimuth step, with a per-point checked action list.
+
+    Both ring elevations must lie inside the EL travel (geom.angles): the
+    firmware refuses a /move outside it, so a plan reaching past it would
+    fail point by point halfway through the sweep."""
 
     model_config = ConfigDict(extra="ignore")
 
     el_start_deg: float = 0.0
     el_max_deg: float = 60.0
-    el_steps: int = 4
+    el_steps: int = Field(default=4, ge=0)
     az_step_deg: float = 20.0
     actions: list[CaptureAction] = Field(default_factory=lambda: ["photo"])
+
+    @model_validator(mode="after")
+    def _within_travel(self) -> "DiscretePlan":
+        for name in ("el_start_deg", "el_max_deg"):
+            value = getattr(self, name)
+            if not is_el_valid(value):
+                raise ValueError(
+                    f"{name} = {value:g}° is outside the EL travel "
+                    f"{EL_MIN:g}…{EL_MAX:+g}°"
+                )
+        if not (math.isfinite(self.az_step_deg) and self.az_step_deg > 0):
+            raise ValueError("az_step_deg must be a positive angle")
+        return self
 
 
 class MotionPlan(BaseModel):
