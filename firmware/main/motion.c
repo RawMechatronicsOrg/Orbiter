@@ -388,9 +388,28 @@ esp_err_t motion_set_calibration(bool do_az, bool do_el,
     return calibration_save_to_nvs(do_az, do_el);
 }
 
+/* Direction of each axis's spin in flight (valid while s_spinning_*). */
+static stepper_dir_t s_spin_dir[2];
+
 esp_err_t motion_spin(stepper_axis_t axis, stepper_dir_t dir, uint32_t step_hz)
 {
     bool first_axis;
+
+    /*
+     * Already spinning: retune instead of refusing. Same direction is a rate
+     * change on the running timer (no gap, no lost step), a reversal stops
+     * and restarts the other way. This is what lets a host drive an axis by
+     * velocity — a sweep with a smoothly varying speed — over /spin.
+     */
+    portENTER_CRITICAL(&s_spin_lk);
+    bool already = (axis == STEPPER_AZ) ? s_spinning_az : s_spinning_el;
+    portEXIT_CRITICAL(&s_spin_lk);
+    if (already) {
+        if (dir == s_spin_dir[axis]) return stepper_set_speed(axis, step_hz);
+        stepper_stop(axis);
+        s_spin_dir[axis] = dir;
+        return stepper_spin(axis, dir, step_hz);
+    }
 
     portENTER_CRITICAL(&s_spin_lk);
     if (axis == STEPPER_AZ && s_spinning_az) {
@@ -418,6 +437,7 @@ esp_err_t motion_spin(stepper_axis_t axis, stepper_dir_t dir, uint32_t step_hz)
 
     stepper_enable();
     s_motors_enabled = true;
+    s_spin_dir[axis] = dir;
     esp_err_t ret = stepper_spin(axis, dir, step_hz);
     if (ret != ESP_OK) {
         portENTER_CRITICAL(&s_spin_lk);

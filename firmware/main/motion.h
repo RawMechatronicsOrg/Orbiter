@@ -125,7 +125,9 @@ esp_err_t motion_set_el_sign(int sign);
 /**
  * Start continuous rotation on one axis (non-blocking).
  * A second axis may spin while the first is active; /move remains blocked until all spins stop.
- * @return ESP_ERR_INVALID_STATE if this axis is already spinning, move mutex is busy, or stepper_spin fails.
+ * Calling it on an axis that is already spinning retunes that spin: the same
+ * direction changes the rate in place, the other direction reverses it.
+ * @return ESP_ERR_INVALID_STATE if the move mutex is busy or stepper_spin fails.
  */
 esp_err_t motion_spin(stepper_axis_t axis, stepper_dir_t dir, uint32_t step_hz);
 

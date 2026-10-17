@@ -447,6 +447,9 @@ esp_err_t handler_spin(httpd_req_t *req)
     if (motorcal_active())
         return send_json(req, "{\"status\":\"busy\",\"message\":\"motor calibration running\"}", 409);
 
+    /* A host steering an axis by velocity retunes it many times a second;
+     * only the start of a spin is worth a log line. */
+    bool was_spinning = (axis == STEPPER_AZ) ? motion_spinning_az() : motion_spinning_el();
     esp_err_t ret = motion_spin(axis, dir, step_hz);
     if (ret == ESP_ERR_INVALID_STATE)
         return send_json(req, "{\"status\":\"busy\"}", 409);
@@ -457,7 +460,8 @@ esp_err_t handler_spin(httpd_req_t *req)
     snprintf(resp, sizeof(resp),
              "{\"status\":\"ok\",\"axis\":\"%s\",\"dir\":\"%s\",\"step_hz\":%lu}",
              axis_str, dir_str, (unsigned long)step_hz);
-    LOGX_EMIT_I(TAG, "POST /spin axis=%s dir=%s hz=%lu", axis_str, dir_str, (unsigned long)step_hz);
+    if (!was_spinning)
+        LOGX_EMIT_I(TAG, "POST /spin axis=%s dir=%s hz=%lu", axis_str, dir_str, (unsigned long)step_hz);
     return send_json(req, resp, 200);
 }
 
