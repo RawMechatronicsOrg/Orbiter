@@ -187,6 +187,12 @@ static void start_http_server(void)
     config.server_port     = CONFIG_ORBITER_HTTP_PORT;
     config.lru_purge_enable = true;
     config.max_uri_handlers = 32;   /* default is 8, we now have 27 routes + /ws/log */
+    /*
+     * 8 KB instead of the 4 KB default: handlers build their JSON on the
+     * stack, and /state (pose + runner + per-axis motor calibration, ~2 KB of
+     * buffers) overflowed 4 KB — a stack overflow on every UI poll.
+     */
+    config.stack_size = 8192;
 
     /*
      * UI polls /state every 250 ms and browsers (Firefox/Chrome) tend to
