@@ -119,7 +119,7 @@ Omitting an axis leaves it at its current position.
 | Axis | Tolerance | Source |
 |------|-----------|--------|
 | AZ | ± 1.0° | One AS5600 step ≈ 0.088°; debounced over 2 readings. |
-| EL | ± 1.0° | One AS5048A step ≈ 0.022° (the v2 AS5600: 0.088°); debounced over 2 readings. |
+| EL | ± 1.0° | One AS5600 step ≈ 0.088°; debounced over 2 readings. |
 
 ---
 
@@ -190,6 +190,50 @@ later so the response reaches you.
 ```json
 { "status": "ok", "message": "rebooting" }
 ```
+
+---
+
+## `POST /ota`
+
+Update the firmware over Wi-Fi. The request body is the **raw app image**
+(`build/orbiter.bin`), not JSON; the firmware streams it into the inactive
+OTA slot.
+
+```bash
+curl --data-binary @build/orbiter.bin http://<esp-ip>/ota
+```
+
+Before the image is accepted the firmware checks that the axes are idle,
+that the body is not empty, and that it fits the slot. While the image is
+written the motors are disabled. On success the slot becomes the boot
+partition and the device reboots about 500 ms after the response.
+
+A new image confirms itself once its HTTP server is up. If that does not
+happen within 120 s, the bootloader rolls back to the previous image. The
+stored calibration (NVS) is not touched by an update.
+
+**200** — image written and verified; rebooting
+```json
+{ "status": "ok", "message": "updated, rebooting" }
+```
+
+If the reboot timer cannot be created, the message is
+`"updated, reboot to run it"` — send `POST /reboot`.
+
+Errors have the form `{ "status": "error", "message": "..." }`:
+
+| Code | When |
+|------|------|
+| 400 | The image is not an Orbiter firmware image (it belongs to another project), the body is empty, or the written image failed verification (checksum / hash). |
+| 409 | An axis is moving or spinning — stop it first. |
+| 413 | The image is larger than the OTA slot. |
+| 500 | Any other failure: no OTA slot (flash the OTA partition table over USB once), out of memory, receive timeout, or a flash write / boot-partition error. |
+
+> **First flash over USB.** A board with the old single-app partition table
+> has no OTA slot. Flash it once with `idf.py -p COM3 flash`; some ESP32
+> dev-board clones need **BOOT** held while `esptool` prints `Connecting...`
+> (see [FIRMWARE.md](FIRMWARE.md#updating-over-wi-fi)). After that, use
+> `/ota`.
 
 ---
 

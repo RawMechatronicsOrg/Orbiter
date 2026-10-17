@@ -186,8 +186,6 @@ directly if you want to change a part.
 
 ## What v2 does not have yet
 
-- **The firmware reads elevation from an AS5048A over SPI.** v2 mounts an
-  AS5600 on elevation, which the firmware does not drive yet.
 - **No assembly guide.** The main [README](../../README.md) has the bill of
   materials and the order of operations for v2, not a step-by-step guide.
   The section view above and the FreeCAD assembly are the best reference

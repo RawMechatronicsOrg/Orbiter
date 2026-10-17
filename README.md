@@ -30,8 +30,11 @@ authoritative when you need depth.
   ([`cad/v2/README.md`](cad/v2/README.md)): two near-identical rotary
   drive modules on an aluminium tube frame, 6008 bearings, taper inserts,
   an AS5600 on both axes. The server's rig model, the 3D viewer and this
-  README follow v2 (its GLB is `cad/v2/assembly/Orbiter.glb`); the firmware
-  still reads elevation from an AS5048A.
+  README follow v2 (its GLB is `cad/v2/assembly/Orbiter.glb`).
+- **Firmware** reads an AS5600 on each axis (one I²C bus per sensor), takes
+  its stepper pins from a **Board wiring** choice in `menuconfig` — the
+  jumper-wire bench or the Orbiter-Simple carrier — and updates over Wi-Fi
+  with `POST /ota` ([§10.1](#101-build--flash)).
 - The docker-compose stack starts on a fresh checkout.
 
 ## Contents
@@ -76,7 +79,7 @@ Orbiter is a **lab kit**, not a finished product. Expect rough edges; the pieces
 
 ### The "lab kit" framing
 
-The hardware is whatever was within arm's reach during prototyping: A4988 drivers (cheap, forgiving, the silicon is everywhere), 1.8°/step NEMA-17 motors (24 mm body) on GT2 belts — 7:1 on azimuth, 10:1 on elevation — a 25 × 25 mm aluminium tube frame with printed drive housings on 6008 bearings, an AS5600 (I²C) on each axis (the firmware still reads elevation from an AS5048A over SPI, a leftover of v1), an old ESP32-D0WD-V3 dev board, and an Android phone running [IP Webcam](https://play.google.com/store/apps/details?id=com.pas.webcam) for the camera. Substitution points are called out in each section so you can swap parts.
+The hardware is whatever was within arm's reach during prototyping: A4988 drivers (cheap, forgiving, the silicon is everywhere), 1.8°/step NEMA-17 motors (24 mm body) on GT2 belts — 7:1 on azimuth, 10:1 on elevation — a 25 × 25 mm aluminium tube frame with printed drive housings on 6008 bearings, an AS5600 (I²C) on each axis, an old ESP32-D0WD-V3 dev board, and an Android phone running [IP Webcam](https://play.google.com/store/apps/details?id=com.pas.webcam) for the camera. Substitution points are called out in each section so you can swap parts.
 
 ### Three licenses, one repo
 
@@ -94,7 +97,7 @@ The minimum-viable path from "I have the parts" to "I have a session of photos":
 
 1. **Print the STLs** in `cad/v2/stl/printed/` ([§8](#8-printable-parts--print-profile)).
 2. **Wire up** the ESP32, drivers, motors, and encoders per [§6](#6-wiring--pin-map).
-3. **Flash the firmware** ([§10.1](#101-build--flash)), set Wi-Fi credentials via `idf.py menuconfig`, note the IP that appears in the boot log.
+3. **Flash the firmware** ([§10.1](#101-build--flash)), set Wi-Fi credentials and the board wiring via `idf.py menuconfig`, note the IP that appears in the boot log.
 4. **Calibrate the encoders** ([§10.3](#103-first-run-encoder-calibration)) — arm horizontal, platform facing forward, then `POST /calibrate {"axis":"el","mode":"current"}` and the same for AZ.
 5. **Bring up the stack:**
    ```bash
@@ -210,7 +213,7 @@ Photo bytes go to a global **immutable** `captures/` pool. Manifests reference t
 | MCU                | ESP32 dev board                         | ESP32-D0WD-V3 rev 3.1, 4 MB flash                                                          | Any ESP32 with Wi-Fi (ESP32-WROOM, ESP32-S3 — pin map shifts).                              |
 | Motor driver ×2    | A4988 stepper driver carrier            | Generic Pololu-style clone                                                                 | DRV8825 (same footprint, swap microstep table). TMC2208/2209 if you want quiet — same STEP/DIR/EN. |
 | Stepper ×2         | NEMA-17, 24 mm body                     | 1.8°/step (200 step/rev)                                                                   | Any NEMA-17 that fits the mounts; the step angle changes only the step rate per degree ([§7](#7-motion-math)). |
-| Encoder ×2         | AS5600 magnetic angle sensor module     | 12-bit, I²C @ 0x36                                                                         | AS5048B (I²C, 14-bit) for more resolution. The firmware still drives EL as an AS5048A (SPI, [§6](#6-wiring--pin-map)). |
+| Encoder ×2         | AS5600 magnetic angle sensor module     | 12-bit, I²C @ 0x36                                                                         | AS5048B (I²C, 14-bit) for more resolution — it would need a driver; the firmware talks to the AS5600 only. |
 | Encoder magnet ×2  | Diametrically magnetised disc           | Sits in a printed `HexPlug` in the end of the spindle and of the shaft                     | Anything diametric that fits the plug.                                                      |
 | Belts              | GT2 closed loop, 6 mm wide              | 280 mm on AZ; EL ≈ 347 mm at the modelled centre distance (the model names no length)      | Any GT2-compatible belt (2 mm pitch, 6 mm wide).                                            |
 | Pulleys            | GT2 16-tooth on the motors              | Printed 112-tooth (AZ, 7:1) and 160-tooth (EL, 10:1) output pulleys on splines             | Reprint the output pulley for another ratio.                                                |
@@ -243,37 +246,35 @@ PLA is enough for a desk-bound rig; PETG / ABS if the lab is warm (PLA softens a
 
 GPIO numbers (not silkscreen) for the ESP32-D0WD-V3.
 
-**Steppers (A4988):**
+**Steppers (A4988):** two wirings, picked at build time in `idf.py menuconfig` → Orbiter Configuration → **Board wiring** ([§10.2](#102-menuconfig-settings)).
 
-| Signal              | GPIO | Notes                                                                                                |
-|---------------------|-----:|------------------------------------------------------------------------------------------------------|
-| Stepper 1 STEP (AZ) |   25 |                                                                                                      |
-| Stepper 1 DIR  (AZ) |   26 |                                                                                                      |
-| Stepper 2 STEP (EL) |   27 |                                                                                                      |
-| Stepper 2 DIR  (EL) |   33 | Moved off JTAG MTMS (GPIO 14), which floated to ~0.9 V at boot and clocked phantom steps. Avoid strapping / JTAG pins on your dev board. |
-| ENABLE (shared)     |   32 | Active LOW. Wire to both drivers in parallel.                                                        |
-| MS1 / MS2 / MS3     | 3.3V | 1/16 microstepping. Pull-up to VCC, no MCU control needed.                                           |
+| Signal              | `ORBITER_BOARD_WIRED` (default) | `ORBITER_BOARD_SIMPLE` | Notes                                                                                                |
+|---------------------|--------------------------------:|-----------------------:|------------------------------------------------------------------------------------------------------|
+| Stepper 1 STEP (AZ) |                              25 |                     26 |                                                                                                      |
+| Stepper 1 DIR  (AZ) |                              26 |                     25 |                                                                                                      |
+| Stepper 2 STEP (EL) |                              27 |                     18 |                                                                                                      |
+| Stepper 2 DIR  (EL) |                              33 |                     19 | On the wired bench, moved off JTAG MTMS (GPIO 14), which floated to ~0.9 V at boot and clocked phantom steps. Avoid strapping / JTAG pins on your dev board. |
+| ENABLE (shared)     |                              32 |                     27 | Active LOW. Wire to both drivers in parallel.                                                        |
 
-**Encoder AZ — AS5600 (I²C @ 400 kHz, address 0x36):**
+`ORBITER_BOARD_WIRED` is the jumper-wire bench (A4988 carriers on jumper wires). `ORBITER_BOARD_SIMPLE` is the Orbiter-Simple carrier PCB. The firmware does not drive MS1 / MS2 / MS3; on the wired bench they are tied to 3.3 V for 1/16 microstepping (pull-up to VCC).
 
-| Signal | GPIO | Notes                                                |
-|--------|-----:|------------------------------------------------------|
-| SDA    |   21 | 4.7 kΩ pull-up to 3.3 V (often already on breakout). |
-| SCL    |   22 | 4.7 kΩ pull-up to 3.3 V.                             |
-| DIR    |  GND | Tie low for CCW = increasing angle. VCC to invert.   |
+On Orbiter-Simple the load outputs OUT A–D (GPIO 12, 2, 5, 17) and the DSLR remote FOCUS / SHUTTER (GPIO 32, 33) are driven low at boot, before anything else, so a floating input cannot switch a 12 V load or trip the camera. The firmware does not use them otherwise. On the wired bench GPIO 32 / 33 are ENABLE and EL DIR, so this is not done there.
 
-**Encoder EL — AS5048A (SPI Mode 1, manual chip select)** — what the firmware reads today. The v2 mechanics mount an AS5600 on EL as well; the firmware does not drive it yet.
+**Encoders — AS5600 on both axes (I²C @ 400 kHz, address 0x36):**
 
-| Signal | GPIO | Notes                                                       |
-|--------|-----:|-------------------------------------------------------------|
-| CLK    |   18 |                                                             |
-| MISO   |   19 |                                                             |
-| MOSI   |   23 | Chip reads commands over MOSI — don't omit.                 |
-| CS     |   17 | Manual GPIO (we don't use the SPI peripheral's hardware CS). |
+The AS5600's address is fixed, so each sensor needs its own I²C bus. The pins are the same on both stepper wirings.
 
-`GPIO 5` is free on this board (was CS for an older AS5048A on AZ).
+| Axis | Signal | GPIO | Notes                                                |
+|------|--------|-----:|------------------------------------------------------|
+| AZ   | SDA    |   22 | 4.7 kΩ pull-up to 3.3 V (often already on breakout). |
+| AZ   | SCL    |   23 | 4.7 kΩ pull-up to 3.3 V.                             |
+| EL   | SDA    |    4 | 4.7 kΩ pull-up to 3.3 V (often already on breakout). |
+| EL   | SCL    |   16 | 4.7 kΩ pull-up to 3.3 V.                             |
+| both | DIR    |  GND | On the sensor board, not an ESP32 pin. **Strap it to GND** — a floating DIR makes the angle jump. |
 
-**Wiring sketch:**
+Both sensors are 12-bit: 4096 counts per turn, 0.088° per count.
+
+**Wiring sketch** (stepper pins as on `ORBITER_BOARD_WIRED`; for Orbiter-Simple use the table above):
 
 ```
        12 V supply ─────┬──────┬──────────────────
@@ -286,11 +287,10 @@ GPIO numbers (not silkscreen) for the ESP32-D0WD-V3.
                         │      │
                     motor1   motor2
 
-       AS5600  AS5048A
-        SDA─21  CLK─18
-        SCL─22  MISO─19
-                MOSI─23
-                CS  ─17
+       AS5600 (AZ)      AS5600 (EL)
+        SDA─22           SDA─4
+        SCL─23           SCL─16
+        DIR─GND          DIR─GND
 
        USB ── ESP32 ── Wi-Fi to your network
 ```
@@ -333,10 +333,10 @@ There is no step-by-step guide for v2 yet. This is the order of operations; the 
 1. **Print everything.** Inspect for blobs / strings on the pulley teeth — they cost backlash if you don't clean them up.
 2. **Build the two drives**: two 6008 bearings per housing with the spacers between the rings, the spindle / shaft through them, clamped by the M32×1 nut (the printed AF32 wrench turns it). The output pulley goes on the splines.
 3. **Press the diametric magnets** into the two `HexPlug`s and the plugs into the end of the spindle and of the shaft.
-4. **Mount the AS5600 modules** on `BaseSensorRing` (AZ) and `AngleSensorMount Ribbed` (EL), about 1 mm from the plug. If the AS5600 reports unstable angles, check centring and gap — its `MD/ML/MH` register reports magnet field status.
+4. **Mount the AS5600 modules** on `BaseSensorRing` (AZ) and `AngleSensorMount Ribbed` (EL), about 1 mm from the plug. If the AS5600 reports unstable angles, check centring and gap — its `MD/ML/MH` register reports magnet field status — and that its `DIR` pin is strapped to GND (a floating `DIR` makes the angle jump).
 5. **Belt and pulleys** — install with the belt under modest tension. If teeth skip during slow moves, tighten; if motors stall, loosen.
 6. **Wire it up** per [§6](#6-wiring--pin-map). Triple-check stepper coil pairs — getting one wrong reverses direction or causes high-current rattling.
-7. **Flash the firmware** ([§10](#10-firmware)), set Wi-Fi, watch the boot log.
+7. **Flash the firmware** ([§10](#10-firmware)), set Wi-Fi and the board wiring, watch the boot log.
 8. **Calibrate the encoders** with the arm horizontal and the platform facing forward ([§10.3](#103-first-run-encoder-calibration)).
 9. **Start the server + UI** ([§13](#13-docker-stack)) and verify a manual move works end-to-end.
 
@@ -353,9 +353,11 @@ There is no step-by-step guide for v2 yet. This is the order of operations; the 
 ```bash
 cd firmware/
 idf.py set-target esp32         # or esp32s3
-idf.py menuconfig               # set Wi-Fi credentials + axis limits
+idf.py menuconfig               # set Wi-Fi credentials, board wiring, axis limits
 idf.py -p COM3 flash monitor    # COM3 / /dev/ttyUSB0 / etc.
 ```
+
+The first flash of a board goes over USB. After that, update over Wi-Fi ([below](#updating-over-wi-fi)).
 
 Headless / CI build (no host ESP-IDF install):
 
@@ -369,13 +371,31 @@ A successful boot prints something like:
 
 ```
 I (xxxx) wifi:connected → ip = 192.168.1.42
-I (xxxx) encoder: AS5600 found at 0x36
-I (xxxx) encoder: AS5048A SPI OK
+I (xxxx) encoder: init — AS5600(AZ) SDA=22 SCL=23 | AS5600(EL) SDA=4 SCL=16
 I (xxxx) calibration loaded: az_zero=0.000° el_zero=138.296°
 I (xxxx) http: server started on port 80
 ```
 
 Write down the IP — the server needs it.
+
+#### Updating over Wi-Fi
+
+Once a board runs this firmware, `POST /ota` replaces it without a cable. Build, then send the raw app image as the request body:
+
+```bash
+cd firmware/
+idf.py build
+curl --data-binary @build/orbiter.bin http://<esp-ip>/ota
+```
+
+| What                | Behaviour                                                                                                    |
+|---------------------|--------------------------------------------------------------------------------------------------------------|
+| Flash layout        | 4 MB flash, two OTA slots ([`firmware/partitions.csv`](firmware/partitions.csv)). `nvs` stays at `0x9000` / `0x6000`, so calibration survives. |
+| Refused             | An image from another project (`400`), an empty body (`400`), an image larger than the slot (`413`), and any request while the axes move (`409`). |
+| While writing       | The motors are disabled; on success the device reboots into the new image.                                   |
+| Rollback            | A new image confirms itself once its HTTP server is up. If that does not happen within 120 s, the bootloader goes back to the previous image. |
+
+The first flash onto a board that still has the old single-app layout **must** go over USB (`idf.py -p COM3 flash`), because the partition table changes. Some ESP32 dev-board clones do not enter download mode by themselves: `esptool` fails with `Wrong boot mode detected (0x17)`. Hold the **BOOT** button while `esptool` prints `Connecting...`. From then on use `/ota`. The response codes are in [docs/API.md](docs/API.md#post-ota).
 
 ### 10.2 `menuconfig` settings
 
@@ -383,12 +403,13 @@ Write down the IP — the server needs it.
 
 | Symbol                  | Purpose                                  | Default       |
 |-------------------------|------------------------------------------|---------------|
+| **Board wiring** (choice) | Which stepper pins the firmware drives: `ORBITER_BOARD_WIRED` — the jumper-wire bench (AZ STEP/DIR 25/26, EL STEP/DIR 27/33, ENABLE 32); `ORBITER_BOARD_SIMPLE` — the Orbiter-Simple carrier (AZ 26/25, EL 18/19, ENABLE 27). Encoder pins are the same on both ([§6](#6-wiring--pin-map)). | `ORBITER_BOARD_WIRED` |
 | `ORBITER_WIFI_SSID`     | 2.4 GHz SSID                             | — (required)  |
 | `ORBITER_WIFI_PASSWORD` | Wi-Fi password                           | — (required)  |
 | `ORBITER_WIFI_MAX_RETRY`| Connect retries before backoff           | 10            |
-| `ORBITER_AZ_MAX_DEG`    | Soft upper bound on AZ (`0` = unbounded) | 0             |
 | `ORBITER_EL_MIN_DEG`    | Lower limit on EL                        | -25           |
 | `ORBITER_EL_MAX_DEG`    | Upper limit on EL                        | 90            |
+| `ORBITER_AS5600_I2C_TRACE` | Log every I²C register read of both AS5600 sensors at INFO, with retries and error codes (verbose; rebuild after changing) | off |
 
 Credentials are baked in at build time. `sdkconfig` is gitignored by default. For runtime provisioning (captive portal, BLE, SmartConfig) you'll need to add it — out of scope for this kit.
 
@@ -403,6 +424,8 @@ Out of the box, encoder zeros are placeholders (`az_zero_raw = 0.0°`, `el_zero_
 
 Values are persisted to NVS and survive reboot.
 
+**After swapping a sensor,** calibrate that axis again. For EL also check the sign on the rig: raise the arm and `el` in `GET /state` must increase. The firmware expects the EL sensor's raw reading to *decrease* as the arm rises and negates it; an AS5600 reverses with its DIR strap and the magnet side (see `el_user_from_raw` in `firmware/main/motion.c`).
+
 ### 10.4 HTTP API
 
 | Method | Path            | Purpose                                                       |
@@ -416,6 +439,7 @@ Values are persisted to NVS and survive reboot.
 | POST   | `/zero`         | Back-compat alias for `/calibrate {"mode":"current"}`.        |
 | POST   | `/motors`       | Enable / disable steppers.                                    |
 | POST   | `/reboot`       | Restart firmware (200 first, reboot ~500 ms later).           |
+| POST   | `/ota`          | Firmware update: the body is the raw app image (`build/orbiter.bin`); reboots into it ([§10.1](#updating-over-wi-fi)). |
 | GET    | `/test/encoder` | Raw encoder reads — debugging.                                |
 | POST   | `/test/jog`     | Open-loop jog for stepper bring-up.                           |
 | WS     | `/ws/log`       | Streaming firmware events.                                    |
@@ -438,7 +462,7 @@ Values are persisted to NVS and survive reboot.
 
 **Move responses:** `200` reached, `408` timeout (motors keep going), `409` another move in progress, `400` EL out of range.
 
-**Arrival tolerance:** ± 1.0° on both axes (AS5600 step ≈ 0.088°, AS5048A step ≈ 0.022°, debounced over two readings).
+**Arrival tolerance:** ± 1.0° on both axes (AS5600 step ≈ 0.088° on both axes, debounced over two readings).
 
 **`/ws/log` frames:**
 
@@ -454,7 +478,7 @@ Up to 4 concurrent clients. Only operational events (`motion`, `http`, `encoder`
 - No homing routine — encoders are absolute.
 - No on-device storage of photos; no on-device web UI.
 
-Memory footprint at idle: ~720 KB flash, ~210 KB free heap. Comfortable on a stock ESP32 with 4 MB flash.
+Memory footprint at idle: ~720 KB flash, ~210 KB free heap. Comfortable on a stock ESP32 with 4 MB flash split into two 1.875 MiB OTA slots.
 
 ---
 
@@ -726,7 +750,7 @@ Each step is wrapped in `[PROFILE]` start/end markers with durations, so a slow 
 
 ### 14.4 How accurate are the priors?
 
-With a calliper-measured arm and the standard AS5600 / AS5048A encoder pair:
+With a calliper-measured arm and the standard AS5600 encoders:
 
 | Quantity                | Typical    |
 |-------------------------|------------|
@@ -765,10 +789,10 @@ docker compose --profile colmap run --rm colmap \
 
 | Symptom                                                  | Likely cause                                              | Fix                                                                              |
 |----------------------------------------------------------|-----------------------------------------------------------|----------------------------------------------------------------------------------|
-| Motors hum but don't move                                | Driver `EN` floating, or `STEP` not toggling.             | Probe with a scope. Check GPIO 32 wiring.                                        |
+| Motors hum but don't move                                | Driver `EN` floating, or `STEP` not toggling.             | Probe with a scope. Check the ENABLE wiring (GPIO 32 on the wired bench, 27 on Orbiter-Simple). |
 | Drivers get hot fast                                     | Current trimpot too high.                                 | Aim for ~70 % of rated motor current.                                            |
-| Reported AZ jumps randomly                               | Magnet not concentric, or stray field nearby.             | Move encoder away from motors; check AS5600 `MD/ML/MH` register.                 |
-| EL keeps spinning past `90°`                             | Encoder zero off, or magnet flipped.                      | Re-run calibration.                                                              |
+| Reported AZ or EL jumps randomly                         | Magnet not concentric, stray field nearby, or the sensor's `DIR` pin floating. | Move encoder away from motors; check AS5600 `MD/ML/MH` register; strap `DIR` to GND. |
+| EL keeps spinning past `90°`                             | Encoder zero off, magnet flipped, or EL sign reversed after a sensor swap. | Re-run calibration and check the EL sign ([§10.3](#103-first-run-encoder-calibration)). |
 | Belts squeal                                             | Too tight.                                                | Loosen tensioner.                                                                |
 | Stepper skips at speed                                   | Too fast for current setting.                             | Reduce `rate_deg_per_s` or increase driver current.                              |
 | `sfm_priors.json missing` (COLMAP)                       | Priors weren't exported.                                  | UI → Library → session → Export → SfM priors.                                    |

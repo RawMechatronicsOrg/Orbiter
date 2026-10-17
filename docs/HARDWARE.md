@@ -14,7 +14,7 @@ The electronics side is below.
 | MCU | ESP32 dev board | ESP32-D0WD-V3 (rev 3.1), 4 MB flash | Any ESP32 with Wi-Fi (ESP32-WROOM, ESP32-S3 — pin map will shift) |
 | Motor driver × 2 | A4988 stepper driver carrier | Generic Pololu-style clone | DRV8825 (same footprint, swap microstep table). TMC2208/2209 if you want quiet — wire the same `STEP/DIR/EN`, ignore UART for now. |
 | Stepper × 2 | NEMA-17, 24 mm body | 1.8°/step (200 steps/rev) | Any NEMA-17 that fits the motor mounts; another step angle changes only the step rate per output degree (see [Motion math](#motion-math)). |
-| Encoder × 2 | AS5600 magnetic angle sensor module | 12-bit, I2C @ 0x36 | AS5048B (I2C, 14-bit) for more resolution. |
+| Encoder × 2 | AS5600 magnetic angle sensor module | 12-bit, I2C @ 0x36 | AS5048B (I2C, 14-bit) for more resolution — it would need a driver; the firmware talks to the AS5600 only. |
 | Encoder magnets × 2 | Diametrically magnetised disc | — | Anything diametric. It sits in a printed `HexPlug` in the end of the azimuth spindle and of the elevation shaft, facing the sensor. |
 | Belts | GT2 closed loop, 6 mm wide | 280 mm on azimuth | Elevation: the model does not name a length; at the modelled centre distance (69.6 mm) the loop is about 347 mm. |
 | Pulleys | GT2 16-tooth on the motors; printed 112-tooth (AZ) and 160-tooth (EL) | 7 : 1 on azimuth, 10 : 1 on elevation | The printed pulleys sit on splines, so another tooth count is a reprint (`ReplacablePulley` on EL). |
@@ -51,41 +51,55 @@ Numbers are GPIO numbers (not silkscreen).
 
 ### Steppers (A4988)
 
-| Signal | GPIO | Notes |
-|--------|------|-------|
-| Stepper 1 STEP (AZ) | 25 | |
-| Stepper 1 DIR (AZ) | 26 | |
-| Stepper 2 STEP (EL) | 27 | |
-| Stepper 2 DIR (EL) | 33 | Was originally 14 — moved off JTAG MTMS pin (floated to ~0.9 V at boot and clocked phantom steps). Keep clear of strapping/JTAG pins on your dev board. |
-| ENABLE (shared) | 32 | Active LOW. Wire to both drivers in parallel. |
-| MS1 / MS2 / MS3 | tied to 3.3 V | 1/16 microstepping on both drivers. Pull-up to VCC, no MCU control needed. |
+The firmware drives one of two stepper wirings, chosen at build time in
+`idf.py menuconfig` → Orbiter Configuration → **Board wiring**:
+
+- `ORBITER_BOARD_WIRED` (default) — the jumper-wire bench: A4988 carriers
+  on jumper wires.
+- `ORBITER_BOARD_SIMPLE` — the Orbiter-Simple carrier PCB.
+
+| Signal | `ORBITER_BOARD_WIRED` | `ORBITER_BOARD_SIMPLE` | Notes |
+|--------|----------------------:|-----------------------:|-------|
+| Stepper 1 STEP (AZ) | 25 | 26 | |
+| Stepper 1 DIR (AZ) | 26 | 25 | |
+| Stepper 2 STEP (EL) | 27 | 18 | |
+| Stepper 2 DIR (EL) | 33 | 19 | On the wired bench it was originally 14 — moved off JTAG MTMS pin (floated to ~0.9 V at boot and clocked phantom steps). Keep clear of strapping/JTAG pins on your dev board. |
+| ENABLE (shared) | 32 | 27 | Active LOW. Wire to both drivers in parallel. |
+
+The firmware does not drive MS1 / MS2 / MS3. On the wired bench they are
+tied to 3.3 V for 1/16 microstepping on both drivers (pull-up to VCC).
+
+On `ORBITER_BOARD_SIMPLE` the carrier's load outputs OUT A–D (GPIO 12, 2, 5,
+17) and the DSLR remote FOCUS / SHUTTER (GPIO 32, 33) are driven low at
+boot, before anything else, so a floating input cannot switch a 12 V load
+or trip the camera. The firmware does not use them otherwise. On the wired
+bench GPIO 32 / 33 are ENABLE and EL DIR, so this is not done there.
 
 ### Encoders
 
-The v2 mechanics carry an AS5600 on both axes. The firmware still drives
-the elevation encoder as an AS5048A over SPI, so until that changes the
-elevation sensor is wired as below.
+The v2 mechanics carry an AS5600 on both axes, and the firmware reads both.
+The AS5600's I2C address is fixed at 0x36, so each sensor sits on its own
+I2C bus. The pins are the same on both stepper wirings. Both sensors are
+12-bit (4096 counts per turn, 0.088° per count).
 
 **AZ — AS5600 (I2C @ 400 kHz, address 0x36 fixed)**
 
 | Signal | GPIO | Notes |
 |--------|------|-------|
-| SDA | 21 | 4.7 kΩ pull-up to 3.3 V (often already on breakout). |
-| SCL | 22 | 4.7 kΩ pull-up to 3.3 V. |
-| DIR | GND | Tie low for CCW = increasing angle. Flip to VCC to invert. |
+| SDA | 22 | 4.7 kΩ pull-up to 3.3 V (often already on breakout). |
+| SCL | 23 | 4.7 kΩ pull-up to 3.3 V. |
+| DIR | GND | On the sensor board, not an ESP32 pin. Strap it to GND — a floating DIR makes the angle jump. |
 
-**EL — AS5048A (SPI Mode 1, manual chip select)** — what the firmware reads today
+**EL — AS5600 (I2C @ 400 kHz, address 0x36 fixed, second bus)**
 
 | Signal | GPIO | Notes |
 |--------|------|-------|
-| CLK  | 18 | |
-| MISO | 19 | |
-| MOSI | 23 | The chip uses MOSI to receive read commands — don't omit it. |
-| CS   | 17 | Manual GPIO (we don't use the SPI peripheral's hardware CS). |
+| SDA | 4 | 4.7 kΩ pull-up to 3.3 V (often already on breakout). |
+| SCL | 16 | 4.7 kΩ pull-up to 3.3 V. |
+| DIR | GND | Same as on AZ: strap it to GND. |
 
-> `GPIO 5` is free on this board (it was the chip-select for an older
-> AS5048A on AZ that's been replaced with AS5600). You can use it for an
-> LED, a button, anything.
+After swapping the EL sensor, re-calibrate the EL zero and check the EL
+sign on the rig (see [Firmware](FIRMWARE.md#first-run-encoder-calibration)).
 
 ## Motion math
 
@@ -125,15 +139,17 @@ slower.
                   ENA─┴────────┴──32  (ESP32)
                         │      │
                     motor1   motor2
-                    
-       AS5600  AS5048A (firmware EL driver; v2 mounts an AS5600)
-        SDA─21  CLK─18
-        SCL─22  MISO─19
-                MOSI─23
-                CS  ─17
-                
+
+       AS5600 (AZ)      AS5600 (EL)
+        SDA─22           SDA─4
+        SCL─23           SCL─16
+        DIR─GND          DIR─GND
+
        USB ── ESP32 ── Wi-Fi to your network
 ```
+
+The stepper pins above are `ORBITER_BOARD_WIRED`; for the Orbiter-Simple
+carrier use the table in [Steppers](#steppers-a4988).
 
 The ESP32 board can be powered over USB during bench tests. For headless
 running, feed `Vin` from the same 12 V rail through a small step-down
@@ -160,4 +176,6 @@ it is concentric with the axis by construction. The sensors sit on a printed
 plug.
 
 If the AS5600 reports unstable angles, check the gap and the centring. The
-`MD/ML/MH` register will tell you if the magnet field is in spec.
+`MD/ML/MH` register will tell you if the magnet field is in spec. Also check
+that the sensor's own `DIR` pin is strapped to GND: left floating, the angle
+register jumps erratically.

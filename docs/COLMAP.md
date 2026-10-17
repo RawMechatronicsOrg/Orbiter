@@ -118,7 +118,7 @@ colmap stereo_fusion        --workspace_path dense/ \
 
 It depends on how carefully you measured `arm_radius`, `base_height`,
 `camera_offset` and how accurate your encoders are. A reasonable build
-with a calliper-measured arm and AS5600 + AS5048A encoders should give:
+with a calliper-measured arm and AS5600 encoders should give:
 
 | Quantity | Typical |
 |----------|---------|
