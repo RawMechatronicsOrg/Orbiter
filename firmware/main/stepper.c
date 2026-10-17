@@ -1,4 +1,5 @@
 #include "stepper.h"
+#include "sdkconfig.h"
 #include "driver/gpio.h"
 #include "esp_timer.h"
 #include "esp_log.h"
@@ -7,12 +8,20 @@
 
 static const char *TAG = "stepper";
 
-/* ── Pin definitions ────────────────────────────────────────────────────── */
+/* ── Pin definitions (menuconfig → Orbiter Configuration → Board wiring) ── */
+#if CONFIG_ORBITER_BOARD_SIMPLE
+#define GPIO_STEP_AZ   26
+#define GPIO_DIR_AZ    25
+#define GPIO_STEP_EL   18
+#define GPIO_DIR_EL    19
+#define GPIO_ENABLE    27   /* active LOW, shared between both drivers */
+#else   /* wired bench, docs/HARDWARE.md */
 #define GPIO_STEP_AZ   25
 #define GPIO_DIR_AZ    26
 #define GPIO_STEP_EL   27
 #define GPIO_DIR_EL    33   /* was GPIO14 (JTAG MTMS) — caused DIR floating at ~0.9V */
 #define GPIO_ENABLE    32   /* active LOW, shared between both drivers */
+#endif
 
 /* ── Per-axis context ───────────────────────────────────────────────────── */
 typedef struct {

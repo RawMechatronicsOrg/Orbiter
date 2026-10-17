@@ -9,22 +9,18 @@ typedef enum {
 } enc_axis_t;
 
 /**
- * Initialise both buses and devices:
- *   ENC_AZ → AS5600 over I2C (SDA=21, SCL=22, addr 0x36, 12-bit)
- *   ENC_EL → AS5048A over SPI (CLK=18, MISO=19, MOSI=23, CS=17, 14-bit)
+ * Initialise both buses and devices (Orbiter-Simple carrier, J3/J4):
+ *   ENC_AZ → AS5600 on I2C0 (SDA=22, SCL=23, addr 0x36, 12-bit)
+ *   ENC_EL → AS5600 on I2C1 (SDA=4,  SCL=16, addr 0x36, 12-bit)
  *
  * Must be called before encoder_read_*.
  */
 esp_err_t encoder_init(void);
 
 /**
- * Read native-resolution raw angle.
- *
- *   ENC_AZ → 12-bit (0..4095)  — AS5600 ANGLE register, 360 / 4096 deg/count
- *   ENC_EL → 14-bit (0..16383) — AS5048A angle, 360 / 16384 deg/count
- *
- * Callers MUST NOT assume a common bit width; use encoder_read_angle for
- * canonical degrees. Returns ESP_FAIL on bad parity/EF (EL) or I2C error (AZ).
+ * Read the raw angle: 12-bit (0..4095) on both axes — AS5600 ANGLE register,
+ * 360 / 4096 deg/count. Use encoder_read_angle for canonical degrees.
+ * Returns an I2C error code when the sensor does not answer.
  */
 esp_err_t encoder_read_raw(enc_axis_t axis, uint16_t *out_raw);
 
@@ -34,13 +30,7 @@ esp_err_t encoder_read_raw(enc_axis_t axis, uint16_t *out_raw);
 esp_err_t encoder_read_angle(enc_axis_t axis, float *out_deg);
 
 /**
- * Read communication / sanity flags.
- *
- *   ENC_EL (AS5048A error reg 0x0001):
- *     bit0 = framing error  bit1 = invalid command  bit2 = parity error
- *     Reading the register CLEARS all three flags.
- *
- *   ENC_AZ (AS5600 STATUS reg 0x0B re-mapped):
+ * Read magnet sanity flags (AS5600 STATUS reg 0x0B re-mapped), both axes:
  *     bit0 = magnet missing (!MD)
  *     bit1 = magnet too weak (ML)
  *     bit2 = magnet too strong (MH)
@@ -50,13 +40,10 @@ esp_err_t encoder_read_angle(enc_axis_t axis, float *out_deg);
 esp_err_t encoder_read_errors(enc_axis_t axis, uint8_t *out_flags);
 
 /**
- * Read diagnostic registers and log a one-line summary.
- *
- *   ENC_EL: AS5048A reg 0x3FFD — AGC, COMP_H/L, COF, OCF.
- *   ENC_AZ: AS5600 STATUS/AGC/MAGNITUDE — MD/ML/MH + agc 0..255 + magnitude.
+ * Read diagnostic registers and log a one-line summary:
+ * AS5600 STATUS/AGC/MAGNITUDE — MD/ML/MH + agc 0..255 + magnitude.
  *
  * Does not affect normal angle reading. Verbose per-frame trace via menuconfig
- *   "Orbiter Configuration" → ORBITER_ENCODER_SPI_TRACE (AS5048A)
- *                          → ORBITER_AS5600_I2C_TRACE  (AS5600)
+ *   "Orbiter Configuration" → ORBITER_AS5600_I2C_TRACE
  */
 esp_err_t encoder_read_diag(enc_axis_t axis);

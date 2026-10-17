@@ -2,6 +2,7 @@
  * Orbiter — main entry point
  *
  * Boot sequence:
+ *   0. Carrier load outputs driven low
  *   1. NVS init
  *   2. WiFi STA connect
  *   3. Motion controller init (steppers + encoders)
@@ -23,6 +24,8 @@
 #include "esp_timer.h"
 #include "nvs_flash.h"
 #include "mdns.h"
+#include "driver/gpio.h"
+#include "esp_ota_ops.h"
 
 static const char *TAG = "orbiter";
 
@@ -183,7 +186,7 @@ static void start_http_server(void)
     httpd_config_t config  = HTTPD_DEFAULT_CONFIG();
     config.server_port     = CONFIG_ORBITER_HTTP_PORT;
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 26;   /* default is 8, we now have 21 routes + /ws/log */
+    config.max_uri_handlers = 27;   /* default is 8, we now have 20 routes + /ws/log */
 
     /*
      * UI polls /state every 250 ms and browsers (Firefox/Chrome) tend to
@@ -225,6 +228,7 @@ static void start_http_server(void)
         { .uri = "/spin/stop",    .method = HTTP_OPTIONS, .handler = handler_options      },
         { .uri = "/reboot",       .method = HTTP_POST,    .handler = handler_reboot       },
         { .uri = "/reboot",       .method = HTTP_OPTIONS, .handler = handler_options      },
+        { .uri = "/ota",          .method = HTTP_POST,    .handler = handler_ota          },
         { .uri = "/test/encoder", .method = HTTP_GET,     .handler = handler_test_encoder },
         { .uri = "/test/jog",     .method = HTTP_POST,    .handler = handler_test_jog     },
         { .uri = "/test/jog",     .method = HTTP_OPTIONS, .handler = handler_options      },
@@ -240,10 +244,85 @@ static void start_http_server(void)
     LOGX_EMIT_I(TAG, "HTTP server ready on port %d (+ /ws/log)", config.server_port);
 }
 
+/* ── Carrier outputs ────────────────────────────────────────────────────── */
+
+/*
+ * Orbiter-Simple load outputs: power switches OUT A–D (TC4427A gate drivers on
+ * GPIO12/2/5/17) and the DSLR remote's FOCUS/SHUTTER optocouplers (GPIO32/33).
+ * The firmware does not use them yet, but a floating input could switch a
+ * 12 V load or trip the camera, so they are driven low before anything else.
+ * Only on that board: on the wired bench 32/33 are the stepper ENABLE and
+ * EL DIR, and pulling ENABLE low would power the drivers at boot.
+ */
+static void carrier_outputs_off(void)
+{
+#if CONFIG_ORBITER_BOARD_SIMPLE
+    const uint64_t mask =
+        (1ULL << 12) | (1ULL << 2) | (1ULL << 5) | (1ULL << 17) |  /* OUT A–D */
+        (1ULL << 32) | (1ULL << 33);                               /* FOCUS, SHUTTER */
+    gpio_config_t io = {
+        .pin_bit_mask = mask,
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    for (int pin = 0; pin < 40; pin++) {
+        if (mask & (1ULL << pin)) gpio_set_level(pin, 0);
+    }
+    gpio_config(&io);
+#endif
+}
+
+/* ── OTA confirmation ───────────────────────────────────────────────────── */
+
+/*
+ * An image written by POST /ota boots in PENDING_VERIFY. It is confirmed once
+ * the HTTP server is up — the point from which the next update can reach it.
+ * The Wi-Fi join never gives up, so a bad build would otherwise sit there
+ * forever: a watchdog timer rolls back to the previous image if confirmation
+ * has not happened within OTA_CONFIRM_TIMEOUT_S.
+ */
+#define OTA_CONFIRM_TIMEOUT_S 120
+
+static esp_timer_handle_t s_ota_watchdog;
+
+static bool ota_pending_verify(void)
+{
+    esp_ota_img_states_t st;
+    return esp_ota_get_state_partition(esp_ota_get_running_partition(), &st) == ESP_OK &&
+           st == ESP_OTA_IMG_PENDING_VERIFY;
+}
+
+static void ota_watchdog_cb(void *arg)
+{
+    (void)arg;
+    ESP_LOGE(TAG, "OTA image not confirmed in %d s — rolling back", OTA_CONFIRM_TIMEOUT_S);
+    esp_ota_mark_app_invalid_rollback_and_reboot();
+}
+
+static void ota_confirm_arm(void)
+{
+    if (!ota_pending_verify()) return;
+    const esp_timer_create_args_t args = { .callback = ota_watchdog_cb, .name = "ota_wd" };
+    if (esp_timer_create(&args, &s_ota_watchdog) == ESP_OK)
+        esp_timer_start_once(s_ota_watchdog, OTA_CONFIRM_TIMEOUT_S * 1000000ULL);
+    ESP_LOGW(TAG, "new OTA image — confirming once the HTTP server is up");
+}
+
+static void ota_confirm(void)
+{
+    if (!ota_pending_verify()) return;
+    if (s_ota_watchdog) esp_timer_stop(s_ota_watchdog);
+    esp_ota_mark_app_valid_cancel_rollback();
+    LOGX_EMIT_I(TAG, "OTA image confirmed");
+}
+
 /* ── Entry point ────────────────────────────────────────────────────────── */
 
 void app_main(void)
 {
+    carrier_outputs_off();
     log_bus_init();
     ESP_LOGI(TAG, "=== Orbiter v0.2 starting ===");
 
@@ -254,10 +333,12 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    ota_confirm_arm();
     wifi_init_sta();
     start_mdns();
     motion_init();
     motion_runner_init();
     start_http_server();
+    ota_confirm();
     LOGX_EMIT_I(TAG, "Orbiter ready");
 }

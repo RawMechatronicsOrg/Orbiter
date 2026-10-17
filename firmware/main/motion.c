@@ -127,9 +127,11 @@ static float az_user_from_raw(float raw)
  * Elevation: bounded signed, user-space in (-180, +180] (then range-validated
  * to [-36, +90] at HTTP layer). See COORDINATES.md §3.2, §4.1.
  *
- * The AS5048A on EL is mounted such that raising the arm DECREASES raw
+ * The EL sensor is mounted such that raising the arm DECREASES raw
  * reading (opposite of AZ). We negate the (raw - zero) term so user_el
- * follows the conventional "+ = up" sense.
+ * follows the conventional "+ = up" sense. This held for the AS5048A; the
+ * AS5600 that replaced it reverses with its DIR strap and magnet side, so
+ * check the sign on the rig after swapping sensors.
  */
 static float el_user_from_raw(float raw)
 {
