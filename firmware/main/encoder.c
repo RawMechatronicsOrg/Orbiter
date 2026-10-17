@@ -217,6 +217,25 @@ void encoder_line_levels(enc_axis_t axis, int *sda, int *scl, int *ext_pullups)
     if (ext_pullups) *ext_pullups = s ? s->idle_ext_pullups : -1;
 }
 
+esp_err_t encoder_read_magnet(enc_axis_t axis, enc_magnet_t *out)
+{
+    as5600_t *s = enc_for(axis);
+    if (!out || !s) return ESP_ERR_INVALID_ARG;
+    uint8_t  st = 0, agc = 0;
+    uint16_t mag = 0;
+    enc_io_lock();
+    esp_err_t ret = as5600_read_status(s, &st, &agc, &mag);
+    enc_io_unlock();
+    if (ret != ESP_OK) return ret;
+    /* Per AS5600 datasheet v1-06 p.21: MD=bit5, ML=bit4, MH=bit3. */
+    out->detected   = (st >> 5) & 1;
+    out->too_weak   = (st >> 4) & 1;
+    out->too_strong = (st >> 3) & 1;
+    out->agc        = agc;
+    out->magnitude  = mag;
+    return ESP_OK;
+}
+
 esp_err_t encoder_read_angle(enc_axis_t axis, float *out_deg)
 {
     as5600_t *s = enc_for(axis);

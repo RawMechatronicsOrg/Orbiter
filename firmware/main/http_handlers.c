@@ -610,66 +610,50 @@ esp_err_t handler_ota(httpd_req_t *req)
 
 /* ── GET /test/encoder ──────────────────────────────────────────────────── */
 
+/*
+ * One axis as JSON: whether the sensor answers, its raw 12-bit angle, the
+ * magnet field (detected / too weak / too strong, AGC, magnitude) and the bus
+ * line levels found at boot. Everything a wiring or magnet problem needs,
+ * without a serial cable.
+ */
+static void encoder_axis_json(enc_axis_t axis, const char *name, char *out, size_t len)
+{
+    int sda, scl, pu;
+    encoder_line_levels(axis, &sda, &scl, &pu);
+
+    char angle[64];
+    uint16_t raw;
+    bool ok = encoder_read_raw(axis, &raw) == ESP_OK;
+    if (ok) {
+        snprintf(angle, sizeof(angle), "\"raw\":%u,\"angle_deg\":%.3f,",
+                 raw, (double)raw * (360.0 / 4096.0));
+    } else {
+        angle[0] = '\0';
+    }
+
+    char magnet[160];
+    enc_magnet_t m;
+    if (encoder_read_magnet(axis, &m) == ESP_OK) {
+        snprintf(magnet, sizeof(magnet),
+                 "\"magnet_missing\":%d,\"magnet_weak\":%d,\"magnet_strong\":%d,"
+                 "\"agc\":%u,\"magnitude\":%u,",
+                 !m.detected, m.too_weak, m.too_strong, m.agc, m.magnitude);
+    } else {
+        magnet[0] = '\0';
+    }
+
+    snprintf(out, len,
+             "\"%s\":{\"ok\":%s,%s%s\"lines\":{\"sda\":%d,\"scl\":%d,\"external_pullups\":%d}}",
+             name, ok ? "true" : "false", angle, magnet, sda, scl, pu);
+    if (!ok) ESP_LOGW(TAG, "encoder %s: read failed", name);
+}
+
 esp_err_t handler_test_encoder(httpd_req_t *req)
 {
-    /* Sizes account for the extended AZ error JSON (magnet_* synonyms). */
-    char buf[640];
-    char az_part[240], el_part[240];
-    char az_lines[64], el_lines[64];
-    {
-        int sda, scl, pu;
-        encoder_line_levels(ENC_AZ, &sda, &scl, &pu);
-        snprintf(az_lines, sizeof(az_lines),
-                 "\"lines\":{\"sda\":%d,\"scl\":%d,\"external_pullups\":%d}", sda, scl, pu);
-        encoder_line_levels(ENC_EL, &sda, &scl, &pu);
-        snprintf(el_lines, sizeof(el_lines),
-                 "\"lines\":{\"sda\":%d,\"scl\":%d,\"external_pullups\":%d}", sda, scl, pu);
-    }
-
-    uint16_t raw; float deg;
-
-    /* ── Azimuth encoder (AS5600 over I2C, 12-bit) ── */
-    if (encoder_read_raw(ENC_AZ, &raw) == ESP_OK) {
-        deg = (float)raw * (360.0f / 4096.0f);
-        snprintf(az_part, sizeof(az_part),
-                 "\"azimuth\":{\"ok\":true,\"raw\":%u,\"angle_deg\":%.3f,%s}",
-                 raw, (double)deg, az_lines);
-        ESP_LOGI(TAG, "encoder AZ: raw=%u angle=%.3f", raw, (double)deg);
-    } else {
-        uint8_t flags = 0;
-        encoder_read_errors(ENC_AZ, &flags);
-        encoder_read_diag(ENC_AZ);
-        /* For AS5600 the legacy fields carry magnet status (see encoder.h):
-         *   bit0 = magnet missing, bit1 = too weak, bit2 = too strong.
-         * Expose synonyms alongside legacy frerr/invcmd/parity. */
-        snprintf(az_part, sizeof(az_part),
-                 "\"azimuth\":{\"ok\":false,\"frerr\":%d,\"invcmd\":%d,\"parity\":%d,"
-                 "\"magnet_missing\":%d,\"magnet_weak\":%d,\"magnet_strong\":%d,%s}",
-                 (flags >> 0) & 1, (flags >> 1) & 1, (flags >> 2) & 1,
-                 (flags >> 0) & 1, (flags >> 1) & 1, (flags >> 2) & 1, az_lines);
-        ESP_LOGW(TAG, "encoder AZ: read failed");
-    }
-
-    /* ── Elevation encoder (AS5600 over I2C, 12-bit) ── */
-    if (encoder_read_raw(ENC_EL, &raw) == ESP_OK) {
-        deg = (float)raw * (360.0f / 4096.0f);
-        snprintf(el_part, sizeof(el_part),
-                 "\"elevation\":{\"ok\":true,\"raw\":%u,\"angle_deg\":%.3f,%s}",
-                 raw, (double)deg, el_lines);
-        ESP_LOGI(TAG, "encoder EL: raw=%u angle=%.3f", raw, (double)deg);
-    } else {
-        uint8_t flags = 0;
-        encoder_read_errors(ENC_EL, &flags);
-        encoder_read_diag(ENC_EL);
-        snprintf(el_part, sizeof(el_part),
-                 "\"elevation\":{\"ok\":false,\"frerr\":%d,\"invcmd\":%d,\"parity\":%d,"
-                 "\"magnet_missing\":%d,\"magnet_weak\":%d,\"magnet_strong\":%d,%s}",
-                 (flags >> 0) & 1, (flags >> 1) & 1, (flags >> 2) & 1,
-                 (flags >> 0) & 1, (flags >> 1) & 1, (flags >> 2) & 1, el_lines);
-        ESP_LOGW(TAG, "encoder EL: read failed");
-    }
-
-    snprintf(buf, sizeof(buf), "{%s,%s}", az_part, el_part);
+    char az[300], el[300], buf[640];
+    encoder_axis_json(ENC_AZ, "azimuth", az, sizeof(az));
+    encoder_axis_json(ENC_EL, "elevation", el, sizeof(el));
+    snprintf(buf, sizeof(buf), "{%s,%s}", az, el);
     return send_json(req, buf, 200);
 }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include <stdbool.h>
 #include <stdint.h>
 
 typedef enum {
@@ -55,3 +56,17 @@ esp_err_t encoder_read_diag(enc_axis_t axis);
  * an encoder that never answers.
  */
 void encoder_line_levels(enc_axis_t axis, int *sda, int *scl, int *ext_pullups);
+
+/** Magnet field as the AS5600 sees it (STATUS, AGC, MAGNITUDE registers). */
+typedef struct {
+    bool     detected;     /* MD */
+    bool     too_weak;     /* ML — AGC at its maximum */
+    bool     too_strong;   /* MH — AGC at its minimum */
+    uint8_t  agc;          /* automatic gain: 0..128 at 3V3, 0..255 at 5V;
+                              mid-range (~64 at 3V3) is the sweet spot,
+                              higher = magnet further away */
+    uint16_t magnitude;    /* CORDIC field magnitude, 12-bit */
+} enc_magnet_t;
+
+/** Read the axis's magnet field. Fails when the sensor does not answer. */
+esp_err_t encoder_read_magnet(enc_axis_t axis, enc_magnet_t *out);
