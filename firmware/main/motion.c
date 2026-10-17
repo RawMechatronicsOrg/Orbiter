@@ -23,10 +23,6 @@ static const char *TAG = "motion";
 #define CAL_DEFAULT_AZ_RAW  0.0f
 #define CAL_DEFAULT_EL_RAW  138.296f
 
-/* Elevation physical limits — enforced by HTTP layer; documented here for clarity. */
-#define EL_MIN_DEG          (-36.0f)
-#define EL_MAX_DEG          ( 90.0f)
-
 /* ── Closed-loop position control ────────────────────────────────────────────
  *
  * `motion_move` is a velocity-mode P-controller. Each control tick reads the
@@ -44,6 +40,11 @@ static const char *TAG = "motion";
  * Tuning: CL_KP_* / CL_HZ_SLEW / CL_HZ_MAX_* are the knobs. Larger Kp = more
  * aggressive approach; CL_HZ_SLEW caps acceleration (prevents cold-start
  * stall); CL_HZ_MAX_* is the per-axis top speed. Adjust on real hardware.
+ *
+ * All rates are driver step rates (1/16 microstep). On the v2 mechanics
+ * (1.8° motors, GT2 16T → 112T on AZ = 7:1, 16T → 160T on EL = 10:1) one
+ * output degree is 62.2 microsteps on AZ and 88.9 on EL, so the default caps
+ * below are about 33.8 °/s on AZ and 3.9 °/s on EL.
  */
 #define CL_TICK_MS          12      /* control period — ~83 Hz loop          */
 #define CL_TOL_DEG          0.15f   /* arrival tolerance                      */
@@ -125,7 +126,8 @@ static float az_user_from_raw(float raw)
 
 /**
  * Elevation: bounded signed, user-space in (-180, +180] (then range-validated
- * to [-36, +90] at HTTP layer). See COORDINATES.md §3.2, §4.1.
+ * to [MOTION_EL_MIN_DEG, MOTION_EL_MAX_DEG] at HTTP layer). See COORDINATES.md
+ * §3.2, §4.1.
  *
  * The AS5048A on EL is mounted such that raising the arm DECREASES raw
  * reading (opposite of AZ). We negate the (raw - zero) term so user_el

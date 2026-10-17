@@ -1,5 +1,11 @@
 # Assembly
 
+> **This sketch is for the v1 rig** (printed frames, 608 bearings, 1:10
+> belts — [`cad/`](../cad/README.md)). The current v2 mechanics have no
+> assembly guide or print profile yet: the order of operations is in the
+> [README, §9](../README.md#9-assembly), the parts and the section view in
+> [`cad/v2`](../cad/v2/README.md).
+
 This is a sketch, not a step-by-step manual. The CAD geometry is the
 source of truth — open [`cad/assembly/Orbiter.glb`](../cad/assembly/Orbiter.glb)
 in Blender / Meshlab / your slicer and you'll see how the pieces fit.

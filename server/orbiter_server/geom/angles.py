@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import math
 
-# Physical elevation travel range, degrees. Mirrors the firmware limits.
-EL_MIN = -36.0
+# Physical elevation travel range, degrees. Mirrors the firmware limits
+# (CONFIG_ORBITER_EL_MIN_DEG / _MAX_DEG): the v2 orbit arm meets the cross rail
+# at about -28.8°, so -25 leaves a margin.
+EL_MIN = -25.0
 EL_MAX = 90.0
 
 

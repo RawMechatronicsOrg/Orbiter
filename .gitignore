@@ -57,7 +57,7 @@ dist/
 colmap/masks/models/
 
 # ── Server-local dev artifacts ───────────────────────────────────────────
-# rig_model.py resolves the rig GLB from cad/assembly/Orbiter.glb (canonical)
+# rig_model.py resolves the rig GLB from cad/v2/assembly/Orbiter.glb (canonical)
 # with server/Orbiter.glb as an optional local override — never commit the
 # copy.
 server/Orbiter.glb

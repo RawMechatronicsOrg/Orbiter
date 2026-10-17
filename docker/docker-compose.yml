@@ -19,10 +19,10 @@ services:
       - ./data:/data
       # The CAD export is the source of truth for the rig geometry, but the
       # server image ships only orbiter_server/ — rig_model's "repo checkout"
-      # candidate resolves to /cad/assembly/Orbiter.glb inside the container,
+      # candidate resolves to /cad/v2/assembly/Orbiter.glb inside the container,
       # which does not exist. Mount it read-only and point at it explicitly
       # rather than relying on that path arithmetic.
-      - ../cad/assembly:/opt/orbiter/cad:ro
+      - ../cad/v2/assembly:/opt/orbiter/cad:ro
     environment:
       ORBITER_STORAGE_DIR: /data
       ORBITER_RIG_GLB: /opt/orbiter/cad/Orbiter.glb

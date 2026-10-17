@@ -82,6 +82,16 @@ measure on your physical machine and enter in the UI. They live in the
 session and get persisted into each scan's `manifest.json` so the data is
 self-contained.
 
+The 3D viewer draws the machine from the v2 CAD,
+[`cad/v2/assembly/Orbiter.glb`](../cad/v2/assembly), which the server loads
+too (`geom/rig_model.py`). Its frame has the azimuth axis on the origin and
+the machine standing on `z = 0`; the elevation axis runs along its `X` at
+`z = 127.18 mm` and crosses the azimuth axis there. The pose math above is
+anchored at that crossing, turned 90° about `Z` so its `+X` (the arm at
+`az = el = 0`) lands on the CAD arm, which points along `+Y`. The two GLB
+nodes `ORB_ROTOR_base` and `ORB_ROTOR_elevation` carry the pivots; the
+server spins their subtrees with the live angles.
+
 ## Data model — a scan session
 
 A **scan session** is one JSON document on disk (`scans/<id>/manifest.json`):

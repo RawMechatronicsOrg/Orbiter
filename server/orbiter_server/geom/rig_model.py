@@ -2,21 +2,28 @@
 
 PROJECT RULE: any 3D-geometric query lives here, not on the frontend.
 
-`Orbiter.glb` (generated once from `Orbiter.fbx` via `tools/fbx_to_glb.py`)
-is the source of truth for the physical assembly. This module:
+`Orbiter.glb` is the source of truth for the physical assembly: the v2
+mechanics, exported from the Fusion model's Blender scene by
+`cad/v2/export_glb.py` into `cad/v2/assembly/`. Its rig nodes:
+
+- `ORB_ROTOR_base` — origin on the azimuth axis (world Z), parent of
+  everything that turns with the platform.
+- `ORB_ROTOR_elevation` — origin on the elevation axis (world X), parent of
+  the shaft, its pulley, the bar insert and the orbit arm.
+- Parts are named after their Fusion occurrence
+  (`BottomBody:1 / BasePlatformInsert Taper:1`, `OrbitArm:1`, ...).
+
+This module:
 
 - Loads the GLB once (`trimesh.load`, cached at module level).
-- Walks the scene graph by true parent → child edges (so 'BasePulley:1'
-  and 'BasePulley:2' stay disjoint; an earlier `startswith` shortcut on
-  the frontend lumped both pulleys into one giant AABB).
-- Bakes the GLB-side Blender→glTF transform (`× 0.001 × rotX(+π/2)`,
-  meters + Y-up) AND the viewer-side Y-up→Z-up conversion
-  (`(x,y,z)→(x,-z,y)`) AND a uniform `× 1000` so the returned numbers
-  are millimetres in our Z-up world — the same unit space the front-end
-  sees after loading Orbiter.fbx with scale 1.0 and `rotation.x = +π/2`.
+- Walks the scene graph by true parent → child edges, so a rotor's subtree
+  is exactly the parts that turn with it.
+- Bakes the glTF Y-up → our Z-up conversion (`(x,y,z)→(x,-z,y)`) and a
+  uniform `× 1000` (glTF metres → mm) — the same space the front-end sees
+  after loading the GLB with scale 1000 and `rotation.x = +π/2`.
 
-Result: `RigModel.part_aabb('BasePulley:2')` gives the millimetre AABB
-of the azimuthal pulley as it appears in the running viewer. The server
+Result: `RigModel.node_origin('ORB_ROTOR_elevation')` is a millimetre
+point on the elevation axis as it appears in the running viewer. The server
 can therefore compute pivot points, anchor frames, kinematic chain
 lengths etc. without round-tripping through the browser.
 """
@@ -42,7 +49,7 @@ _THREE_RESERVED = re.compile(r"[\[\].:/]")
 
 
 def to_three_name(name: str) -> str:
-    """`BasePulley:2` → `BasePulley2`, `Orbiter v38` → `Orbiter_v38`."""
+    """`OrbitArm:1` → `OrbitArm1`, `BottomBody:1 / HexPlug:2` → `BottomBody1__HexPlug2`."""
     return _THREE_RESERVED.sub("", name.replace(" ", "_"))
 
 # Y-up GLB → our Z-up world: (x, y, z) → (x, -z, y). Plus a scalar ×1000
@@ -100,6 +107,9 @@ class RigModel:
             # trimesh emits [parent, child, attrs]
             parent, child = edge[0], edge[1]
             self._children.setdefault(parent, []).append(child)
+        # The rig is static (rest pose), so per-node vertex sets never change;
+        # the scene builder queries the same few nodes on every rebuild.
+        self._vertex_cache: dict[str, np.ndarray | None] = {}
 
     # ── public API ──────────────────────────────────────────────────────
 
@@ -107,28 +117,23 @@ class RigModel:
         """All named scene-graph nodes (component instances + intermediates)."""
         return sorted(self.scene.graph.nodes)
 
+    def node_origin(self, name: str) -> tuple[float, float, float] | None:
+        """World-mm position of node `name`'s own origin — for a rotor empty,
+        a point on its axis. None if the node doesn't exist."""
+        if name not in self.scene.graph.nodes:
+            return None
+        world_T, _ = self.scene.graph[name]
+        origin = _GLB_TO_WORLD_MM @ np.asarray(world_T, dtype=np.float64)
+        return tuple(origin[:3, 3].tolist())
+
     def part_aabb(self, name: str) -> PartAABB | None:
         """World-mm AABB of every mesh descendant of `name`, unioned.
         Returns None if `name` doesn't exist or has no mesh leaves."""
-        if name not in self.scene.graph.nodes:
+        world = self._world_vertices(name)
+        if world is None:
             return None
-        lo = np.full(3, np.inf)
-        hi = np.full(3, -np.inf)
-        for mesh_node, mesh_world_T in self._mesh_descendants(name):
-            geom_name = self.scene.graph[mesh_node][1]
-            if geom_name is None:
-                continue
-            mesh = self.scene.geometry[geom_name]
-            verts = np.asarray(mesh.vertices, dtype=np.float64)
-            # mesh local → GLB world → our Z-up mm world
-            full = _GLB_TO_WORLD_MM @ mesh_world_T
-            ones = np.ones((len(verts), 1), dtype=np.float64)
-            world = (full @ np.hstack([verts, ones]).T).T[:, :3]
-            lo = np.minimum(lo, world.min(axis=0))
-            hi = np.maximum(hi, world.max(axis=0))
-        if not np.isfinite(lo).all():
-            return None
-        return PartAABB(min=tuple(lo.tolist()), max=tuple(hi.tolist()))
+        return PartAABB(min=tuple(world.min(axis=0).tolist()),
+                        max=tuple(world.max(axis=0).tolist()))
 
     def part_centre(self, name: str) -> tuple[float, float, float] | None:
         aabb = self.part_aabb(name)
@@ -138,45 +143,43 @@ class RigModel:
         aabb = self.part_aabb(name)
         return None if aabb is None else aabb.top_centre
 
-    def part_extreme_vertex(
-        self, name: str, axis: int, sign: int = 1,
+    def part_end_centre(
+        self, name: str, axis: int, sign: int = 1, depth_mm: float = 1.0,
     ) -> tuple[float, float, float] | None:
-        """Vertex of `name`'s mesh with the max (sign=+1) or min (sign=-1)
-        coordinate along `axis` (0=x, 1=y, 2=z), in world-mm coords.
+        """Centre of `name`'s end face along `axis` (0=x, 1=y, 2=z): the AABB
+        centre of the vertices within `depth_mm` of the max (sign=+1) or min
+        (sign=-1) coordinate, in world-mm coords.
 
-        Use this when you need an actual mesh point, not the AABB centre:
-        the AABB extends out to the bounding box face, but `aabb.centre`
-        XY/XZ at the max-Y face is a fictitious point inside the bounding
-        box that may sit far from any real vertex. We hit this with
-        `OrbitArm:1` — its max-Y tip is at z≈-1 mm in world, while the
-        AABB centre Z is +55 mm. Using the centre Z for the tip's Y-Z
-        direction biased the alignment angle by ~18°."""
-        if name not in self.scene.graph.nodes:
+        For a tube such as `OrbitArm:1` this is the point on its centreline
+        at the tip. The extreme vertex is not: it is a corner of the tube,
+        12.5 mm off the centreline, and tilts the arm's Y-Z direction by ~3°."""
+        world = self._world_vertices(name)
+        if world is None:
             return None
-        best_val = -np.inf if sign > 0 else np.inf
-        best_v: np.ndarray | None = None
-        for mesh_node, mesh_world_T in self._mesh_descendants(name):
-            geom_name = self.scene.graph[mesh_node][1]
-            if geom_name is None:
-                continue
-            mesh = self.scene.geometry[geom_name]
-            verts = np.asarray(mesh.vertices, dtype=np.float64)
-            ones = np.ones((len(verts), 1))
-            full = _GLB_TO_WORLD_MM @ mesh_world_T
-            world = (full @ np.hstack([verts, ones]).T).T[:, :3]
-            if sign > 0:
-                i = int(np.argmax(world[:, axis]))
-                if world[i, axis] > best_val:
-                    best_val = float(world[i, axis])
-                    best_v = world[i]
-            else:
-                i = int(np.argmin(world[:, axis]))
-                if world[i, axis] < best_val:
-                    best_val = float(world[i, axis])
-                    best_v = world[i]
-        return None if best_v is None else tuple(best_v.tolist())
+        coord = world[:, axis] * sign
+        end = world[coord >= coord.max() - depth_mm]
+        return tuple(((end.min(axis=0) + end.max(axis=0)) * 0.5).tolist())
 
     # ── internals ───────────────────────────────────────────────────────
+
+    def _world_vertices(self, name: str) -> np.ndarray | None:
+        """(N, 3) world-mm vertices of every mesh descendant of `name`, or
+        None if `name` doesn't exist or has no mesh leaves. Cached."""
+        if name in self._vertex_cache:
+            return self._vertex_cache[name]
+        chunks: list[np.ndarray] = []
+        if name in self.scene.graph.nodes:
+            for mesh_node, mesh_world_T in self._mesh_descendants(name):
+                geom_name = self.scene.graph[mesh_node][1]
+                if geom_name is None:
+                    continue
+                verts = np.asarray(self.scene.geometry[geom_name].vertices, dtype=np.float64)
+                # mesh local → GLB world → our Z-up mm world
+                full = _GLB_TO_WORLD_MM @ mesh_world_T
+                chunks.append(verts @ full[:3, :3].T + full[:3, 3])
+        world = np.vstack(chunks) if chunks else None
+        self._vertex_cache[name] = world
+        return world
 
     def _mesh_descendants(self, root: str):
         """Yield (node_name, world_matrix) for every descendant that has
@@ -206,7 +209,7 @@ _PKG_DIR = Path(__file__).resolve().parent.parent
 _GLB_CANDIDATES = (
     _PKG_DIR / "assets" / "Orbiter.glb",                       # packaged asset
     _PKG_DIR.parent / "Orbiter.glb",                           # server/ dev copy
-    _PKG_DIR.parent.parent / "cad" / "assembly" / "Orbiter.glb",  # repo checkout
+    _PKG_DIR.parent.parent / "cad" / "v2" / "assembly" / "Orbiter.glb",  # repo checkout
 )
 
 

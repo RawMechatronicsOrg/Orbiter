@@ -29,8 +29,9 @@ authoritative when you need depth.
 - **`cad/v2/` — the second-generation mechanics** as STL, STEP and FreeCAD
   ([`cad/v2/README.md`](cad/v2/README.md)): two near-identical rotary
   drive modules on an aluminium tube frame, 6008 bearings, taper inserts,
-  an AS5600 on both axes. Design files only so far: the server, the
-  firmware and the rest of this README still describe the v1 rig.
+  an AS5600 on both axes. The server's rig model, the 3D viewer and this
+  README follow v2 (its GLB is `cad/v2/assembly/Orbiter.glb`); the firmware
+  still reads elevation from an AS5048A.
 - The docker-compose stack starts on a fresh checkout.
 
 ## Contents
@@ -66,7 +67,7 @@ Orbiter is a **lab kit**, not a finished product. Expect rough edges; the pieces
 
 | Layer       | What it does                                                                                  |
 |-------------|-----------------------------------------------------------------------------------------------|
-| **CAD**     | v1: 3D-printable parts + full assembly (`.glb`, `.fbx`, `.obj`, individual `.stl`). v2: the next mechanics as STL, STEP and FreeCAD in `cad/v2/` |
+| **CAD**     | v2 (current): STL, STEP, FreeCAD and the GLB the software reads, in `cad/v2/`. v1: the first rig's printed parts + assembly in `cad/` |
 | **Firmware**| ESP32 sketch that exposes the table as a **generic 2-axis IP actuator** with encoder feedback |
 | **Server**  | FastAPI service that owns scan-session state, drives the actuator, stores photos with poses   |
 | **UI**      | Browser app (Vite + React + react-three-fiber) — live 3D view + photo library on a hemisphere + the stereo rig settings |
@@ -75,7 +76,7 @@ Orbiter is a **lab kit**, not a finished product. Expect rough edges; the pieces
 
 ### The "lab kit" framing
 
-The hardware is whatever was within arm's reach during prototyping: A4988 drivers (cheap, forgiving, the silicon is everywhere), generic 1.2°/step NEMA-17 motors with a 1:10 GT2 belt reduction, AS5600 (I²C) on azimuth + AS5048A (SPI) on elevation (mixed because of migration history — two AS5600s if starting fresh, which is what the v2 mechanics in `cad/v2/` do), an old ESP32-D0WD-V3 dev board, and an Android phone running [IP Webcam](https://play.google.com/store/apps/details?id=com.pas.webcam) for the camera. Substitution points are called out in each section so you can swap parts.
+The hardware is whatever was within arm's reach during prototyping: A4988 drivers (cheap, forgiving, the silicon is everywhere), 1.8°/step NEMA-17 motors (24 mm body) on GT2 belts — 7:1 on azimuth, 10:1 on elevation — a 25 × 25 mm aluminium tube frame with printed drive housings on 6008 bearings, an AS5600 (I²C) on each axis (the firmware still reads elevation from an AS5048A over SPI, a leftover of v1), an old ESP32-D0WD-V3 dev board, and an Android phone running [IP Webcam](https://play.google.com/store/apps/details?id=com.pas.webcam) for the camera. Substitution points are called out in each section so you can swap parts.
 
 ### Three licenses, one repo
 
@@ -91,7 +92,7 @@ The hardware is whatever was within arm's reach during prototyping: A4988 driver
 
 The minimum-viable path from "I have the parts" to "I have a session of photos":
 
-1. **Print the STLs** in `cad/parts/` per the [print profile](#8-printable-parts--print-profile).
+1. **Print the STLs** in `cad/v2/stl/printed/` ([§8](#8-printable-parts--print-profile)).
 2. **Wire up** the ESP32, drivers, motors, and encoders per [§6](#6-wiring--pin-map).
 3. **Flash the firmware** ([§10.1](#101-build--flash)), set Wi-Fi credentials via `idf.py menuconfig`, note the IP that appears in the boot log.
 4. **Calibrate the encoders** ([§10.3](#103-first-run-encoder-calibration)) — arm horizontal, platform facing forward, then `POST /calibrate {"axis":"el","mode":"current"}` and the same for AZ.
@@ -208,32 +209,33 @@ Photo bytes go to a global **immutable** `captures/` pool. Manifests reference t
 |--------------------|-----------------------------------------|--------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------|
 | MCU                | ESP32 dev board                         | ESP32-D0WD-V3 rev 3.1, 4 MB flash                                                          | Any ESP32 with Wi-Fi (ESP32-WROOM, ESP32-S3 — pin map shifts).                              |
 | Motor driver ×2    | A4988 stepper driver carrier            | Generic Pololu-style clone                                                                 | DRV8825 (same footprint, swap microstep table). TMC2208/2209 if you want quiet — same STEP/DIR/EN. |
-| Stepper ×2         | NEMA-17                                 | 1.2°/step (300 step/rev), ~1 A                                                             | Standard 1.8°/step (200 step/rev) — adjust microstepping. Any NEMA-17 with enough torque for 1:10. |
-| Encoder AZ         | AS5600 magnetic angle sensor breakout   | 12-bit, I²C @ 0x36                                                                         | AS5048B (I²C, 14-bit) drop-in for more resolution on AZ.                                    |
-| Encoder EL         | AS5048A magnetic angle sensor breakout  | 14-bit, SPI Mode 1                                                                         | AS5600 if 0.088° resolution is enough.                                                      |
-| Encoder magnet ×2  | Diametrically magnetised disc           | 6 mm × 2.5 mm N35 cylindrical                                                              | Anything diametric, ~5–8 mm × ~1.5–3 mm. Glue or press-fit into the back of the output pulley. |
-| Belt ×2            | GT2 closed-loop                         | **`2M-348-6`** (2 mm pitch, 348 mm circumference, 6 mm width) — runs fine but is slightly long for this frame; a shorter belt would tension cleaner. | Any closed-loop GT2-compatible belt (2 mm pitch, 6 mm wide). Pick the next length down from 348 mm if you want less slack. |
-| Pulley ×2          | GT2 10-tooth pinion + 100-tooth output  | 1:10 reduction                                                                             | Any pair giving 1:8 to 1:15.                                                                |
+| Stepper ×2         | NEMA-17, 24 mm body                     | 1.8°/step (200 step/rev)                                                                   | Any NEMA-17 that fits the mounts; the step angle changes only the step rate per degree ([§7](#7-motion-math)). |
+| Encoder ×2         | AS5600 magnetic angle sensor module     | 12-bit, I²C @ 0x36                                                                         | AS5048B (I²C, 14-bit) for more resolution. The firmware still drives EL as an AS5048A (SPI, [§6](#6-wiring--pin-map)). |
+| Encoder magnet ×2  | Diametrically magnetised disc           | Sits in a printed `HexPlug` in the end of the spindle and of the shaft                     | Anything diametric that fits the plug.                                                      |
+| Belts              | GT2 closed loop, 6 mm wide              | 280 mm on AZ; EL ≈ 347 mm at the modelled centre distance (the model names no length)      | Any GT2-compatible belt (2 mm pitch, 6 mm wide).                                            |
+| Pulleys            | GT2 16-tooth on the motors              | Printed 112-tooth (AZ, 7:1) and 160-tooth (EL, 10:1) output pulleys on splines             | Reprint the output pulley for another ratio.                                                |
 | Power supply       | 12 V, ≥ 2 A                             | Lab bench supply during dev                                                                | 12 V / 3 A "LED strip" brick for headless.                                                  |
 | Step-down (logic)  | DC-DC buck (for headless)               | Feeds ESP32 `Vin` from the 12 V rail                                                       | MP1584 / LM2596 module.                                                                     |
 | Camera             | Android phone + IP Webcam app           | Any source that exposes MJPEG/JPEG over HTTP                                               | Raspberry Pi + CSI cam + `mjpg-streamer`; USB webcam via `motion`.                          |
 
 ### 5.2 Mechanical + fasteners
 
+The full list with quantities is [`cad/v2/parts.csv`](cad/v2/parts.csv).
+
 | Group                    | What                                              | Qty       | Notes                                                                  |
 |--------------------------|---------------------------------------------------|----------:|------------------------------------------------------------------------|
-| Output shaft             | 5 mm round steel shaft cut to length              | 2         | One per axis.                                                          |
-| Bearing                  | 608ZZ (5 mm bore × 22 mm OD × 7 mm) or 608-class  | 2         | Press-fit; one per output axis.                                        |
-| Screws — frame to base   | M3 × 12 mm SHCS                                   | 8         |                                                                        |
-| Screws — encoder mounts  | M3 × 8 mm                                         | 4         |                                                                        |
-| Standoffs — encoders     | M3 nylon, 4 mm                                    | 4         | Sets the 1.5–2 mm gap between IC and magnet.                           |
-| Screws — driver carriers | M2.5 × 6 mm                                       | as needed | A4988 boards to ESP32 board or perfboard.                              |
+| Frame                    | 25 × 25 mm aluminium square tube                  | 4         | 3 × 253 mm (main rail, cross rail, orbit arm), 1 × 93 mm (vertical bar). |
+| Bearing                  | 6008-2Z (40 × 68 × 15 mm)                         | 4         | Two per axis, clamped by a printed M32×1 nut.                          |
+| Socket-head screws M5    | ISO 4762 × 10 / 12 / 16 / 25 / 30 / 35 / 40 / 70 mm | 3 / 1 / 3 / 1 / 1 / 2 / 2 / 1 | The 70 mm one is the main stack bolt through the vertical bar. |
+| Socket-head screws M3    | ISO 4762 M3 × 8                                   | 8         | Motor mounts.                                                          |
+| Nuts and washers M5      | ISO 4032 nut / ISO 4035 thin nut / ISO 7093 washer 15 × 1.2 | 6 / 1 / 6 |                                                              |
+| Heat-set inserts         | M5 × 7                                            | 7         |                                                                        |
 | Wiring sundries          | Dupont wires, screw terminals, perfboard          | —         |                                                                        |
-| Camera mount             | Friction-grip phone holder                        | 1         | A car-mount holder works; mount at the **end of the arm** for longer parallax baseline. |
+| Camera mount             | Phone holder clamped to the arm                   | 1         | Mount at the **end of the arm** for the longest parallax baseline.     |
 
 ### 5.3 Frame (3D-printed)
 
-PLA at 30 % infill is enough for a desk-bound rig. PETG / ABS if the lab is warm (PLA softens above ~55 °C). Per-part settings in [§8](#8-printable-parts--print-profile).
+PLA is enough for a desk-bound rig; PETG / ABS if the lab is warm (PLA softens above ~55 °C). The parts are in [§8](#8-printable-parts--print-profile).
 
 ---
 
@@ -260,7 +262,7 @@ GPIO numbers (not silkscreen) for the ESP32-D0WD-V3.
 | SCL    |   22 | 4.7 kΩ pull-up to 3.3 V.                             |
 | DIR    |  GND | Tie low for CCW = increasing angle. VCC to invert.   |
 
-**Encoder EL — AS5048A (SPI Mode 1, manual chip select):**
+**Encoder EL — AS5048A (SPI Mode 1, manual chip select)** — what the firmware reads today. The v2 mechanics mount an AS5600 on EL as well; the firmware does not drive it yet.
 
 | Signal | GPIO | Notes                                                       |
 |--------|-----:|-------------------------------------------------------------|
@@ -299,15 +301,16 @@ ESP32 can be USB-powered for bench work. For headless deployment, feed `Vin` fro
 
 ## 7. Motion math
 
-| Parameter                       | Value     | Source                                            |
-|---------------------------------|-----------|---------------------------------------------------|
-| Motor step angle                | 1.2°      | Datasheet of the motor used (300 step/rev).       |
-| Microstepping                   | 1/16      | A4988 with MS1/MS2/MS3 high.                      |
-| Gear ratio                      | 1 : 10    | 10-tooth pinion / 100-tooth output pulley.        |
-| Steps per output revolution     | 48 000    | 300 × 16 × 10.                                    |
-| Degrees per microstep at output | 0.0075°   | 360 / 48 000.                                     |
+| Parameter                       | Azimuth   | Elevation | Source                                            |
+|---------------------------------|-----------|-----------|---------------------------------------------------|
+| Motor step angle                | 1.8°      | 1.8°      | Motor datasheet (200 step/rev).                   |
+| Microstepping                   | 1/16      | 1/16      | A4988 with MS1/MS2/MS3 high.                      |
+| Belt reduction                  | 7 : 1     | 10 : 1    | GT2 16-tooth motor pulley → 112 / 160-tooth output pulley. |
+| Microsteps per output rev       | 22 400    | 32 000    | 200 × 16 × 7, 200 × 16 × 10.                      |
+| Degrees per microstep at output | 0.0161°   | 0.01125°  | 360 / 22 400, 360 / 32 000.                       |
+| Travel                          | endless   | −25° … +90° | The arm meets the cross rail at −28.8° in the v2 model. |
 
-If the motor is 1.8°/step (200 step/rev) with the same 1/16 microstep + 1:10 gearing, the math becomes 32 000 microsteps/rev or 0.01125°/microstep. Adjust in firmware `menuconfig`.
+The firmware does not use these numbers — it closes the loop on the encoders — but its speed caps are step rates: the default 2100 Hz on AZ is about 33.8 °/s at the platform, 350 Hz on EL about 3.9 °/s at the arm. The geometry the server uses (axes, platform, arm) is in [docs/HARDWARE.md](docs/HARDWARE.md#mechanics).
 
 **Open-loop micro-step accuracy is a fiction at low currents.** The A4988 micro-step table assumes balanced phase currents; real ones drift. The firmware uses the magnetic encoders as the source of truth and runs a **P-loop in velocity mode** rather than counting steps. It will still drive open-loop if you skip the encoders — but the reported angle is then unreliable.
 
@@ -315,37 +318,29 @@ If the motor is 1.8°/step (200 step/rev) with the same 1/16 microstep + 1:10 ge
 
 ## 8. Printable parts & print profile
 
-| Part                       | Qty | Material | Layer    | Infill | Supports             | Notes                                  |
-|----------------------------|----:|----------|---------:|-------:|----------------------|----------------------------------------|
-| `AxisFrame.stl`            |   1 | PLA      | 0.2 mm  | 30 %  | none                 | Arm pivot frame; flat on the bed.      |
-| `OrbitFrame.stl`           |   1 | PLA      | 0.2 mm  | 30 %  | small (bearing seat) | Main vertical structure.               |
-| `TableSupportFrame.stl`    |   1 | PLA      | 0.2 mm  | 25 %  | none                 | Base under the platform.               |
-| `PlatformInsert.stl`       |   1 | PLA      | 0.2 mm  | 25 %  | none                 | Flat side down. Top surface.           |
-| `BarHolderInsert.stl`      |   2 | PLA      | 0.2 mm  | 30 %  | none                 | Captures the camera arm.               |
-| `GT2 Pulley.stl`           |   2 | PLA      | 0.15 mm | 40 %  | none                 | Slow down to keep teeth crisp.         |
-| `Hall Sensor Mount.stl`    |   2 | PLA      | 0.2 mm  | 25 %  | none                 | Holds the encoder breakouts over the magnets. |
+The v2 rig has 25 printed files, 32 pieces (three of them are tools), about 830 g of PLA at 100 % infill. The list with colour, quantity, thread, mass and role of each part is in [`cad/v2/README.md`](cad/v2/README.md#printed-parts); STL in `cad/v2/stl/printed/<colour>/`, STEP in `cad/v2/step/printed/<colour>/`, FreeCAD files in `cad/v2/freecad/`. There is no per-part print profile (orientation, infill, supports) for v2 yet.
 
-Source CAD ships as `cad/assembly/Orbiter.glb` (also `.fbx`, `.obj`); per-part STLs in `cad/parts/`; renders in `cad/screenshots/`. Model started in FreeCAD; the distribution format is the GLB. Edit individual STLs in Blender / Meshmixer for small tweaks; for structural changes (arm length, gear ratio) re-derive in a parametric tool and re-export.
+The assembly the software reads is [`cad/v2/assembly/Orbiter.glb`](cad/v2/assembly), exported from the Fusion model's Blender scene by [`cad/v2/export_glb.py`](cad/v2/export_glb.py). For structural changes (arm length, pulley ratio) change the CAD and export the GLB again — the server takes the axes, the platform and the arm from it.
 
-The second-generation mechanics (aluminium tube frame, 6008 bearings, taper inserts, AS5600 on both axes) are in [`cad/v2/`](cad/v2/README.md) as STL, STEP and FreeCAD files. This README, the server's rig model and the firmware still describe v1.
+The first rig (printed frames, 608 bearings, 1:10 belts) stays in [`cad/`](cad/README.md) for reference.
 
 ---
 
 ## 9. Assembly
 
-This is the order of operations. The CAD geometry is the source of truth — open `cad/assembly/Orbiter.glb` in Blender / your slicer to see how the pieces fit.
+There is no step-by-step guide for v2 yet. This is the order of operations; the CAD is the source of truth — open `cad/v2/assembly/Orbiter.glb` or `cad/v2/freecad/Orbiter_assembly.FCStd` to see how the pieces fit, and the section view in [`cad/v2/README.md`](cad/v2/README.md) for the drives.
 
-1. **Print everything.** Inspect for blobs / strings on the pulley teeth — they cost ~0.5° of backlash if you don't clean them up.
-2. **Press-fit the bearings** into `OrbitFrame` and the base.
-3. **Glue the diametric magnets** into the back of the 100-tooth output pulleys, centred as well as you can manage. Concentricity matters more than depth (within ~0.3 mm of the axis).
-4. **Mount the encoder breakouts** on their printed seats with 4 mm nylon standoffs. Aim for a 1.5–2 mm gap between IC and magnet. If the AS5600 reports unstable angles, check concentricity and gap — its `MD/ML/MH` register reports magnet field status.
+1. **Print everything.** Inspect for blobs / strings on the pulley teeth — they cost backlash if you don't clean them up.
+2. **Build the two drives**: two 6008 bearings per housing with the spacers between the rings, the spindle / shaft through them, clamped by the M32×1 nut (the printed AF32 wrench turns it). The output pulley goes on the splines.
+3. **Press the diametric magnets** into the two `HexPlug`s and the plugs into the end of the spindle and of the shaft.
+4. **Mount the AS5600 modules** on `BaseSensorRing` (AZ) and `AngleSensorMount Ribbed` (EL), about 1 mm from the plug. If the AS5600 reports unstable angles, check centring and gap — its `MD/ML/MH` register reports magnet field status.
 5. **Belt and pulleys** — install with the belt under modest tension. If teeth skip during slow moves, tighten; if motors stall, loosen.
 6. **Wire it up** per [§6](#6-wiring--pin-map). Triple-check stepper coil pairs — getting one wrong reverses direction or causes high-current rattling.
 7. **Flash the firmware** ([§10](#10-firmware)), set Wi-Fi, watch the boot log.
 8. **Calibrate the encoders** with the arm horizontal and the platform facing forward ([§10.3](#103-first-run-encoder-calibration)).
 9. **Start the server + UI** ([§13](#13-docker-stack)) and verify a manual move works end-to-end.
 
-**Camera mounting.** The arm has slots for a generic phone holder (a friction-grip car-mount holder works fine). Mount the camera at the **end of the arm** — farther from the AZ pivot = longer parallax baseline for photogrammetry. Measure `arm_radius` (pivot → camera sensor along the arm), `base_height` (pivot above the platform surface), `camera_offset` (perpendicular distance from arm to camera) with callipers, and enter these in the UI. Eyeball numbers are fine for turntable-GIF use; measure carefully if you'll feed COLMAP as priors.
+**Camera mounting.** Clamp a phone holder to the 25 × 25 mm arm (a friction-grip car-mount holder works fine). Mount the camera at the **end of the arm** — the tip is 225 mm from the elevation axis; farther from the AZ pivot = longer parallax baseline for photogrammetry. Measure `arm_radius` (pivot → camera sensor along the arm), `base_height` (pivot above the platform surface), `camera_offset` (perpendicular distance from arm to camera) with callipers, and enter these in the UI. Eyeball numbers are fine for turntable-GIF use; measure carefully if you'll feed COLMAP as priors.
 
 ---
 
@@ -824,8 +819,8 @@ Orbiter/
 ├── LICENSE                 ← Apache-2.0 (default for source code)
 ├── docs/                   ← per-subsystem deep dives + license
 │   └── LICENSE             ← CC-BY-4.0 (docs)
-├── cad/                    ← CAD (assembly + per-part STLs + screenshots)
-│   ├── v2/                 ← second-generation mechanics (STL, STEP, FreeCAD)
+├── cad/                    ← CAD: the v1 rig (assembly + per-part STLs + screenshots)
+│   ├── v2/                 ← the current mechanics (STL, STEP, FreeCAD, assembly GLB)
 │   └── LICENSE             ← CERN-OHL-S-2.0 (hardware)
 ├── firmware/               ← ESP-IDF project — the 2-axis IP actuator
 ├── server/                 ← FastAPI — scene state + ESP proxy + storage
@@ -842,7 +837,7 @@ Orbiter/
 | `server/`            | FastAPI app, `ModelState`, scene-graph builder, scan orchestration, COLMAP-priors exporter. |
 | `ui/`                | Single-page React app over the scene-graph WebSocket.                                  |
 | `native/`            | Desktop CV workbench for the binocular pair: `orbiter-native`, `orbiter-rigcheck`, `orbiter-recon`; docs in `native/docs/`. |
-| `cad/`               | `.glb`/`.fbx`/`.obj` assembly + per-part `.stl` files + rendered previews; `cad/v2/` holds the second-generation mechanics. |
+| `cad/`               | `cad/v2/`: the current mechanics as STL, STEP, FreeCAD and the assembly GLB the server and viewer read. The rest: the v1 rig (`.glb`/`.fbx`/`.obj` assembly, per-part `.stl`, previews). |
 | `docker/`            | `docker-compose.yml` with three services and a `colmap` profile.                       |
 | `colmap/`            | Thin container over `colmap/colmap:latest` + an SfM-priors → COLMAP-text converter.    |
 | `docs/`              | Per-subsystem deep dives (architecture, hardware, firmware, API, assembly, COLMAP).    |

@@ -5,19 +5,45 @@ substitution, it's called out.
 
 ## Bill of materials
 
+The mechanics are the second generation (v2): the full parts list with
+quantities, printed parts and CAD is in [`cad/v2`](../cad/v2/README.md).
+The electronics side is below.
+
 | Group | Part | What we used | Sensible alternatives |
 |-------|------|--------------|-----------------------|
 | MCU | ESP32 dev board | ESP32-D0WD-V3 (rev 3.1), 4 MB flash | Any ESP32 with Wi-Fi (ESP32-WROOM, ESP32-S3 — pin map will shift) |
 | Motor driver × 2 | A4988 stepper driver carrier | Generic Pololu-style clone | DRV8825 (same footprint, swap microstep table). TMC2208/2209 if you want quiet — wire the same `STEP/DIR/EN`, ignore UART for now. |
-| Stepper × 2 | NEMA-17 | 1.2°/step (300 steps/rev), ~1 A | Standard 1.8°/step (200 steps/rev) is fine — just adjust microstepping. Any NEMA-17 with enough torque for a 1:10 belt reduction. |
-| Encoder AZ | AS5600 magnetic angle sensor breakout | 12-bit, I2C @ 0x36 | AS5048A (SPI, 14-bit) — see EL row. AS5048B (I2C, 14-bit) is a drop-in if you need more resolution on AZ. |
-| Encoder EL | AS5048A magnetic angle sensor breakout | 14-bit, SPI Mode 1 | AS5600 (cheaper, 12-bit) if 0.088° resolution is enough. |
-| Encoder magnets × 2 | Diametrically magnetised disc | 6 mm × 2.5 mm cylindrical N35 | Anything diametric. ~5–8 mm diameter, ~1.5–3 mm thick. Glue or press-fit into the back of the output pulley. |
-| Belt × 2 | GT2 closed-loop | `2M-348-6` (2 mm pitch, 348 mm circumference, 6 mm width) — runs fine but is slightly long for this frame; a shorter belt would tension cleaner. | Any closed-loop GT2-compatible belt (2 mm pitch, 6 mm wide). Pick the next length down from 348 mm if you want less idle slack. |
-| Pulley × 2 | GT2 10-tooth pinion + 100-tooth output | 1 : 10 reduction | Any pair that gives 1:8 to 1:15. Lower ratio = less torque, higher speed; higher ratio = slower, smoother. |
+| Stepper × 2 | NEMA-17, 24 mm body | 1.8°/step (200 steps/rev) | Any NEMA-17 that fits the motor mounts; another step angle changes only the step rate per output degree (see [Motion math](#motion-math)). |
+| Encoder × 2 | AS5600 magnetic angle sensor module | 12-bit, I2C @ 0x36 | AS5048B (I2C, 14-bit) for more resolution. |
+| Encoder magnets × 2 | Diametrically magnetised disc | — | Anything diametric. It sits in a printed `HexPlug` in the end of the azimuth spindle and of the elevation shaft, facing the sensor. |
+| Belts | GT2 closed loop, 6 mm wide | 280 mm on azimuth | Elevation: the model does not name a length; at the modelled centre distance (69.6 mm) the loop is about 347 mm. |
+| Pulleys | GT2 16-tooth on the motors; printed 112-tooth (AZ) and 160-tooth (EL) | 7 : 1 on azimuth, 10 : 1 on elevation | The printed pulleys sit on splines, so another tooth count is a reprint (`ReplacablePulley` on EL). |
+| Bearings × 4 | 6008 (40 × 68 × 15 mm) | Two per axis | 6008-2Z / -2RS. |
+| Frame | 25 × 25 mm aluminium tube | 3 × 253 mm, 1 × 93 mm | Any 25 × 25 square tube; the printed caps and clamps take the rest. |
 | Power supply | 12 V, ≥ 2 A | Lab bench supply during dev | A 12 V / 3 A "LED strip" brick is fine for headless deployment. |
 | Camera | Android phone with [IP Webcam](https://play.google.com/store/apps/details?id=com.pas.webcam) | Anything that exposes MJPEG over HTTP | A Raspberry Pi with a CSI camera + `mjpg-streamer`. A USB webcam through `motion`. Anything with a URL that returns JPEGs. |
-| Frame | 3D-printed in PLA | Default 0.2 mm layer, 30% infill | PETG or ABS if you live somewhere hot. |
+| Printed parts | PLA | 25 files, 32 pieces, see [`cad/v2`](../cad/v2/README.md#printed-parts) | PETG or ABS if you live somewhere hot. |
+
+## Mechanics
+
+The geometry the software uses comes from the v2 CAD
+([`cad/v2/assembly/Orbiter.glb`](../cad/v2/assembly), exported from the
+Fusion model, version 225). The world frame is millimetres, Z up, the
+machine standing on z = 0, the azimuth axis on the Z axis.
+
+| Quantity | Value | Where it comes from |
+|----------|-------|---------------------|
+| Azimuth axis | vertical, x = y = 0 | `ORB_ROTOR_base` in the GLB: centre of the two 6008 inner rings |
+| Elevation axis | along X, at y = 0, z = 127.18 mm | `ORB_ROTOR_elevation` in the GLB: centre of the 6008 inner rings |
+| Axes crossing | yes — the elevation axis passes through the azimuth axis | both rotors at y = 0 |
+| Platform | 120 mm disc, top at z = 118.64 mm (8.5 mm under the elevation axis) | `BasePlatformInsert Taper` |
+| Orbit arm | 25 × 25 mm tube along +Y at el = 0; tip 225.0 mm from the elevation axis, centred at x = 179 mm | `OrbitArm` |
+| Elevation travel | −25° … +90° (0 = arm horizontal) | the arm meets the cross rail at −28.8° in the model; nothing stops it upward. `ORBITER_EL_MIN_DEG` / `_MAX_DEG` in firmware menuconfig |
+
+In the model the arm rests 0.84° below horizontal. Where the camera sits on
+the arm is not part of the model: the server takes it from the hand-eye
+calibration, and before that from the arm radius and camera offset in the
+UI (an unset arm radius defaults to the arm's 225 mm reach).
 
 ## Pin assignment (ESP32-D0WD-V3 dev board)
 
@@ -36,6 +62,10 @@ Numbers are GPIO numbers (not silkscreen).
 
 ### Encoders
 
+The v2 mechanics carry an AS5600 on both axes. The firmware still drives
+the elevation encoder as an AS5048A over SPI, so until that changes the
+elevation sensor is wired as below.
+
 **AZ — AS5600 (I2C @ 400 kHz, address 0x36 fixed)**
 
 | Signal | GPIO | Notes |
@@ -44,7 +74,7 @@ Numbers are GPIO numbers (not silkscreen).
 | SCL | 22 | 4.7 kΩ pull-up to 3.3 V. |
 | DIR | GND | Tie low for CCW = increasing angle. Flip to VCC to invert. |
 
-**EL — AS5048A (SPI Mode 1, manual chip select)**
+**EL — AS5048A (SPI Mode 1, manual chip select)** — what the firmware reads today
 
 | Signal | GPIO | Notes |
 |--------|------|-------|
@@ -59,17 +89,22 @@ Numbers are GPIO numbers (not silkscreen).
 
 ## Motion math
 
-| Parameter | Value | Where it comes from |
-|-----------|-------|---------------------|
-| Motor step angle | 1.2° (300 steps/rev) | Datasheet of the specific motor we bought |
-| Microstepping | 1/16 | A4988 with MS1/MS2/MS3 high |
-| Gear ratio | 1 : 10 | 10-tooth pinion / 100-tooth output pulley |
-| Steps / output rev | 48 000 | 300 × 16 × 10 |
-| Degrees / microstep at output | 0.0075° | 360 / 48 000 |
+| Parameter | Azimuth | Elevation | Where it comes from |
+|-----------|---------|-----------|---------------------|
+| Motor step angle | 1.8° (200 steps/rev) | 1.8° (200 steps/rev) | Motor datasheet |
+| Microstepping | 1/16 | 1/16 | A4988 with MS1/MS2/MS3 high |
+| Belt reduction | 7 : 1 | 10 : 1 | GT2 16-tooth motor pulley → 112 / 160-tooth output pulley |
+| Microsteps / output rev | 22 400 | 32 000 | 200 × 16 × 7, 200 × 16 × 10 |
+| Microsteps / output degree | 62.2 | 88.9 | |
+| Degrees / microstep at output | 0.0161° | 0.01125° | |
+| Encoder step | 0.088° | 0.088° (AS5600) | 360 / 4096 |
 
-If your motor is 1.8°/step (200 steps/rev) and you keep 1/16 microstep + 1:10
-gearing, you get 32 000 microsteps/rev or 0.01125°/microstep. Adjust in
-firmware menuconfig.
+The firmware never uses these numbers: it closes the loop on the encoders
+(below), so a different motor or pulley needs no firmware change. Its speed
+limits are step rates, though — `CL_HZ_MAX_AZ` = 2100 Hz is about 33.8 °/s
+at the platform and `CL_HZ_MAX_EL` = 350 Hz about 3.9 °/s at the arm, and
+the UI speed knobs are in the same Hz. With 1.2° motors they would be 1.5×
+slower.
 
 > **Open-loop micro-step accuracy is a fiction at low currents.** The
 > A4988 micro-step table assumes balanced phase currents — real ones drift.
@@ -91,7 +126,7 @@ firmware menuconfig.
                         │      │
                     motor1   motor2
                     
-       AS5600  AS5048A
+       AS5600  AS5048A (firmware EL driver; v2 mounts an AS5600)
         SDA─21  CLK─18
         SCL─22  MISO─19
                 MOSI─23
@@ -117,12 +152,12 @@ server fetches still JPEGs from `/shot.jpg` for each capture.
 
 ## Mounting the encoders
 
-Magnets are diametrically magnetised. They need to be:
+Magnets are diametrically magnetised. In v2 each one sits in a `HexPlug`
+pressed into the end of the azimuth spindle and of the elevation shaft, so
+it is concentric with the axis by construction. The sensors sit on a printed
+`BaseSensorRing` under the spindle and on the three-legged
+`AngleSensorMount Ribbed` on the elevation housing, about 1 mm from the
+plug.
 
-- **Concentric** with the rotation axis (within ~0.3 mm). The pulley
-  centre is usually good enough.
-- **Close** to the sensor IC (~1–2 mm gap, not touching). Check the
-  datasheet of your specific breakout.
-
-If the AS5600 reports unstable angles, check both. The `MD/ML/MH` register
-will tell you if the magnet field is in spec.
+If the AS5600 reports unstable angles, check the gap and the centring. The
+`MD/ML/MH` register will tell you if the magnet field is in spec.

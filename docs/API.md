@@ -119,13 +119,17 @@ Omitting an axis leaves it at its current position.
 | Axis | Tolerance | Source |
 |------|-----------|--------|
 | AZ | ± 1.0° | One AS5600 step ≈ 0.088°; debounced over 2 readings. |
-| EL | ± 1.0° | One AS5048A step ≈ 0.022°; debounced over 2 readings. |
+| EL | ± 1.0° | One AS5048A step ≈ 0.022° (the v2 AS5600: 0.088°); debounced over 2 readings. |
 
 ---
 
 ## `POST /spin`
 
 Continuous rotation. Useful for video sweeps or warm-up.
+
+> **No range check on EL.** Unlike `/move`, a spin is not stopped at the
+> elevation limits: on the v2 mechanics the arm meets the cross rail at
+> −28.8°. Spin elevation only while watching it.
 
 **Request**
 ```json

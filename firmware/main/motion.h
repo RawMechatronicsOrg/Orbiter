@@ -1,9 +1,18 @@
 #pragma once
 
 #include "esp_err.h"
+#include "sdkconfig.h"
 #include "stepper.h"
 #include <stdbool.h>
 #include <stdint.h>
+
+/*
+ * Elevation travel, user degrees (0 = arm horizontal, + = up). Enforced by
+ * POST /move. Set in menuconfig → Orbiter Configuration; the defaults (-25,
+ * +90) fit the v2 mechanics, whose orbit arm meets the cross rail at -28.8°.
+ */
+#define MOTION_EL_MIN_DEG   ((float)CONFIG_ORBITER_EL_MIN_DEG)
+#define MOTION_EL_MAX_DEG   ((float)CONFIG_ORBITER_EL_MAX_DEG)
 
 typedef enum {
     MOTION_IDLE,

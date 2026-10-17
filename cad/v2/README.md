@@ -7,8 +7,9 @@ version 225 (2026-10-05).
 
 ![v2 assembly](images/photoreal.jpg)
 
-> **Status: design files only.** The rest of this repository still describes
-> and drives the [v1 rig](../README.md). See [What v2 does not have yet](#what-v2-does-not-have-yet)
+> **Status:** the server's rig model and the 3D viewer use this geometry
+> ([`assembly/Orbiter.glb`](assembly)); the firmware does not drive the
+> elevation AS5600 yet. See [What v2 does not have yet](#what-v2-does-not-have-yet)
 > before you print anything.
 
 ## What changed from v1
@@ -33,6 +34,7 @@ version 225 (2026-10-05).
 | [`step/printed/<colour>/`](step/printed) | the same 25 parts as STEP, exact B-rep geometry from Fusion |
 | [`stl/purchased/<category>/`](stl/purchased) | 28 bought parts as STL: tube, bearings, belts, motors, motor pulleys, fasteners, heat-set inserts, AS5600 modules |
 | [`freecad/Orbiter_assembly.FCStd`](freecad) | the whole machine in FreeCAD 1.0: the Fusion assembly tree, 98 occurrences, filament colours |
+| [`assembly/Orbiter.glb`](assembly) | the assembly the software reads: glTF 2.0, metres, Y up, the azimuth axis on the origin, with the two rotor nodes (below). `Orbiter.json` next to it is the export report |
 | [`freecad/parts/`](freecad/parts) | every part as its own `.FCStd` (53 files) |
 | [`freecad/build_report.json`](freecad/build_report.json) | per-part check of the FreeCAD files against Fusion: volume, validity, closed shells |
 | [`parts.csv`](parts.csv) | every component: category, colour, quantity, material, volume, role, file paths |
@@ -118,6 +120,39 @@ colour). In short:
 - M5 socket-head screws (10 to 70 mm), M5 nuts, thin nut and washers,
   M3 × 8 screws, 7 M5 × 7 heat-set inserts.
 
+## The assembly GLB
+
+[`export_glb.py`](export_glb.py) writes `assembly/Orbiter.glb` from the same
+assembly `.blend` as the previews (the Blender project in the private
+hardware tree builds it from the Fusion export):
+
+```bash
+blender -b master.blend -P export_glb.py -- assembly/Orbiter.glb
+```
+
+The GLB keeps the scene's rig: `ORB_ROTOR_base` sits on the azimuth axis and
+parents everything that turns with the platform (spindle, 112T pulley,
+platform insert, inner rings, clamp nut, magnet plug); `ORB_ROTOR_elevation`
+sits on the elevation axis and parents the shaft, the 160T pulley, the bar
+insert and the orbit arm. The server
+([`rig_model.py`](../../server/orbiter_server/geom/rig_model.py)) takes the
+pivots from these two nodes, the platform top from
+`BottomBody:1 / BasePlatformInsert Taper:1` and the arm tip from
+`OrbitArm:1`; the viewer spins the two subtrees. Keep these names when you
+change the model. The export moves the machine so the azimuth axis is the Z
+axis (the machine still stands on z = 0), leaves the tools out and decimates
+meshes over 4 000 faces.
+
+What the software reads from it, in the GLB's frame (mm, Z up):
+
+| | |
+|---|---|
+| Azimuth axis | x = y = 0 |
+| Elevation axis | along X at y = 0, z = 127.18 — it crosses the azimuth axis |
+| Platform | 120 mm disc, top at z = 118.64 |
+| Orbit arm | along +Y, tip 225.0 mm from the elevation axis; 0.84° below horizontal as modelled |
+| Elevation travel | the arm meets the cross rail at −28.8°; the firmware stops at −25° |
+
 ## Working with the models
 
 **Coordinates.** A single-part file (STL, STEP, or a `.FCStd` from
@@ -151,16 +186,15 @@ directly if you want to change a part.
 
 ## What v2 does not have yet
 
-- **The software still models v1.** The server's 3D scene and its pivot
-  and arm geometry are read from [`../assembly/Orbiter.glb`](../assembly),
-  by v1 node names (`BasePulley:2`, `OrbitArm:1`, …). v2 has no GLB with
-  matching names yet, so the viewer shows v1 and the server's default
-  geometry is v1's.
 - **The firmware reads elevation from an AS5048A over SPI.** v2 mounts an
   AS5600 on elevation, which the firmware does not drive yet.
-- **No assembly guide.** The main [README](../../README.md) bill of
-  materials, wiring and assembly sections describe v1. The section view
-  above and the FreeCAD assembly are the best reference for now.
+- **No assembly guide.** The main [README](../../README.md) has the bill of
+  materials and the order of operations for v2, not a step-by-step guide.
+  The section view above and the FreeCAD assembly are the best reference
+  for now.
+- **No camera mount.** The model ends at the arm; where the camera sits on
+  it comes from the hand-eye calibration (or the arm radius and camera
+  offset entered in the UI).
 - **No print profile.** Orientation, infill and supports per part are not
   written down yet.
 

@@ -252,10 +252,14 @@ esp_err_t handler_move(httpd_req_t *req)
      * Azimuth is continuous — accept any float. motion.c normalises to [0, 360)
      * via angle_delta which always picks the shortest path. See COORDINATES.md §3.1.
      */
-    if (has_el && (el_deg < -36.0f || el_deg > 90.0f))
-        return send_json(req,
-            "{\"status\":\"error\",\"message\":\"elevation_deg out of range -36..+90\"}",
-            400);
+    /* Written as "not inside" so a NaN from the parser is rejected too. */
+    if (has_el && !(el_deg >= MOTION_EL_MIN_DEG && el_deg <= MOTION_EL_MAX_DEG)) {
+        char msg[96];
+        snprintf(msg, sizeof(msg),
+                 "{\"status\":\"error\",\"message\":\"elevation_deg out of range %d..%+d\"}",
+                 CONFIG_ORBITER_EL_MIN_DEG, CONFIG_ORBITER_EL_MAX_DEG);
+        return send_json(req, msg, 400);
+    }
 
     mr_cmd_t cmd = {
         .kind = MR_KIND_MOVE,
@@ -396,7 +400,7 @@ esp_err_t handler_spin(httpd_req_t *req)
 
     char axis_str[4] = {0};
     char dir_str[8]  = "cw";
-    uint32_t step_hz = 525;  /* calibrated ~9°/sec (see motion.c CAL_DEFAULT_SPR) */
+    uint32_t step_hz = 525;  /* v2: ~8.4 °/s on AZ, ~5.9 °/s on EL (see motion.c) */
 
     if (!json_str(body, "axis", axis_str, sizeof(axis_str)))
         return send_json(req, "{\"status\":\"error\",\"message\":\"axis required\"}", 400);

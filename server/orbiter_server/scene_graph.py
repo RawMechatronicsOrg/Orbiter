@@ -112,7 +112,8 @@ def _rot_x(deg: float) -> tuple[float, float, float, float]:
 
 
 def _slug(name: str) -> str:
-    """`BasePulley:2` -> `basepulley_2` — colon isn't friendly in a node id."""
+    """`ORB_ROTOR_base` -> `orb_rotor_base`, `OrbitArm:1` -> `orbitarm_1` —
+    colon isn't friendly in a node id."""
     return name.replace(":", "_").lower()
 
 
@@ -172,23 +173,41 @@ def _cylinder_node(
     )
 
 
-#: Default arm radius (mm) when the operator hasn't set one yet — keeps the
-#: camera body + frustum visible from a fresh boot so the operator sees the
-#: rig immediately.
-_DEFAULT_ARM_RADIUS_MM = 120.0
+#: Rig nodes of the v2 GLB (`cad/v2/export_glb.py`). Each rotor empty sits on
+#: its axis and parents everything that turns with it, so its subtree is
+#: hidden in the static model and re-drawn under a spinning frame.
+_AZ_ROTOR = "ORB_ROTOR_base"         # spindle, 112T pulley, platform insert; about world +Z
+_EL_ROTOR = "ORB_ROTOR_elevation"    # shaft, 160T pulley, bar insert, orbit arm; about world +X
+_PLATFORM_PART = "BottomBody:1 / BasePlatformInsert Taper:1"   # the 120 mm platform disc
+_ARM_PART = "OrbitArm:1"             # 25x25 tube, along world +Y at el = 0
 
 #: Yaw of the math camera model (deg about world +Z, CCW from above) so the
-#: procedural arm/camera line up with the CAD's el-pulley + arm direction.
-#: The math arm direction at az=0 is +X; the CAD arm lives along world +Y -
-#: 90 deg CCW takes math +X onto world +Y. Applied at the `rig_math` anchor
-#: (NOT at the rig parent), so only the procedural camera viz rotates - the
-#: static CAD bodies and captures stay put.
+#: procedural arm/camera line up with the CAD arm direction. The math arm
+#: direction at az=0 is +X; the CAD arm lives along world +Y - 90 deg CCW
+#: takes math +X onto world +Y. Applied at the `rig_math` anchor (NOT at the
+#: rig parent), so only the procedural camera viz rotates - the static CAD
+#: bodies and captures stay put.
 _MATH_YAW_CCW_DEG = 90.0
 
 
-def _effective_arm_radius(model: ModelState) -> float:
-    """`model.arm_radius_mm` if positive, else the CAD-ish default."""
-    return model.arm_radius_mm if model.arm_radius_mm > 0 else _DEFAULT_ARM_RADIUS_MM
+def _arm_reach_mm(rig_cad) -> float:
+    """Distance from the elevation axis to the tip of the CAD orbit arm, in the
+    Y-Z plane the arm turns in."""
+    pivot = rig_cad.node_origin(_EL_ROTOR)
+    tip = rig_cad.part_end_centre(_ARM_PART, axis=1, sign=+1)
+    if pivot is None or tip is None:
+        return 0.0
+    return math.hypot(tip[1] - pivot[1], tip[2] - pivot[2])
+
+
+def _effective_arm_radius(model: ModelState, rig_cad) -> float:
+    """`model.arm_radius_mm` if positive, else the reach of the CAD arm — so a
+    fresh boot shows the camera as far out as the arm's tip. The manual model
+    keeps the camera in the plane of the azimuth axis, so `cam_stem` bridges
+    the arm's 179 mm side offset until a calibration places it."""
+    if model.arm_radius_mm > 0:
+        return model.arm_radius_mm
+    return _arm_reach_mm(rig_cad)
 
 
 def build_scene(model: ModelState) -> list[Node]:
@@ -228,23 +247,20 @@ def build_scene(model: ModelState) -> list[Node]:
     _CAD_URL = "/Orbiter.glb"
     _CAD_SCALE_MM = 1000.0
 
-    _SUBJECT_PARTS = ("BasePlatformInsert:1", "BasePulley:1")
-    _ORBIT_PARTS = ("BasePulley:2", "OrbitBarInsert:1", "OrbitArm:1")
-    _ROTATING = list(_SUBJECT_PARTS) + list(_ORBIT_PARTS)
     nodes.append(_node(
         "rig_cad", "cad_model",
         {
             "url": _CAD_URL,
             "scale": _CAD_SCALE_MM,
             "convert_y_up": True,
-            "hide_parts": [to_three_name(n) for n in _ROTATING],
+            "hide_parts": [to_three_name(n) for n in (_AZ_ROTOR, _EL_ROTOR)],
         },
         parent="rig",
         position=(0.0, 0.0, 0.0),
     ))
 
     # ── subject-disk spin (model.az + operator offset around Z) ───────────
-    subj_centre = rig_cad.part_centre("BasePulley:1") or (0.0, 0.0, 0.0)
+    subj_centre = rig_cad.node_origin(_AZ_ROTOR) or (0.0, 0.0, 0.0)
     nodes.append(_node(
         "platform_spin", "frame", {},
         parent="rig",
@@ -253,28 +269,30 @@ def build_scene(model: ModelState) -> list[Node]:
             -(model.az + float(getattr(model, "az_kinematic_offset_deg", 0.0)))
         ),
     ))
-    for part_name in _SUBJECT_PARTS:
-        nodes.append(_node(
-            f"part_{_slug(part_name)}", "cad_part",
-            {
-                "url": _CAD_URL,
-                "part_name": to_three_name(part_name),
-                "scale": _CAD_SCALE_MM,
-                "convert_y_up": True,
-                "pivot_offset": list(subj_centre),
-            },
-            parent="platform_spin",
-        ))
+    nodes.append(_node(
+        f"part_{_slug(_AZ_ROTOR)}", "cad_part",
+        {
+            "url": _CAD_URL,
+            "part_name": to_three_name(_AZ_ROTOR),
+            "scale": _CAD_SCALE_MM,
+            "convert_y_up": True,
+            "pivot_offset": list(subj_centre),
+        },
+        parent="platform_spin",
+    ))
 
-    # ── orbit arm spin (rotation about pulley's natural +X axis) ──────────
-    orbit_centre = rig_cad.part_centre("BasePulley:2") or (0.0, 0.0, 0.0)
+    # ── orbit arm spin (rotation about the elevation axis, world +X) ──────
+    # The elevation axis crosses the azimuth axis (both rotor origins have
+    # y = 0 in the v2 GLB), so the AZ-EL intersection is the azimuth axis at
+    # the elevation axis' height.
+    orbit_centre = rig_cad.node_origin(_EL_ROTOR) or (0.0, 0.0, 0.0)
     math_anchor = (subj_centre[0], subj_centre[1], orbit_centre[2])
-    tip_max_y = rig_cad.part_extreme_vertex("OrbitArm:1", axis=1, sign=+1)
+    arm_tip = rig_cad.part_end_centre(_ARM_PART, axis=1, sign=+1)
 
     el_with_offset = model.el + float(getattr(model, "el_kinematic_offset_deg", 0.0))
     rig = compute_rig(
         el_deg=el_with_offset,
-        arm_radius_mm=_effective_arm_radius(model),
+        arm_radius_mm=_effective_arm_radius(model, rig_cad),
         camera_offset_mm=model.camera_offset_mm,
         # Tilt is zeroed by design — see _geom_params above.
         camera_tilt_deg=0.0,
@@ -293,11 +311,11 @@ def build_scene(model: ModelState) -> list[Node]:
 
     orbit_spin_theta_deg = float(model.el)
     stem_start_math: tuple[float, float, float] | None = None
-    if tip_max_y is not None and cam_yz_norm > 1e-3:
+    if arm_tip is not None and cam_yz_norm > 1e-3:
         picked = (
-            tip_max_y[0] - orbit_centre[0],
-            tip_max_y[1] - orbit_centre[1],
-            tip_max_y[2] - orbit_centre[2],
+            arm_tip[0] - orbit_centre[0],
+            arm_tip[1] - orbit_centre[1],
+            arm_tip[2] - orbit_centre[2],
         )
         a0 = math.atan2(picked[2], picked[1])
         a1 = math.atan2(cam_yz[1], cam_yz[0])
@@ -324,21 +342,20 @@ def build_scene(model: ModelState) -> list[Node]:
         position=orbit_centre,
         quaternion=_rot_x(orbit_spin_theta_deg),
     ))
-    for part_name in _ORBIT_PARTS:
-        nodes.append(_node(
-            f"part_{_slug(part_name)}", "cad_part",
-            {
-                "url": _CAD_URL,
-                "part_name": to_three_name(part_name),
-                "scale": _CAD_SCALE_MM,
-                "convert_y_up": True,
-                "pivot_offset": list(orbit_centre),
-            },
-            parent="orbit_spin",
-        ))
+    nodes.append(_node(
+        f"part_{_slug(_EL_ROTOR)}", "cad_part",
+        {
+            "url": _CAD_URL,
+            "part_name": to_three_name(_EL_ROTOR),
+            "scale": _CAD_SCALE_MM,
+            "convert_y_up": True,
+            "pivot_offset": list(orbit_centre),
+        },
+        parent="orbit_spin",
+    ))
 
-    # ── subject disk — top-centre of BasePlatformInsert ────────────────────
-    insert_top = rig_cad.part_top_centre("BasePlatformInsert:1") or (0.0, 0.0, 0.0)
+    # ── subject disk — on top of the platform insert ──────────────────────
+    insert_top = rig_cad.part_top_centre(_PLATFORM_PART) or (0.0, 0.0, 0.0)
     disc_height = 15.0
     disc_local = (
         insert_top[0] - subj_centre[0],
@@ -471,7 +488,7 @@ def _arm_nodes(
     stem_start_math: tuple[float, float, float] | None = None,
 ) -> list[Node]:
     """Dynamic arm visualisation — single procedural beam (`cam_stem`)
-    from the CAD `OrbitArm:1` tip to the camera optical centre."""
+    from the tip of the CAD orbit arm to the camera optical centre."""
     out: list[Node] = []
 
     cam_pos = np.asarray(rig.camera_pos, dtype=float)

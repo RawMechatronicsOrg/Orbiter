@@ -28,13 +28,16 @@ menu "Orbiter Configuration"
         int "Elevation min (deg)"
         default -25
         help
-            Lower limit of the elevation axis, in degrees. Hard-enforced by /move and /spin.
+            Lower limit of the elevation axis, in degrees (0 = arm horizontal).
+            Hard-enforced by /move. The v2 orbit arm meets the cross rail at
+            about -28.8 degrees; -25 leaves a margin for the camera mount.
 
     config ORBITER_EL_MAX_DEG
         int "Elevation max (deg)"
         default 90
         help
-            Upper limit of the elevation axis, in degrees.
+            Upper limit of the elevation axis, in degrees (90 = arm vertical).
+            Hard-enforced by /move.
 
     config ORBITER_ENCODER_SPI_TRACE
         bool "Verbose AS5048A SPI trace (UART)"
