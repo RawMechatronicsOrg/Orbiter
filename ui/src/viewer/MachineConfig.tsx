@@ -1,22 +1,23 @@
 /**
  * Machine Config — rig parameters reachable from the UI.
  *
- *  - **Calibration** — the rig has no accurate camera poses until a ChArUco
- *    hand-eye calibration has been run and applied. A sweep of poses
- *    captures a photo at each, detects the board, runs `cv2.calibrateHandEye`
- *    and applies the derived geometry. Pick an accuracy preset (fast / normal
- *    / full) — more poses are slower but more accurate. Until then a bright
- *    warning is shown and `model.calibrated` is false.
+ *  - **Status** — green when the ChArUco hand-eye calibration was solved on
+ *    the mechanics this server models (`calib_rig_id === rig_id`), amber when
+ *    it comes from other mechanics (with *Reset calibration*), and an amber
+ *    "not calibrated" warning when there is none.
+ *  - **Step 0 · Zero encoders** — the firmware's encoder zero offsets. The EL
+ *    zero gates the calibration sweep (`encoder_zero_initialized`).
+ *  - **Step 1 · Board** — the ChArUco params (squares, lengths, ArUco dict),
+ *    the only geometry input entered by hand; pushed with *Apply board*.
+ *  - **Step 2 · Calibration** — a sweep of poses captures a photo at each,
+ *    detects the board, runs `cv2.calibrateHandEye` and applies the derived
+ *    geometry. Presets (fast / normal / full) trade time for accuracy.
+ *  - **Motion speed** — per-axis top step rate (Hz) with the output °/s,
+ *    both from the drive facts the server publishes (`model.axes`).
  *  - **Geometry** (arm_radius_mm, camera_offset_mm, camera_tilt_deg,
- *    camera_pan_deg) is derived from that calibration, not entered by hand.
- *    `base_height_mm` stays at the configured default (the hand-eye solver
- *    is invariant to it).
- *  - **Board** — the ChArUco params (squares, lengths, ArUco dict). These are
- *    now THE only user-entered geometry input, so they're editable here and
- *    pushed to the server with *Apply board*.
- *  - **Endpoints** — ESP IP (with mDNS auto-discovery) and camera URL.
- *  - **Encoder zero** — firmware-side encoder offsets (positioning is
- *    closed-loop, no steps-per-degree calibration).
+ *    camera_pan_deg) — solved by the calibration; until then the rig is
+ *    drawn from the CAD model.
+ *  - **Connections** — ESP host (with mDNS auto-discovery) and camera URL.
  */
 
 import { useEffect, useRef, useState, type ReactNode } from 'react';
@@ -273,7 +274,6 @@ export function MachineConfig({ commands }: { commands: Commands }) {
   );
   const armRadius  = useViewerStore((s) => num(s.model, 'arm_radius_mm', 0));
   const camOffset  = useViewerStore((s) => num(s.model, 'camera_offset_mm', 80));
-  const baseHeight = useViewerStore((s) => num(s.model, 'base_height_mm', 45));
   const camTilt    = useViewerStore((s) => num(s.model, 'camera_tilt_deg', 0));
   const camPan     = useViewerStore((s) => num(s.model, 'camera_pan_deg', 0));
 
@@ -502,15 +502,15 @@ export function MachineConfig({ commands }: { commands: Commands }) {
               onClick={() => {
                 if (
                   window.confirm(
-                    'Reset both encoder zeros? The encoders then read raw ' +
-                      'angles, and the calibration sweep is blocked until EL ' +
-                      'is zeroed again.',
+                    'Reset both encoder zeros to the firmware defaults? The ' +
+                      'angles then read against the factory offsets, and the ' +
+                      'calibration sweep is blocked until EL is zeroed again.',
                   )
                 ) {
                   commands.zeroEncoder('both', 'reset');
                 }
               }}
-              title="Drop both zeros — the encoders read raw"
+              title="Both zeros back to the firmware defaults"
             >
               Reset
             </Button>
@@ -664,14 +664,17 @@ export function MachineConfig({ commands }: { commands: Commands }) {
       {/* ── derived geometry — collapsed (read-only result of Step 2) ── */}
       <Collapsible title="Geometry (derived)">
         <CardContent>
-          <ReadOnlyRow label="arm radius"    value={`${armRadius.toFixed(1)} mm`} />
+          <ReadOnlyRow
+            label="arm radius"
+            value={armRadius > 0 ? `${armRadius.toFixed(1)} mm` : 'CAD arm'}
+          />
           <ReadOnlyRow label="camera offset" value={`${camOffset.toFixed(1)} mm`} />
-          <ReadOnlyRow label="base height"   value={`${baseHeight.toFixed(1)} mm`} />
           <ReadOnlyRow label="camera tilt"   value={`${camTilt.toFixed(2)}°`} />
           <ReadOnlyRow label="camera pan"    value={`${camPan.toFixed(2)}°`} />
           <div className="mt-2 text-[11px] text-inkmute">
-            Derived from the ChArUco hand-eye calibration; `base_height` keeps
-            its configured default (the solver is invariant to it).
+            Solved by the ChArUco hand-eye calibration (Step 2); until then
+            the rig is drawn from the CAD model. Overrides: Advanced →
+            Geometry state.
           </div>
         </CardContent>
       </Collapsible>
@@ -683,7 +686,7 @@ export function MachineConfig({ commands }: { commands: Commands }) {
             <span className="w-24 shrink-0 text-[13px] text-inkdim">ESP IP</span>
             <Input
               value={espIp}
-              placeholder={autoEsp ? 'auto (mDNS)' : '192.168.0.42'}
+              placeholder={autoEsp ? 'auto (mDNS)' : 'orbiter.local'}
               onChange={(e) => {
                 setEspIp(e.target.value);
                 setEspDirty(true);

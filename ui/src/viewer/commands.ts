@@ -36,12 +36,14 @@ export interface Commands {
    *  and stops one heading out of the travel. */
   spin(axis: 'az' | 'el', dir: 'cw' | 'ccw', stepHz: number): void;
   spinStop(axis: Axis): void;
-  /** Set or clear the firmware encoder zero (`calibrate_encoder`):
-   *  `current` takes the present reading as 0, `reset` drops the zero. Not the
-   *  geometry calibration (Machine config → "Calibrate from board"). */
+  /** Set or reset the firmware encoder zero (`calibrate_encoder`):
+   *  `current` takes the present reading as 0, `reset` restores the
+   *  firmware's default zero. Not the geometry calibration (Machine config →
+   *  "Calibrate from board"). */
   zeroEncoder(axis: Axis, mode?: 'current' | 'reset'): void;
-  rebootEsp(): void;
-  setGeometry(fields: Record<string, number>): void;
+  rebootFirmware(): void;
+  /** Rig geometry overrides and kinematic offsets (`set_machine_config`). */
+  setMachineConfig(fields: Record<string, number>): void;
   /** Update the persisted ChArUco board params. Only the keys present in
    *  `params` are applied server-side. */
   setBoardParams(params: {
@@ -111,8 +113,8 @@ export function makeCommands(client: WsClient): Commands {
     spinStop: (axis) => client.sendCommand('spin_stop', { axis }),
     zeroEncoder: (axis, mode = 'current') =>
       client.sendCommand('calibrate_encoder', { axis, mode }),
-    rebootEsp: () => client.sendCommand('reboot_esp'),
-    setGeometry: (fields) => client.sendCommand('set_geometry', fields),
+    rebootFirmware: () => client.sendCommand('reboot_firmware'),
+    setMachineConfig: (fields) => client.sendCommand('set_machine_config', fields),
     setBoardParams: (params) => client.sendCommand('set_board_params', params),
     calibrateGeometry: (preset) =>
       client.sendCommand('calibrate_geometry', { apply: true, preset }),

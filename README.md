@@ -528,6 +528,9 @@ docker run --rm -p 8000:8000 \
 | GET/POST | `/stereo/upstream/controls/{cam_id}` | Read / set a camera's V4L2 controls through the proxy.           |
 | GET    | `/stereo/upstream/formats/{cam_id}` | List a camera's sizes, FourCCs, frame rates.                        |
 | POST   | `/stereo/upstream/format/{cam_id}` | Set a camera's size, FourCC, fps.                                    |
+| GET    | `/firmware/health`                | The firmware's `GET /health` (chip, IDF, uptime, heap), proxied.      |
+| GET    | `/firmware/encoder`               | The firmware's `GET /test/encoder`: AS5600 readings, magnet status, I2C line levels. |
+| POST   | `/firmware/ota`                   | Body = `firmware/build/orbiter.bin`; streamed to the firmware's `POST /ota`, its status relayed. |
 | GET    | `/command`                        | The command names the server accepts.                                 |
 | POST   | `/command/{name}`                 | Run a command over HTTP — the same handlers as the WS channel; the native workbench uses it (`set_stereo_rig`, …). |
 | WS     | `/ws/scene`                       | Scene + model diffs, command channel ([§12.3](#123-wire-protocol)).   |
@@ -537,7 +540,7 @@ docker run --rm -p 8000:8000 \
 | Variable                       | Default                | Purpose                                        |
 |--------------------------------|------------------------|------------------------------------------------|
 | `ORBITER_STORAGE_DIR`          | `./data`               | Root for `scans/` + `captures/`.               |
-| `ORBITER_ESP_IP`               | `192.168.1.50`         | ESP32 firmware host.                           |
+| `ORBITER_ESP_IP`               | `orbiter.local`        | ESP32 firmware host (mDNS auto-discovery or the UI override it). |
 | `ORBITER_CAMERA_URL`           | empty                  | IP Webcam HTTP base URL (e.g. `http://phone-ip:8080`). |
 | `ORBITER_PORT`                 | `8000`                 | Bound port.                                    |
 | `ORBITER_CORS_ORIGINS`         | localhost:5173 / 5174  | Comma-separated allowed origins.               |

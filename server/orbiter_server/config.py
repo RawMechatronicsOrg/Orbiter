@@ -13,10 +13,12 @@ class Settings(BaseSettings):
     # against a Galaxy S22 (SM-S921B) etc. See camera_adapter.py.
     default_camera_preset: str = "native"
 
-    # ESP32 firmware address. The server is the sole proxy to the
-    # firmware (Viser pattern) — set ORBITER_ESP_IP in .env.
+    # ESP32 firmware host. The server is the sole proxy to the firmware
+    # (Viser pattern). The firmware announces itself as orbiter.local (mDNS);
+    # set ORBITER_ESP_IP in .env for a fixed address. A host found by mDNS
+    # auto-discovery or set from the UI (model.esp_ip) takes precedence.
     # Live state is streamed from the firmware's ws://<esp_ip>/ws/log.
-    esp_ip: str = "192.168.1.50"
+    esp_ip: str = "orbiter.local"
 
     # Camera still-image URL (e.g. http://<phone-ip>:8080/photoaf.jpg). The
     # server-side scan loop GETs this for each capture. Empty → a placeholder

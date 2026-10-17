@@ -15,11 +15,9 @@ import { useViewerStore } from './modelStore';
 import { API_BASE } from './api';
 import { Button } from '../components/ui/button';
 
+/** The live photo of the current capture (`off` = no flash). */
 interface LiveImages {
   off?: string | null;
-  on?: string | null;
-  line?: string | null;
-  plane?: string | null;
 }
 
 interface LivePreview {
@@ -76,12 +74,7 @@ function imageUrl(path: string | null | undefined, rev: string | number): string
 
 function mergeImages(prev: LiveImages, incoming: LiveImages | undefined): LiveImages {
   if (!incoming) return prev;
-  return {
-    off: incoming.off ?? prev.off,
-    on: incoming.on ?? prev.on,
-    line: incoming.line ?? prev.line,
-    plane: incoming.plane ?? prev.plane,
-  };
+  return { off: incoming.off ?? prev.off };
 }
 
 function PreviewThumb({
@@ -147,7 +140,7 @@ export function CaptureProgressModal() {
   );
 
   useEffect(() => {
-    if (live.images && (live.images.off || live.images.on || live.images.line || live.images.plane)) {
+    if (live.images?.off) {
       setStickyImages((prev) => mergeImages(prev, live.images));
     }
   }, [live.images, frameRev]);
@@ -172,9 +165,7 @@ export function CaptureProgressModal() {
     return () => window.clearTimeout(t);
   }, [isDonePhase, live.phase, live.title]);
 
-  const hasPreviewData = Boolean(
-    displayImages.off || displayImages.on || displayImages.line || displayImages.plane,
-  );
+  const hasPreviewData = Boolean(displayImages.off);
 
   const canShowReopen =
     (isRunning || hasPreviewData || showDoneHint) && !panelOpen;
@@ -287,7 +278,7 @@ export function CaptureProgressModal() {
                 }`}
               >
                 {live.phase === 'failed'
-                  ? 'Job failed — see firmware log'
+                  ? 'Capture failed — see the log panel'
                   : 'Done'}
               </div>
             )}

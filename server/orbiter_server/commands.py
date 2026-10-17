@@ -557,13 +557,13 @@ _ZERO_MODES = ("current", "explicit", "reset")
 
 
 async def _cmd_calibrate_encoder(args: dict[str, Any]) -> dict[str, Any]:
-    """Set or clear the firmware encoder zero (Machine config → Step 0).
+    """Set or reset the firmware encoder zero (Machine config → Step 0).
 
     `{axis: az|el|both, mode: current|explicit|reset}`: `current` takes the
     present encoder reading as 0, `explicit` takes `az_raw_deg`/`el_raw_deg`,
-    `reset` drops the zero (the encoder then reads raw). Setting the EL zero
-    is what makes the rig ready for absolute moves; resetting it undoes that
-    (see encoder_init).
+    `reset` restores the firmware's default zero. Setting the EL zero is what
+    makes the rig ready for absolute moves; resetting it undoes that (see
+    encoder_init).
     """
     import encoder_init
 
@@ -840,15 +840,6 @@ _COMMANDS: dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]] = {
     "reset_calibration": _cmd_reset_calibration,
     "test_calibration_accuracy": _cmd_test_calibration_accuracy,
 }
-
-# UI commands.ts still uses the older names from the parent project. Map
-# them to the current handlers so the UI stops spamming `unknown command`
-# every click — until commands.ts gets a contract-aligned rewrite.
-_COMMANDS.update({
-    "calibrate":  _COMMANDS["calibrate_encoder"],
-    "reboot_esp": _COMMANDS["reboot_firmware"],
-    "set_geometry": _COMMANDS["set_machine_config"],
-})
 
 
 def known_commands() -> list[str]:

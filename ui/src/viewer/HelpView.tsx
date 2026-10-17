@@ -94,16 +94,30 @@ export function HelpView() {
         <Section title="The workflow — do this in order">
           <Steps>
             <li>
-              <Tag>Calibrate geometry</Tag> (right bar → Machine config): pick an
-              accuracy and <Tag>Calibrate from board</Tag>. The rig sweeps poses,
-              detects the ChArUco board, and solves where the camera sits at each
-              angle.
+              <Tag>Motor calibration</Tag> (firmware): each axis measures its
+              steps per degree and top speed. This is being added to the
+              firmware; until then the server uses steps per degree measured on
+              the bench, and <Tag>Motion speed</Tag> shows them as °/s next to
+              each step rate.
+            </li>
+            <li>
+              <Tag>Zero the encoders</Tag> (right bar → Machine config → Step 0):
+              level the arm and press <Tag>Zero EL</Tag>; optionally{' '}
+              <Tag>Zero AZ</Tag> to name the platform heading 0°. The geometry
+              calibration stays blocked until the EL zero is set.
+            </li>
+            <li>
+              <Tag>Calibrate geometry</Tag> (Steps 1–2): set the ChArUco board,
+              pick an accuracy and <Tag>Calibrate from board</Tag>. The rig
+              sweeps poses, detects the board, and solves where the camera sits
+              at each angle.
             </li>
             <li>
               <Tag>Configure & run a scan</Tag> (left bar): set the Motion planner
               (elevation range / steps, azimuth step, actions) and press{' '}
               <Tag>Start scan</Tag> — the rig sweeps and shoots. Or take single
-              shots with <Tag>Take shot</Tag>.
+              shots with <Tag>Take shot</Tag>. Ring elevations must lie in the
+              EL travel.
             </li>
             <li>
               <Tag>Review</Tag> in the <Tag>Library</Tag> tab: open a scan to see
@@ -128,6 +142,13 @@ export function HelpView() {
             sizes, dictionary. Accuracy presets trade speed for a denser pose
             sweep (<Tag>Fine</Tag> = most accurate).
           </p>
+          <p>
+            A calibration describes the mechanics it was solved on — the rig
+            model (GLB) the server loads. After a change of mechanics it shows
+            amber, <Tag>from other mechanics</Tag>, and scans are refused until
+            you calibrate again or <Tag>Reset calibration</Tag> (the rig is then
+            drawn from the CAD model alone).
+          </p>
         </Section>
 
         <Section title="Testing accuracy">
@@ -138,6 +159,37 @@ export function HelpView() {
             calibration — reporting the delta (Δ rotation° / Δ position mm). A
             small delta means good agreement. (Needs a prior calibration.)
           </p>
+        </Section>
+
+        <Section title="Firmware, encoders and travel">
+          <Bullets>
+            <Bullet>
+              <Tag>Encoders</Tag>: an AS5600 magnetic encoder on each axis, each
+              on its own I2C bus — AZ on SDA 22 / SCL 23, EL on SDA 4 / SCL 16.
+              The <Tag>Encoders</Tag> card (right bar) reads both: angle, magnet
+              status and the idle level of each line. A LOW line is a short, a
+              wire on GND or a DIR pin, or an unpowered chip; missing external
+              pull-ups mean the sensor board has no supply.
+            </Bullet>
+            <Bullet>
+              <Tag>EL travel</Tag> is −25…+90°: the arm meets the cross rail at
+              about −28.8°. The firmware refuses a move outside it, the server
+              validates moves, jogs and scan plans against it, and the navball
+              shades the band below −25°. A <Tag>spin</Tag> is open loop: the
+              server stops an EL spin a few degrees before the limits.
+            </Bullet>
+            <Bullet>
+              <Tag>Speeds</Tag> are driver step rates (Hz, 1/16 microsteps); the
+              °/s next to them comes from the steps per degree the server holds.
+            </Bullet>
+            <Bullet>
+              <Tag>Updates over Wi-Fi</Tag>: the <Tag>Firmware</Tag> card uploads{' '}
+              <Path>firmware/build/orbiter.bin</Path>. The device reboots into
+              it; a new image confirms itself once its HTTP server is up, and
+              if it does not within 120 s the bootloader goes back to the
+              previous one. Encoder zeros in NVS are kept.
+            </Bullet>
+          </Bullets>
         </Section>
 
         <Section title="What the software is made of">
@@ -153,8 +205,9 @@ export function HelpView() {
               browser).
             </Bullet>
             <Bullet>
-              <Tag>Firmware (ESP32)</Tag> — a generic 2-axis IP actuator; it just
-              moves azimuth / elevation on command.
+              <Tag>Firmware (ESP32)</Tag> — a generic 2-axis IP actuator:
+              closed-loop moves on the encoder readings, the EL travel limits,
+              encoder zeros in NVS, updates over Wi-Fi.
             </Bullet>
             <Bullet>
               <Tag>Camera (phone / IP Webcam)</Tag> — streams live video + shoots

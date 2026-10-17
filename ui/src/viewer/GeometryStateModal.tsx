@@ -1,11 +1,9 @@
 /**
- * Geometry state modal — one screen with the live tunables (manual rig
- * geometry, kinematic offsets, render preferences). Read-only solver-output
- * sections (active_calibration, board_placement, etc.) were removed in v0.1
- * because the calibration pipeline isn't part of this slice yet.
+ * Geometry state modal — one screen with the geometry calibration (read-only
+ * solver output + Reset), the overrides of the CAD-derived geometry, the
+ * kinematic offsets and the render preferences.
  *
- * No new commands — uses the existing set_geometry / set_render_pref
- * dispatch.
+ * Commands: reset_calibration, set_machine_config, set_render_pref.
  */
 import { useState, useEffect } from 'react';
 import {
@@ -206,26 +204,23 @@ export function GeometryStateModal({
             </div>
           </Section>
 
-          {/* ── manual rig geometry ── */}
-          <Section title="Manual rig geometry">
+          {/* ── overrides of the CAD-derived geometry ── */}
+          <Section
+            title="Geometry overrides"
+            hint="Over the rig GLB; a calibration writes these"
+          >
             <Field
               label="arm_radius_mm"
               value={num('arm_radius_mm')}
-              onCommit={(v) => commands.setGeometry({ arm_radius_mm: v })}
+              onCommit={(v) => commands.setMachineConfig({ arm_radius_mm: v })}
               step="1"
+              hint="0 = the CAD arm's reach"
             />
             <Field
               label="camera_offset_mm"
               value={num('camera_offset_mm')}
-              onCommit={(v) => commands.setGeometry({ camera_offset_mm: v })}
+              onCommit={(v) => commands.setMachineConfig({ camera_offset_mm: v })}
               step="1"
-            />
-            <Field
-              label="base_height_mm"
-              value={num('base_height_mm')}
-              onCommit={(v) => commands.setGeometry({ base_height_mm: v })}
-              step="1"
-              hint="Disc top to AZ-EL axis (mm)"
             />
           </Section>
 
@@ -238,7 +233,7 @@ export function GeometryStateModal({
               label="el_kinematic_offset_deg"
               value={num('el_kinematic_offset_deg')}
               onCommit={(v) =>
-                commands.setGeometry({ el_kinematic_offset_deg: v })
+                commands.setMachineConfig({ el_kinematic_offset_deg: v })
               }
               step="0.5"
             />
@@ -246,7 +241,7 @@ export function GeometryStateModal({
               label="az_kinematic_offset_deg"
               value={num('az_kinematic_offset_deg')}
               onCommit={(v) =>
-                commands.setGeometry({ az_kinematic_offset_deg: v })
+                commands.setMachineConfig({ az_kinematic_offset_deg: v })
               }
               step="0.5"
             />
