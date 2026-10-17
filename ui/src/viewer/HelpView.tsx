@@ -157,9 +157,10 @@ export function HelpView() {
               moves azimuth / elevation on command.
             </Bullet>
             <Bullet>
-              <Tag>Camera (phone / IP Webcam)</Tag> — streams live video + shoots
-              stills, and reports orientation (IMU) used as a redundant tilt
-              indicator on the navball.
+              <Tag>Camera (phone)</Tag> — the CameraStreamer capture node app
+              (or, legacy, IP Webcam): live preview, stills, and the phone IMU
+              used as a redundant tilt indicator on the navball. The server
+              detects which app answers on the camera URL.
             </Bullet>
           </Bullets>
         </Section>
@@ -184,11 +185,35 @@ export function HelpView() {
           </Bullets>
         </Section>
 
+        <Section title="The phone camera">
+          <p>
+            Set the phone&apos;s address as the <Tag>camera URL</Tag> (Machine config
+            → Connections, e.g. <Path>http://192.168.0.248:8080</Path>). The
+            preview in the top-right corner shows the stream, its URL and the last
+            error; click it for the full view.
+          </p>
+          <p>
+            On the <Tag>capture node</Tag> every photo is shot on one locked
+            manual profile (exposure, ISO, focus, white balance) and checked
+            against it. Lock it once per setup in the full camera view:{' '}
+            <Tag>Lock (meter)</Tag> meters the scene once and freezes it,{' '}
+            <Tag>Re-lock saved</Tag> brings back the profile saved on the phone. A
+            scan does not start on an unlocked phone. During a scan the rig moves
+            on as soon as a frame is exposed; the photo is pulled off the phone in
+            the background.
+          </p>
+          <p>
+            A photo that cannot be taken fails its shot or scan point (shown in the
+            log panel) — nothing is ever stored in its place.
+          </p>
+        </Section>
+
         <Section title="The navball">
           <p>
             To the left of the controls, the navball shows the live azimuth /
             elevation attitude. The purple marker is the phone-camera-based
-            elevation estimate (a redundant sensor) and can be toggled off.
+            elevation estimate (a redundant sensor) and can be toggled off; it and
+            its toggle only appear while the phone reports its IMU.
           </p>
         </Section>
       </div>
