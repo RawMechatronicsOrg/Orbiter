@@ -233,6 +233,12 @@ async def fetch_photo(el_deg: float | None = None) -> bytes:
     taken — the caller fails the shot, it never gets a blank stand-in."""
     if await is_capture_node():
         return await _node_photo()
+    return await fetch_webcam_photo()
+
+
+async def fetch_webcam_photo() -> bytes:
+    """The IP Webcam half of `fetch_photo`, for callers that already know the
+    phone is not a capture node. Raises `CameraError`."""
     base = camera_base()
     if base is None:
         raise CameraError("camera_url is not configured — set the camera URL in "
@@ -307,11 +313,15 @@ class ShotError(CameraError):
     ``definitive`` — the phone says the shot itself failed: retrying the SAME
     id returns that failure again, a retry needs a new id. Otherwise (busy,
     not settled, network) the same id is safe to retry: the phone never
-    shoots a known id twice and records nothing for a 503."""
+    shoots a known id twice and records nothing for a 503.
 
-    def __init__(self, message: str, definitive: bool = False):
+    ``retryable`` False — no retry helps until the operator acts (the phone
+    is not locked on a profile)."""
+
+    def __init__(self, message: str, definitive: bool = False, retryable: bool = True):
         super().__init__(message)
         self.definitive = definitive
+        self.retryable = retryable
 
 
 _shared: tuple[asyncio.AbstractEventLoop, httpx.AsyncClient] | None = None
@@ -360,11 +370,21 @@ def new_shot_id(prefix: str) -> str:
     return f"{prefix}-{time.strftime('%Y%m%d-%H%M%S')}-{next(_shot_counter)}"
 
 
+def _node_answer(resp: httpx.Response) -> bool | None:
+    """Whether a ``GET /status`` answer comes from a capture node; None when
+    it says neither (a 5xx: something answers, but is failing)."""
+    if resp.status_code >= 500:
+        return None
+    return resp.status_code == 200 and _body(resp).get("app") == _NODE_APP
+
+
 async def is_capture_node() -> bool:
     """True when ``camera_url`` points at a CameraStreamer capture node.
 
-    Answers are cached per URL for `_NODE_CACHE_S`; an unreachable phone is
-    not cached, so the next call asks again."""
+    Answers are cached per URL for `_NODE_CACHE_S` (`monitor` refreshes them).
+    When the phone does not answer, or answers 5xx, the last answer for the
+    URL stands — a known node stays a node through a WiFi blip, so a shot is
+    never sent down the IP Webcam path; with no answer yet, False."""
     base = camera_base()
     if base is None:
         return False
@@ -374,11 +394,24 @@ async def is_capture_node() -> bool:
         return hit[0]
     try:
         resp = await _client().get(f"{base}/status", timeout=_CONTROL_TIMEOUT_S)
-    except Exception:  # noqa: BLE001 — unreachable: no answer to cache
-        return False
-    is_node = resp.status_code == 200 and _body(resp).get("app") == _NODE_APP
+    except Exception:  # noqa: BLE001 — unreachable: nothing new to cache
+        return hit[0] if hit else False
+    is_node = _node_answer(resp)
+    if is_node is None:
+        return hit[0] if hit else False
     _node_cache[base] = (is_node, now)
     return is_node
+
+
+async def require_ready() -> None:
+    """Raises `CameraError` unless shots can be attempted at all: a camera URL
+    is set and, on a capture node, the phone is ready and locked on a profile
+    — a scan or a calibration must never run on auto exposure."""
+    if camera_base() is None:
+        raise CameraError("camera_url is not configured — set the camera URL in "
+                          "Machine config → Connections")
+    if await is_capture_node():
+        await require_locked_node()
 
 
 async def require_locked_node() -> dict[str, Any]:
@@ -412,7 +445,8 @@ async def trigger_shot(shot_id: str, meta: dict[str, Any]) -> dict[str, Any]:
         raise ShotError(f"shot {shot_id}: {exc!r}") from exc
     record = _body(resp)
     if resp.status_code == 409:
-        raise ShotError(f"shot {shot_id}: the phone camera is not locked — {_LOCK_HINT}")
+        raise ShotError(f"shot {shot_id}: the phone camera is not locked — {_LOCK_HINT}",
+                        retryable=False)
     if resp.status_code not in (200, 201) or record.get("state") == "failed":
         raise ShotError(f"shot {shot_id}: HTTP {resp.status_code} "
                         f"{record.get('error') or _error(resp)}",
@@ -493,7 +527,7 @@ async def _node_photo() -> bytes:
             jpeg, _record = await fetch_shot(shot_id)
             break
         except ShotError as exc:
-            if attempt == _PHOTO_ATTEMPTS:
+            if attempt == _PHOTO_ATTEMPTS or not exc.retryable:
                 raise
             log.warning("photo %s failed (attempt %d/%d): %s — retrying",
                         shot_id, attempt, _PHOTO_ATTEMPTS, exc)
@@ -522,19 +556,29 @@ async def _capabilities(base: str) -> dict[str, Any]:
     return caps
 
 
-async def capture_preset() -> str:
-    """The `camera_adapter` preset the next capture is stored with.
+def _sensor_preset(caps: dict[str, Any]) -> str:
+    """The `sensor*` preset for the node's open camera. Raises `ShotError`
+    when its capabilities carry no usable ``sensor_orientation``."""
+    deg = caps.get("sensor_orientation")
+    if isinstance(deg, bool) or not isinstance(deg, (int, float)):
+        raise ShotError(f"phone capabilities carry no sensor_orientation ({deg!r})")
+    return sensor_preset_name(int(deg))
+
+
+async def capture_preset(is_node: bool) -> str:
+    """The `camera_adapter` preset the next capture is stored with, for the
+    path the caller takes (``is_node`` from `is_capture_node`, asked once per
+    shot so the preset and the shot cannot disagree).
 
     A capture node shoots sensor-native pixels (EXIF says "no rotation"), so
     its preset follows the camera's sensor orientation — the rotation that
     turns those pixels upright for a phone mounted in its natural (portrait)
     orientation, which is how the rig holds it. IP Webcam keeps the operator's
-    `model.camera_preset`. Raises `ShotError` when the node does not answer —
+    `model.camera_preset`. Raises `ShotError` when the node does not say —
     a capture must not guess its orientation."""
-    if not await is_capture_node():
+    if not is_node:
         return model.camera_preset
-    caps = await _capabilities(_require_base())
-    return sensor_preset_name(int(caps.get("sensor_orientation") or 0))
+    return _sensor_preset(await _capabilities(_require_base()))
 
 
 #: Profile operations the UI may run on the node (`POST /camera/node/{op}`).
@@ -575,6 +619,7 @@ def _node_summary(status: dict[str, Any], caps: dict[str, Any] | None) -> dict[s
     values, so the model only broadcasts real changes)."""
     profile = status.get("profile") or {}
     device = status.get("device") or {}
+    free = status.get("storage_free_bytes")
     return {
         "version": status.get("version"),
         "state": status.get("state"),
@@ -590,7 +635,10 @@ def _node_summary(status: dict[str, Any], caps: dict[str, Any] | None) -> dict[s
         "profile": {k: profile.get(k) for k in
                     ("exposure_ns", "iso", "focus_diopters", "wb_mode", "torch")},
         "shots": status.get("shots") or {},
-        "storage_free_bytes": status.get("storage_free_bytes"),
+        # Rounded to 100 MB: the exact count moves with every file the phone
+        # writes, and each change would rebroadcast the whole summary.
+        "storage_free_bytes": (round(free / 1e8) * 100_000_000
+                               if isinstance(free, (int, float)) else None),
         "battery_pct": device.get("battery_pct"),
         "charging": device.get("charging"),
         "thermal": device.get("thermal"),
@@ -635,11 +683,13 @@ class CameraMonitor:
             return
         try:
             resp = await _client().get(f"{base}/status", timeout=_CONTROL_TIMEOUT_S)
-        except httpx.HTTPError:
+        except Exception:  # noqa: BLE001 — unreachable or a malformed URL
+            resp = None
+        is_node = None if resp is None else _node_answer(resp)
+        if is_node is None:
             model.update(camera_kind="offline", camera_node=None, camera_quarter_turns=turns)
             return
         status = _body(resp)
-        is_node = resp.status_code == 200 and status.get("app") == _NODE_APP
         _node_cache[base] = (is_node, time.monotonic())
         if not is_node:
             # Any other HTTP answer on the camera port is taken for IP Webcam.
@@ -650,11 +700,9 @@ class CameraMonitor:
             del _caps_cache[base]   # the camera was switched on the phone
         try:
             caps: dict[str, Any] | None = await _capabilities(base)
+            turns = get_preset(_sensor_preset(caps)).extra_cw_quarter_turns % 4
         except ShotError:
             caps = None
-        if caps is not None:
-            preset = get_preset(sensor_preset_name(int(caps.get("sensor_orientation") or 0)))
-            turns = preset.extra_cw_quarter_turns % 4
         model.update(camera_kind="capture_node", camera_node=_node_summary(status, caps),
                      camera_quarter_turns=turns)
 

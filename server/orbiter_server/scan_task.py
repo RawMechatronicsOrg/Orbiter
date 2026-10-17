@@ -22,7 +22,6 @@ from __future__ import annotations
 import asyncio
 import bisect
 import logging
-import threading
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -158,11 +157,13 @@ async def _take(
     geom = _geom_params()
     az_act, el_act = model.az, model.el
     pose = camera_pose_at(az_act, el_act, geom)
-    # The orientation the pixels will be stored in: a capture node's follows
-    # its sensor, IP Webcam's the operator's preset (`camera_io.capture_preset`).
-    preset = get_preset(await camera_io.capture_preset())
+    # Which camera answers is asked once: the shot and the orientation its
+    # pixels are stored in (a node's follows its sensor, IP Webcam's the
+    # operator's preset — `camera_io.capture_preset`) must agree.
+    is_node = await camera_io.is_capture_node()
+    preset = get_preset(await camera_io.capture_preset(is_node))
     raw: bytes | None = None
-    if await camera_io.is_capture_node():
+    if is_node:
         shot_id = shot_id or camera_io.new_shot_id(f"{scan_id}-{index:04d}")
         await camera_io.trigger_shot(shot_id, {
             "scan_id": scan_id, "index": index, "action": action,
@@ -170,7 +171,7 @@ async def _take(
         })
     else:
         shot_id = None
-        raw = await camera_io.fetch_photo(el_deg=el_act)
+        raw = await camera_io.fetch_webcam_photo()
 
     # Bank the stored camera orientation by the live bracket roll — ONLY on
     # the manual-model path. The calibrated mount X already carries the
@@ -408,15 +409,8 @@ def _build_manifest() -> Manifest:
     return base.model_copy(update=update)
 
 
-#: One manifest write at a time. Background stores, the sweep and the autosave
-#: each write from their own worker thread; two renames over the same
-#: manifest.json race (on a network share the loser gets "Access is denied").
-_manifest_write = threading.Lock()
-
-
 def _write_active_manifest() -> None:
-    with _manifest_write:
-        storage.write_manifest(_build_manifest())
+    storage.write_manifest(_build_manifest())
 
 
 async def persist_active_manifest_now() -> None:
@@ -772,14 +766,7 @@ async def start_scan() -> dict[str, Any]:
     if not check:
         raise RuntimeError("discrete plan is empty — check params")
 
-    if camera_io.camera_base() is None:
-        raise RuntimeError("camera_url is not configured — set the camera URL in "
-                           "Machine config → Connections")
-    if await camera_io.is_capture_node():
-        try:
-            await camera_io.require_locked_node()
-        except camera_io.ShotError as exc:
-            raise RuntimeError(str(exc)) from exc
+    await camera_io.require_ready()
 
     info = await new_active_scan(machine_captured=True)
     scan_id = info["scan_id"]

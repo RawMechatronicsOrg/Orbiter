@@ -20,6 +20,7 @@ from fastapi.responses import StreamingResponse
 
 import camera_io
 from camera_stream import stream
+from orbiter_model import model
 
 log = logging.getLogger("orbiter.stream")
 
@@ -81,10 +82,15 @@ def camera_status() -> dict:
 @router.post("/camera/node/{op}")
 async def camera_node_op(op: str, body: dict[str, Any] = Body(default_factory=dict)) -> dict:
     """Lock (meter once and freeze), re-apply / patch the profile, or unlock
-    the capture node. Returns the phone's apply result; 502 with the phone's
-    reason when it refuses or does not answer."""
+    the capture node. Returns the phone's apply result; 409 while a scan
+    runs; 502 with the phone's reason when it refuses or does not answer."""
     if op not in camera_io.NODE_OPS:
         raise HTTPException(404, f"unknown operation {op!r}")
+    if model.scan_running:
+        # A re-metered or unlocked camera would shoot the rest of the scan
+        # with other settings (or not at all).
+        raise HTTPException(409, "a scan is running — the camera profile stays "
+                                 "as it is until the scan ends")
     try:
         return await camera_io.node_control(op, body)
     except camera_io.CameraError as exc:

@@ -209,6 +209,10 @@ function NodeRow({ label, value, warn }: { label: string; value: string; warn?: 
 function NodePanel({ node }: { node: CameraNode }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The server refuses profile changes mid-scan (409): the rest of the scan
+  // would be shot with other settings.
+  const scanRunning = useViewerStore((s) => s.model.scan_running === true);
+  const blocked = busy !== null || scanRunning;
 
   const run = async (op: 'lock' | 'profile' | 'unlock') => {
     setBusy(op);
@@ -268,7 +272,7 @@ function NodePanel({ node }: { node: CameraNode }) {
         <Button
           size="sm"
           variant={locked ? 'secondary' : 'default'}
-          disabled={busy !== null}
+          disabled={blocked}
           onClick={() => void run('lock')}
           title="Meter once with auto exposure, focus (centre) and white balance, then freeze exactly those values as the manual profile"
         >
@@ -277,7 +281,7 @@ function NodePanel({ node }: { node: CameraNode }) {
         <Button
           size="sm"
           variant="secondary"
-          disabled={busy !== null}
+          disabled={blocked}
           onClick={() => void run('profile')}
           title="Lock the profile saved on the phone again, without metering"
         >
@@ -287,13 +291,16 @@ function NodePanel({ node }: { node: CameraNode }) {
           size="sm"
           variant="secondary"
           className="col-span-2"
-          disabled={busy !== null || !locked}
+          disabled={blocked || !locked}
           onClick={() => void run('unlock')}
           title="Back to auto exposure / focus / white balance; the saved profile stays"
         >
           {busy === 'unlock' ? 'Unlocking…' : 'Unlock (auto)'}
         </Button>
       </div>
+      {scanRunning && (
+        <div className="text-[11px] text-sky-300">A scan is running — the profile stays locked.</div>
+      )}
       {error && <div className="break-all text-[11px] text-rose-300/90">{error}</div>}
       {!locked && (
         <div className="text-[11px] leading-snug text-amber-300/90">

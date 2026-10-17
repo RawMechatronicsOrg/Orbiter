@@ -206,7 +206,7 @@ def rig(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     async def is_node() -> bool:
         return True
 
-    async def preset() -> str:
+    async def preset(_is_node: bool) -> str:
         return "sensor90"
 
     async def nothing(*_args: Any) -> None:
@@ -276,7 +276,8 @@ def test_an_unlocked_phone_refuses_the_shot_with_a_hint(phone: FakePhone) -> Non
     phone.mode = "metering"
     with pytest.raises(camera_io.ShotError, match="not locked") as exc:
         asyncio.run(camera_io.fetch_photo())
-    assert exc.value.definitive is False
+    assert exc.value.definitive is False and exc.value.retryable is False
+    assert phone.calls.count("POST /shots") == 1  # not retried: nothing would change
 
 
 def test_fetch_photo_retries_a_busy_phone_with_the_same_id(phone: FakePhone) -> None:
@@ -285,6 +286,46 @@ def test_fetch_photo_retries_a_busy_phone_with_the_same_id(phone: FakePhone) -> 
     posted = [c for c in phone.calls if c == "POST /shots"]
     assert len(posted) == 3
     assert phone.shots == {}
+
+
+def test_calibration_refuses_an_unlocked_node_before_moving(
+    phone: FakePhone, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import calibration
+
+    moved: list[Any] = []
+
+    async def move(**kwargs: Any) -> None:
+        moved.append(kwargs)
+
+    monkeypatch.setattr(calibration.esp, "move_and_await", move)
+    phone.mode = "metering"
+    with pytest.raises(camera_io.ShotError, match="not locked"):
+        asyncio.run(calibration.run_calibration(poses=[(0.0, 10.0)] * 3))
+    assert moved == []
+
+
+def test_calibration_skips_one_lost_photo_but_stops_on_a_dead_camera(
+    phone: FakePhone, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import calibration
+
+    async def move(**_kwargs: Any) -> None:
+        return None
+
+    shots = iter([camera_io.ShotError("wifi"), None, camera_io.ShotError("wifi"),
+                  camera_io.ShotError("wifi")])
+
+    async def capture(*_args: Any) -> None:
+        outcome = next(shots)
+        if outcome is not None:
+            raise outcome
+        return None  # board not detected
+
+    monkeypatch.setattr(calibration.esp, "move_and_await", move)
+    monkeypatch.setattr(calibration, "_capture_one", capture)
+    with pytest.raises(RuntimeError, match="failed at 2 poses in a row"):
+        asyncio.run(calibration.run_calibration(poses=[(0.0, 10.0)] * 6))
 
 
 def test_a_scan_refuses_to_start_without_a_camera(phone: FakePhone) -> None:
@@ -301,16 +342,40 @@ def test_a_scan_refuses_to_start_without_a_camera(phone: FakePhone) -> None:
 
 
 def test_a_node_capture_is_oriented_by_the_sensor(phone: FakePhone) -> None:
-    assert asyncio.run(camera_io.capture_preset()) == "sensor90"
+    assert asyncio.run(camera_io.capture_preset(True)) == "sensor90"
     phone.sensor_orientation = 270
     camera_io._caps_cache.clear()
-    assert asyncio.run(camera_io.capture_preset()) == "sensor270"
+    assert asyncio.run(camera_io.capture_preset(True)) == "sensor270"
+
+
+@pytest.mark.parametrize("orientation", [None, "90"])
+def test_a_node_without_a_sensor_orientation_is_not_guessed(
+    phone: FakePhone, orientation: Any,
+) -> None:
+    phone.sensor_orientation = orientation
+    with pytest.raises(camera_io.ShotError, match="sensor_orientation"):
+        asyncio.run(camera_io.capture_preset(True))
 
 
 def test_ip_webcam_keeps_the_operator_preset(phone: FakePhone) -> None:
-    phone.app = "ipwebcam"
     model.update(camera_preset="sm22")
-    assert asyncio.run(camera_io.capture_preset()) == "sm22"
+    assert asyncio.run(camera_io.capture_preset(False)) == "sm22"
+
+
+def test_a_failing_node_stays_a_node(phone: FakePhone, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert asyncio.run(camera_io.is_capture_node()) is True
+    monkeypatch.setattr(camera_io, "_NODE_CACHE_S", 0.0)  # every call asks again
+    for answer in (httpx.Response(503, json={"error": "restarting"}), httpx.ConnectError("down")):
+        def failing(_request: httpx.Request, answer: Any = answer) -> httpx.Response:
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        transport = httpx.MockTransport(failing)
+        monkeypatch.setattr(camera_io, "_client", lambda: httpx.AsyncClient(transport=transport))
+        assert asyncio.run(camera_io.is_capture_node()) is True
+        asyncio.run(camera_io.monitor.refresh())
+        assert model.camera_kind == "offline"
 
 
 def test_the_monitor_publishes_the_node(phone: FakePhone) -> None:
