@@ -29,6 +29,7 @@ import httpx
 import websockets
 
 from config import settings
+from geom.angles import EL_MAX, EL_MIN
 from orbiter_model import ModelState, model
 
 log = logging.getLogger("orbiter.esp")
@@ -49,6 +50,17 @@ _POLL_INTERVAL_S = 0.25
 #: rebooted without a TCP FIN, network dropped, …). Forces a reconnect — the
 #: firmware emits `pose` at ~10 Hz, so a multi-second gap is never legitimate.
 _STREAM_IDLE_TIMEOUT_S = 5.0
+#: Read-only diagnostics (/health, /test/encoder) answer at once or not at all
+#: (the device is rebooting) — fail fast so a UI poll stays responsive.
+_DIAG_TIMEOUT_S = 3.0
+#: POST /ota streams ~1-2 MB over the ESP's Wi-Fi, then the device verifies
+#: the image before it answers.
+_OTA_TIMEOUT_S = 120.0
+#: A spin is open loop and the firmware does not stop it at the EL travel
+#: limits (API.md, POST /spin), so the proxy does: an EL spin heading out of
+#: the travel is stopped this far before the limit. One pose frame (10 Hz)
+#: at the top EL step rate is about 1°.
+_EL_SPIN_MARGIN_DEG = 3.0
 
 LogCallback = Callable[[dict[str, Any]], None]
 
@@ -77,6 +89,9 @@ class EspProxy:
         #: one-shot guard so the "degraded to REST poll" notice fires once.
         self._degraded_logged = False
         self._hydrate_task: asyncio.Task[None] | None = None
+        #: Last EL reading and the pending guard stop (see `_guard_el_spin`).
+        self._last_el: float | None = None
+        self._el_stop_task: asyncio.Task[None] | None = None
 
     # ── lifecycle ───────────────────────────────────────────────────────────
 
@@ -225,12 +240,16 @@ class EspProxy:
                 "esp_online": True,
                 "motion_state": frame.get("st", "unknown"),
                 "motors_on": bool(frame.get("motors", False)),
+                "spinning_az": bool(frame.get("sp_az", False)),
+                "spinning_el": bool(frame.get("sp_el", False)),
             }
             if "az" in frame:
                 patch["az"] = float(frame["az"])
             if "el" in frame:
                 patch["el"] = float(frame["el"])
             self.model.update(**patch)
+            if "el" in patch:
+                self._guard_el_spin(patch["el"])
 
         elif kind == "task":
             self.model.update(runner={
@@ -326,6 +345,9 @@ class EspProxy:
             patch["motion_state"] = data["state"]
         if "motors_enabled" in data:
             patch["motors_on"] = bool(data["motors_enabled"])
+        for key in ("spinning_az", "spinning_el"):
+            if key in data:
+                patch[key] = bool(data[key])
         az = data.get("azimuth")
         if isinstance(az, dict) and "angle_deg" in az:
             patch["az"] = float(az["angle_deg"])
@@ -346,6 +368,34 @@ class EspProxy:
                 "result": runner.get("result"),
             }
         self.model.update(**patch)
+        if "el" in patch:
+            self._guard_el_spin(patch["el"])
+
+    def _guard_el_spin(self, el: float) -> None:
+        """Stop an EL spin that is heading out of the travel. Direction comes
+        from the reading trend — which way cw/ccw turns the arm is wiring."""
+        prev, self._last_el = self._last_el, el
+        if not self.model.spinning_el or prev is None:
+            return
+        if self._el_stop_task is not None and not self._el_stop_task.done():
+            return
+        if el < prev and el <= EL_MIN + _EL_SPIN_MARGIN_DEG:
+            limit = EL_MIN
+        elif el > prev and el >= EL_MAX - _EL_SPIN_MARGIN_DEG:
+            limit = EL_MAX
+        else:
+            return
+        msg = f"EL spin stopped at {el:.1f}° — {limit:+g}° travel limit ahead"
+        log.warning(msg)
+        self._emit_log("W", "esp", msg)
+        self._el_stop_task = asyncio.get_running_loop().create_task(self._stop_el_spin())
+
+    async def _stop_el_spin(self) -> None:
+        try:
+            await self.spin_stop("el")
+        except EspError as exc:
+            log.error("EL spin guard: /spin/stop failed: %s", exc)
+            self._emit_log("E", "esp", f"EL spin guard could not stop the axis: {exc}")
 
     def _emit_log(self, level: str, tag: str, msg: str) -> None:
         cb = self.on_log
@@ -458,6 +508,40 @@ class EspProxy:
         if resp.status_code >= 400:
             raise EspError(data.get("message") or f"{path}: HTTP {resp.status_code}")
         return data
+
+    async def get_json(self, path: str) -> dict[str, Any]:
+        """A read-only firmware GET (`/health`, `/test/encoder`) with a short
+        timeout. Raises EspError when the device does not answer."""
+        if self._client is None:
+            raise EspError("ESP proxy not started")
+        try:
+            async with self._http_lock:
+                resp = await self._client.get(path, timeout=_DIAG_TIMEOUT_S)
+            resp.raise_for_status()
+            return resp.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise EspError(f"{path}: {type(exc).__name__}: {exc}") from exc
+
+    async def ota(self, image: bytes) -> tuple[int, dict[str, Any]]:
+        """Stream a firmware image to `POST /ota`. Returns the firmware's
+        status code and JSON as they are — 200 means written, verified and
+        rebooting; 400/409/413/500 carry its reason. Raises EspError only when
+        the device cannot be reached."""
+        if self._client is None:
+            raise EspError("ESP proxy not started")
+        try:
+            async with self._http_lock:
+                resp = await self._client.post(
+                    "/ota", content=image, timeout=_OTA_TIMEOUT_S,
+                    headers={"Content-Type": "application/octet-stream"},
+                )
+        except httpx.HTTPError as exc:
+            raise EspError(f"/ota: {type(exc).__name__}: {exc}") from exc
+        try:
+            data = resp.json() if resp.content else {}
+        except ValueError:
+            data = {"status": "error", "message": resp.text[:200]}
+        return resp.status_code, data
 
     async def wait_for_task(self, task_id: int, timeout_s: float) -> dict[str, Any]:
         """Wait until the task reaches a terminal status. `model.runner` is kept
@@ -573,6 +657,14 @@ class EspProxy:
 
     async def motors(self, enabled: bool) -> dict[str, Any]:
         return await self._post("/motors", {"enabled": enabled})
+
+    async def spin(self, axis: str, direction: str, step_hz: int) -> dict[str, Any]:
+        """Continuous rotation of one axis at a driver step rate (open loop).
+        An EL spin is stopped short of the travel by `_guard_el_spin`."""
+        return await self._post("/spin", {"axis": axis, "dir": direction, "step_hz": step_hz})
+
+    async def spin_stop(self, axis: str = "both") -> dict[str, Any]:
+        return await self._post("/spin/stop", {"axis": axis})
 
     async def reboot(self) -> dict[str, Any]:
         """Ask the firmware to restart. The device acks 200 then reboots

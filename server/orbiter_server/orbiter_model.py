@@ -127,6 +127,9 @@ class ModelState:
     move_target_el: float | None = None
     motion_state: str = "unknown"      # idle | moving | spinning | error | unknown
     motors_on: bool = False
+    # Per-axis continuous spin (firmware POST /spin), from the pose stream.
+    spinning_az: bool = False
+    spinning_el: bool = False
     # Raw /state.runner snapshot: {id, status, kind, result}.
     runner: dict[str, Any] | None = None
     # Firmware-reported encoder zero offsets (az/el raw degrees).

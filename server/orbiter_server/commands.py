@@ -17,7 +17,7 @@ import math
 from typing import Any, Awaitable, Callable
 
 import scan_task
-from drive import clamp_hz
+from drive import AXES, clamp_hz
 from esp_proxy import esp
 from geom.angles import EL_MAX, EL_MIN, clamp_el, is_el_valid
 from orbiter_model import model
@@ -584,6 +584,48 @@ async def _cmd_calibrate_encoder(args: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+async def _cmd_spin(args: dict[str, Any]) -> dict[str, Any]:
+    """Continuous rotation `{axis: az|el, dir: cw|ccw, step_hz}` — open loop,
+    at a driver step rate inside the axis' speed band (drive.AXES).
+
+    EL needs its zero: the proxy stops an EL spin short of the travel limits
+    from the encoder reading, which means nothing on an unzeroed encoder."""
+    axis = str(args.get("axis", ""))
+    direction = str(args.get("dir", "cw"))
+    if axis not in AXES:
+        raise CommandError("spin: axis must be 'az' or 'el'")
+    if direction not in ("cw", "ccw"):
+        raise CommandError("spin: dir must be 'cw' or 'ccw'")
+    band = AXES[axis]
+    try:
+        step_hz = int(args.get("step_hz", band.hz_default))
+    except (TypeError, ValueError) as exc:
+        raise CommandError(f"spin: bad step_hz: {exc}") from exc
+    if not band.hz_min <= step_hz <= band.hz_max:
+        raise CommandError(
+            f"spin: step_hz must be {band.hz_min}..{band.hz_max} Hz for {axis.upper()}"
+        )
+    if model.scan_running:
+        raise CommandError("spin: a scan is running")
+    if axis == "el":
+        if not model.encoder_zero_initialized:
+            raise CommandError(
+                "spin: zero the EL encoder first (Machine config → Step 0) — the "
+                "travel guard reads it"
+            )
+        if not is_el_valid(model.el):
+            raise CommandError(f"spin: EL reads {model.el:.1f}°, outside the travel {_EL_TRAVEL}")
+    return await esp.spin(axis, direction, step_hz)
+
+
+async def _cmd_spin_stop(args: dict[str, Any]) -> dict[str, Any]:
+    """Stop continuous rotation: `{axis: az|el|both}` (default both)."""
+    axis = str(args.get("axis", "both"))
+    if axis not in _ZERO_AXES:
+        raise CommandError("spin_stop: axis must be 'az', 'el' or 'both'")
+    return await esp.spin_stop(axis)
+
+
 async def _cmd_reboot_firmware(_args: dict[str, Any]) -> dict[str, Any]:
     """Restart the ESP32 firmware. The device drops offline for a few seconds;
     the poll loop flips `esp_online` back when it returns."""
@@ -771,6 +813,8 @@ _COMMANDS: dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]] = {
     "move": _cmd_move,
     "jog": _cmd_jog,
     "motors": _cmd_motors,
+    "spin": _cmd_spin,
+    "spin_stop": _cmd_spin_stop,
     "calibrate_encoder": _cmd_calibrate_encoder,
     "reboot_firmware": _cmd_reboot_firmware,
     # scan-loop / capture

@@ -31,6 +31,11 @@ export interface StereoEye {
 export interface Commands {
   move(az?: number, el?: number): void;
   motors(enabled: boolean): void;
+  /** Continuous rotation of one axis at a driver step rate (Hz) inside the
+   *  band of `model.axes`. The server refuses an EL spin without the EL zero
+   *  and stops one heading out of the travel. */
+  spin(axis: 'az' | 'el', dir: 'cw' | 'ccw', stepHz: number): void;
+  spinStop(axis: Axis): void;
   /** Set or clear the firmware encoder zero (`calibrate_encoder`):
    *  `current` takes the present reading as 0, `reset` drops the zero. Not the
    *  geometry calibration (Machine config → "Calibrate from board"). */
@@ -101,6 +106,9 @@ export function makeCommands(client: WsClient): Commands {
       client.sendCommand('move', { az, el });
     },
     motors: (enabled) => client.sendCommand('motors', { enabled }),
+    spin: (axis, dir, stepHz) =>
+      client.sendCommand('spin', { axis, dir, step_hz: Math.round(stepHz) }),
+    spinStop: (axis) => client.sendCommand('spin_stop', { axis }),
     zeroEncoder: (axis, mode = 'current') =>
       client.sendCommand('calibrate_encoder', { axis, mode }),
     rebootEsp: () => client.sendCommand('reboot_esp'),
