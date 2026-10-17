@@ -30,6 +30,8 @@ typedef struct {
     esp_timer_handle_t timer;
     volatile int32_t  steps_remaining;
     volatile bool     step_high;
+    volatile int32_t  position;      /* net microsteps, + for DIR_CCW      */
+    volatile int8_t   dir_step;      /* +1 / -1 for the current direction  */
     SemaphoreHandle_t done_sem;
 } stepper_ctx_t;
 
@@ -45,6 +47,7 @@ static void IRAM_ATTR step_timer_cb(void *arg)
         gpio_set_level(s->step_pin, 0);
         s->step_high = false;
         s->steps_remaining--;
+        s->position += s->dir_step;
 
         if (s->steps_remaining <= 0) {
             esp_timer_stop(s->timer);
@@ -133,6 +136,7 @@ esp_err_t stepper_move(stepper_axis_t axis, uint32_t steps,
      * resolved in motion.c (delta ≥ 0 → DIR_CCW). See COORDINATES.md §6.
      */
     gpio_set_level(s->dir_pin, (int)dir);
+    s->dir_step        = (dir == DIR_CCW) ? 1 : -1;
     s->steps_remaining = (int32_t)steps;
     s->step_high       = false;
 
@@ -185,6 +189,16 @@ void stepper_stop(stepper_axis_t axis)
     gpio_set_level(s->step_pin, 0);
     s->step_high = false;
     xSemaphoreTake(s->done_sem, 0);   /* drain any stale token */
+}
+
+int32_t stepper_position(stepper_axis_t axis)
+{
+    return (axis < 2) ? s_ctx[axis].position : 0;
+}
+
+void stepper_reset_position(stepper_axis_t axis)
+{
+    if (axis < 2) s_ctx[axis].position = 0;
 }
 
 bool stepper_is_busy(stepper_axis_t axis)

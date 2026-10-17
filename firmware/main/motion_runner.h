@@ -28,8 +28,9 @@ extern "C" {
  */
 
 typedef enum {
-    MR_KIND_MOVE = 1,
-    MR_KIND_JOG  = 2,
+    MR_KIND_MOVE      = 1,
+    MR_KIND_JOG       = 2,
+    MR_KIND_MOTOR_CAL = 3,   /* motorcal_run on one axis, minutes long */
 } mr_kind_t;
 
 typedef enum {
@@ -58,6 +59,9 @@ typedef struct {
             uint32_t       step_hz;
             stepper_dir_t  dir;
         } jog;
+        struct {
+            stepper_axis_t axis;
+        } motor_cal;
     } u;
 } mr_cmd_t;
 
@@ -70,6 +74,7 @@ typedef struct {
     union {
         struct { motion_pos_t final; uint32_t duration_ms; } move;
         struct { uint32_t duration_ms; } jog;
+        struct { stepper_axis_t axis; uint32_t duration_ms; } motor_cal;
     } result;
 } mr_snapshot_t;
 

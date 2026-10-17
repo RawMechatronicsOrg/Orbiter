@@ -186,7 +186,7 @@ static void start_http_server(void)
     httpd_config_t config  = HTTPD_DEFAULT_CONFIG();
     config.server_port     = CONFIG_ORBITER_HTTP_PORT;
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 27;   /* default is 8, we now have 20 routes + /ws/log */
+    config.max_uri_handlers = 32;   /* default is 8, we now have 27 routes + /ws/log */
 
     /*
      * UI polls /state every 250 ms and browsers (Firefox/Chrome) tend to
@@ -229,6 +229,13 @@ static void start_http_server(void)
         { .uri = "/reboot",       .method = HTTP_POST,    .handler = handler_reboot       },
         { .uri = "/reboot",       .method = HTTP_OPTIONS, .handler = handler_options      },
         { .uri = "/ota",          .method = HTTP_POST,    .handler = handler_ota          },
+        { .uri = "/motor/calibrate",        .method = HTTP_POST,    .handler = handler_motor_calibrate        },
+        { .uri = "/motor/calibrate",        .method = HTTP_OPTIONS, .handler = handler_options                },
+        { .uri = "/motor/calibrate/cancel", .method = HTTP_POST,    .handler = handler_motor_calibrate_cancel },
+        { .uri = "/motor/calibrate/cancel", .method = HTTP_OPTIONS, .handler = handler_options                },
+        { .uri = "/motor/calibration",      .method = HTTP_GET,     .handler = handler_motor_calibration      },
+        { .uri = "/motor/compensation",     .method = HTTP_POST,    .handler = handler_motor_compensation     },
+        { .uri = "/motor/compensation",     .method = HTTP_OPTIONS, .handler = handler_options                },
         { .uri = "/test/encoder", .method = HTTP_GET,     .handler = handler_test_encoder },
         { .uri = "/test/jog",     .method = HTTP_POST,    .handler = handler_test_jog     },
         { .uri = "/test/jog",     .method = HTTP_OPTIONS, .handler = handler_options      },

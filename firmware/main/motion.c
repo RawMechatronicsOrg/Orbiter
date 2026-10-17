@@ -1,6 +1,7 @@
 #include "motion.h"
 #include "stepper.h"
 #include "encoder.h"
+#include "motorcal.h"
 #include "log_bus.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -100,11 +101,24 @@ static const char *motion_state_str(motion_state_t s)
     }
 }
 
+/*
+ * One axis's raw angle, linearised through its motor-calibration deviation
+ * profile when there is one. Every position the firmware works with — pose,
+ * closed-loop moves, the encoder zero — goes through here, so they all live in
+ * the same corrected frame. Caller holds s_enc_mutex.
+ */
+static esp_err_t read_axis_raw(enc_axis_t ax, float *out)
+{
+    esp_err_t e = encoder_read_angle(ax, out);
+    if (e == ESP_OK) *out = motorcal_correct((stepper_axis_t)ax, *out);
+    return e;
+}
+
 /* Encoder-bus-locked single-axis read. */
 static esp_err_t encoder_read_locked(enc_axis_t ax, float *out)
 {
     xSemaphoreTake(s_enc_mutex, portMAX_DELAY);
-    esp_err_t e = encoder_read_angle(ax, out);
+    esp_err_t e = read_axis_raw(ax, out);
     xSemaphoreGive(s_enc_mutex);
     return e;
 }
@@ -218,11 +232,11 @@ static void pose_tick_task(void *arg)
 
         float raw;
         if (xSemaphoreTake(s_enc_mutex, 0) == pdTRUE) {
-            if (encoder_read_angle(ENC_AZ, &raw) == ESP_OK) s_pos.az_deg = az_user_from_raw(raw);
+            if (read_axis_raw(ENC_AZ, &raw) == ESP_OK) s_pos.az_deg = az_user_from_raw(raw);
             xSemaphoreGive(s_enc_mutex);
         }
         if (xSemaphoreTake(s_enc_mutex, 0) == pdTRUE) {
-            if (encoder_read_angle(ENC_EL, &raw) == ESP_OK) s_pos.el_deg = el_user_from_raw(raw);
+            if (read_axis_raw(ENC_EL, &raw) == ESP_OK) s_pos.el_deg = el_user_from_raw(raw);
             xSemaphoreGive(s_enc_mutex);
         }
 
@@ -244,6 +258,7 @@ void motion_init(void)
     s_enc_mutex  = xSemaphoreCreateMutex();
     stepper_init();
     calibration_load_from_nvs();
+    motorcal_init();
 
     if (encoder_init() == ESP_OK) {
         float raw;
@@ -443,6 +458,34 @@ typedef struct {
     int           in_tol;     /* consecutive in-tolerance ticks   */
 } axis_loop_t;
 
+/*
+ * DIR level that moves an axis's USER angle by the sign of `err`.
+ *
+ * Uncalibrated, the historical mapping: err ≥ 0 → DIR_CCW on both axes
+ * (COORDINATES.md §6). It is an assumption about wiring and magnet sides, and
+ * on the v2 bench it was measured wrong on both axes — a closed-loop move
+ * would drive away from its target until the timeout. Motor calibration
+ * measures which DIR raises the RAW angle (dir_sign); the user angle follows
+ * raw on AZ and runs against it on EL (el_user_from_raw), so the mapping
+ * falls out of those two signs.
+ */
+static stepper_dir_t dir_toward(stepper_axis_t sax, float err)
+{
+    if (!motorcal_valid(sax)) return (err >= 0.0f) ? DIR_CCW : DIR_CW;
+    int user_from_raw = (sax == STEPPER_EL) ? -1 : 1;
+    int raw_up        = ((err >= 0.0f) ? 1 : -1) * user_from_raw;
+    return (raw_up * motorcal_dir_sign(sax) > 0) ? DIR_CCW : DIR_CW;
+}
+
+/* Cap a step rate at the axis's calibrated ceiling (none when uncalibrated). */
+static uint32_t cap_to_calibration(stepper_axis_t sax, uint32_t hz)
+{
+    float cap = motorcal_max_step_hz(sax);
+    if (cap > 0.0f && (float)hz > cap) hz = (uint32_t)cap;
+    if (hz < CL_HZ_MIN) hz = CL_HZ_MIN;
+    return hz;
+}
+
 /**
  * One control tick for one axis: P law (error → step rate), slew-limited,
  * driving the continuous-spin stepper. The encoder angle is passed in so the
@@ -484,8 +527,7 @@ static esp_err_t cl_tick_axis(axis_loop_t *a, stepper_axis_t sax, float current_
     else                                a->cur_hz  = want;         /* decel: on plan */
     if (a->cur_hz < CL_HZ_MIN) a->cur_hz = CL_HZ_MIN;
 
-    /* delta ≥ 0 → DIR_CCW (the only sign mapping; see COORDINATES.md §6). */
-    stepper_dir_t dir = (err >= 0.0f) ? DIR_CCW : DIR_CW;
+    stepper_dir_t dir = dir_toward(sax, err);
 
     if (!a->running || dir != a->dir) {
         if (a->running) stepper_stop(sax);
@@ -525,8 +567,8 @@ esp_err_t motion_move(float az_deg, float el_deg,
 
     /* Per-axis top step rate: server-supplied knob value, or the compiled
      * default when 0. effective_hz_max clamps to a safe band. */
-    uint32_t hz_max_az = effective_hz_max(az_hz_max, CL_HZ_MAX_AZ);
-    uint32_t hz_max_el = effective_hz_max(el_hz_max, CL_HZ_MAX_EL);
+    uint32_t hz_max_az = cap_to_calibration(STEPPER_AZ, effective_hz_max(az_hz_max, CL_HZ_MAX_AZ));
+    uint32_t hz_max_el = cap_to_calibration(STEPPER_EL, effective_hz_max(el_hz_max, CL_HZ_MAX_EL));
 
     axis_loop_t az = {
         .active = has_az, .target = az_deg,

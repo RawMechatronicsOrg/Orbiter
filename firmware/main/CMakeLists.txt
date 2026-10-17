@@ -6,6 +6,7 @@ idf_component_register(
         "enc_as5600.c"
         "motion.c"
         "motion_runner.c"
+        "motorcal.c"
         "http_handlers.c"
         "log_bus.c"
     INCLUDE_DIRS "."

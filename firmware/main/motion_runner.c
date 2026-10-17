@@ -1,4 +1,5 @@
 #include "motion_runner.h"
+#include "motorcal.h"
 #include "stepper.h"
 #include "log_bus.h"
 #include "esp_log.h"
@@ -46,6 +47,7 @@ const char *motion_runner_kind_str(mr_kind_t k)
     switch (k) {
         case MR_KIND_MOVE: return "move";
         case MR_KIND_JOG:  return "jog";
+        case MR_KIND_MOTOR_CAL: return "motor_cal";
         default:           return "unknown";
     }
 }
@@ -165,6 +167,38 @@ static void run_jog(uint32_t id, const mr_cmd_t *cmd)
     log_bus_emit_task(id, status_str, inner);
 }
 
+static void run_motor_cal(uint32_t id, const mr_cmd_t *cmd)
+{
+    uint64_t t0 = esp_timer_get_time() / 1000ULL;
+    stepper_axis_t axis = cmd->u.motor_cal.axis;
+
+    motion_set_motors(true);
+    esp_err_t ret = motorcal_run(axis);
+
+    uint32_t dur = (uint32_t)(esp_timer_get_time() / 1000ULL - t0);
+    xSemaphoreTake(s_snap_mtx, portMAX_DELAY);
+    s_snap.result.motor_cal.axis        = axis;
+    s_snap.result.motor_cal.duration_ms = dur;
+    xSemaphoreGive(s_snap_mtx);
+    snap_update_status(ret == ESP_OK ? MR_STATUS_DONE_OK : MR_STATUS_DONE_ERR,
+                       esp_timer_get_time() / 1000ULL);
+
+    motorcal_phase_t phase;
+    char msg[96];
+    motorcal_progress(NULL, &phase, NULL, NULL, msg, sizeof(msg));
+    motorcal_result_t r;
+    motorcal_result(axis, &r);
+
+    char inner[256];
+    snprintf(inner, sizeof(inner),
+             "\"axis\":\"%s\",\"phase\":\"%s\",\"message\":\"%s\",\"duration_ms\":%lu,"
+             "\"steps_per_deg\":%.4f,\"max_speed_dps\":%.2f,\"dir_sign\":%d",
+             axis == STEPPER_AZ ? "az" : "el", motorcal_phase_name(phase), msg,
+             (unsigned long)dur, (double)r.steps_per_deg, (double)r.max_speed_dps,
+             r.dir_sign);
+    log_bus_emit_task(id, ret == ESP_OK ? "done" : "error", inner);
+}
+
 /* ── Runner task ────────────────────────────────────────────────────────── */
 
 /*
@@ -196,6 +230,7 @@ static void motion_runner_task(void *arg)
         switch (qd.cmd.kind) {
             case MR_KIND_MOVE: run_move(qd.id, &qd.cmd); break;
             case MR_KIND_JOG:  run_jog(qd.id, &qd.cmd);  break;
+            case MR_KIND_MOTOR_CAL: run_motor_cal(qd.id, &qd.cmd); break;
             default:
                 snap_update_status(MR_STATUS_DONE_ERR,
                                    esp_timer_get_time() / 1000ULL);

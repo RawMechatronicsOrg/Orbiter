@@ -14,6 +14,13 @@ typedef enum {
     DIR_CCW = 1,
 } stepper_dir_t;
 
+/*
+ * Highest STEP rate calibration may certify. The timer could go faster, but
+ * at two ISRs per pulse on both axes the margin shrinks quickly, and a stored
+ * maximum the generator cannot hold would be a speed the axis never reaches.
+ */
+#define STEPPER_MAX_STEP_HZ  10000u
+
 /**
  * Initialise GPIO and timers for both axes.
  * Must be called before any other stepper function.
@@ -75,3 +82,14 @@ bool stepper_is_busy(stepper_axis_t axis);
  * @return ESP_ERR_INVALID_STATE if the axis is already moving.
  */
 esp_err_t stepper_spin(stepper_axis_t axis, stepper_dir_t dir, uint32_t step_hz);
+
+/**
+ * Net microstep position of an axis: +1 per completed pulse with DIR_CCW,
+ * -1 with DIR_CW, counted on the falling edge so a reported step is one the
+ * driver has fully seen. Not overflow-guarded: consumers (motor calibration)
+ * reset it before the run they measure, which stays far below 2^31 steps.
+ */
+int32_t stepper_position(stepper_axis_t axis);
+
+/** Zero an axis's microstep counter. */
+void stepper_reset_position(stepper_axis_t axis);
