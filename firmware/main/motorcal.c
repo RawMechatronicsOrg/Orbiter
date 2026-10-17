@@ -28,7 +28,18 @@ static const char *TAG = "motorcal";
 #define SPEED_START_HZ        200u
 #define SPEED_RAMP_FACTOR     1.18f
 #define SPEED_SETTLE_MS       180
-#define SPEED_WINDOW_MS       260
+#define SPEED_WINDOW_MS       260     /* minimum; see SPEED_MIN_SWEEP_DEG    */
+/*
+ * Measure each rung over at least this much angle, not just over a fixed time.
+ * The pendulum's axis was direct drive, where 200 Hz is 22 deg/s and 260 ms
+ * sweeps ~6 deg. Behind Orbiter's 7:1 and 10:1 belts the same rung is 2-3
+ * deg/s, 260 ms sweeps ~0.6 deg = 7 encoder counts, and a single count of
+ * quantisation (0.088 deg) swings the ratio by 15% — the ramp then "slipped"
+ * on its first rungs while the axis tracked cleanly at 4x the rate. 5 deg
+ * keeps that error under 2%.
+ */
+#define SPEED_MIN_SWEEP_DEG   5.0f
+#define SPEED_MAX_WINDOW_MS   4000
 #define SPEED_TRACK_RATIO     0.90f   /* measured/commanded below this = slip */
 #define SPEED_MARGIN          0.70f   /* derate applied to the tracked edge   */
 #define SPEED_BISECT_PROBES   4u
@@ -332,13 +343,21 @@ static void tick_speed(void)
         s_step = 1;
         break;
 
-    case 1:  /* let the rung's acceleration transient pass */
+    case 1: {  /* let the rung's acceleration transient pass */
         if (!waited()) return;
         s_rung_start_deg = s_sweep_deg;
         s_rung_start_us  = now_us();
-        wait_ms(SPEED_WINDOW_MS);
+        float expected = (float)s_ramp_hz / s_run.steps_per_deg_coarse;
+        int window = SPEED_WINDOW_MS;
+        if (expected > 0.0f) {
+            float need_ms = SPEED_MIN_SWEEP_DEG / expected * 1000.0f;
+            if (need_ms > (float)window) window = (int)need_ms;
+        }
+        if (window > SPEED_MAX_WINDOW_MS) window = SPEED_MAX_WINDOW_MS;
+        wait_ms(window);
         s_step = 2;
         break;
+    }
 
     case 2: {  /* measure the rung */
         if (!waited()) return;
