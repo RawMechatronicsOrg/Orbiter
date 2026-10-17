@@ -13,11 +13,14 @@ The surviving command surface drives the two-axis turntable, captures photos
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Awaitable, Callable
 
 import scan_task
+from drive import AXES, clamp_hz
 from esp_proxy import esp
-from orbiter_model import model
+from geom.angles import EL_MAX, EL_MIN, clamp_el, is_el_valid
+from orbiter_model import model, motor_signature
 
 log = logging.getLogger("orbiter.cmd")
 
@@ -74,31 +77,19 @@ async def _cmd_set_motion_plan(args: dict[str, Any]) -> dict[str, Any]:
     return serialised
 
 
-# Per-axis closed-loop top step rate (Hz) bounds for the operator speed knobs.
-# Tighter than the firmware sanity clamp (CL_HZ_MIN..CL_HZ_OVERRIDE_MAX) and
-# matched to the UI slider ranges. AZ is the light axis (fast); EL carries the
-# whole arm, so it's capped lower to keep calibration/scan sweeps from
-# over-shooting (the reason the EL default was historically conservative).
-_MOVE_HZ_BOUNDS: dict[str, tuple[int, int]] = {
-    "az": (100, 4000),
-    "el": (50, 1000),
-}
-
-
 async def _cmd_set_move_speed(args: dict[str, Any]) -> dict[str, Any]:
     """Set the per-axis closed-loop top step rate — the Machine-config speed
     knobs. Payload (either or both key): ``{az_hz_max: int, el_hz_max: int}``
-    in Hz. Each value is clamped to its per-axis safe band and persisted on the
-    model; the next /move carries it to the firmware (see esp_proxy.move)."""
+    in Hz. Each value is clamped to its per-axis band (drive.AXES) and
+    persisted on the model; the next /move carries it to the firmware (see
+    esp_proxy.move)."""
     patch: dict[str, Any] = {}
     try:
         if "az_hz_max" in args:
-            lo, hi = _MOVE_HZ_BOUNDS["az"]
-            patch["move_hz_max_az"] = max(lo, min(hi, int(args["az_hz_max"])))
+            patch["move_hz_max_az"] = clamp_hz("az", float(args["az_hz_max"]))
         if "el_hz_max" in args:
-            lo, hi = _MOVE_HZ_BOUNDS["el"]
-            patch["move_hz_max_el"] = max(lo, min(hi, int(args["el_hz_max"])))
-    except (TypeError, ValueError) as exc:
+            patch["move_hz_max_el"] = clamp_hz("el", float(args["el_hz_max"]))
+    except (TypeError, ValueError, OverflowError) as exc:
         raise CommandError(f"set_move_speed: bad value: {exc}") from exc
     if not patch:
         raise CommandError("set_move_speed: provide az_hz_max and/or el_hz_max")
@@ -406,26 +397,48 @@ async def _cmd_calibrate_geometry(args: dict[str, Any]) -> dict[str, Any]:
     """
     import calibration
 
+    busy = model.busy_reason()
+    if busy:
+        raise CommandError(f"calibrate_geometry: {busy}")
     if not model.encoder_zero_initialized:
         raise CommandError(
-            "encoder zero not initialized — the sweep would move to absolute "
-            "poses while the encoders may read arbitrary angles. Wait for the "
-            "first-boot auto-zero (needs ESP + phone IMU online) or zero the "
-            "encoders manually in Machine config first."
+            "the EL encoder zero is not set — the sweep moves to absolute "
+            "elevations, and an unzeroed encoder reads an arbitrary angle. "
+            "Level the arm and press Zero EL (Machine config → Step 2) first."
         )
     do_apply = bool(args.get("apply", True))
     preset = str(args.get("preset", "fast"))
     poses = calibration.poses_for_preset(preset)
+    # The angles the solve uses are relative to these — record them as the
+    # sweep starts (re-zeroing is refused while it runs).
+    zeros = dict(model.encoder_zero) or None
+    motors = motor_signature(model.motor_cal)
+    model.update(calibration_running=True)
     try:
         result = await calibration.run_calibration(poses=poses)
     except RuntimeError as exc:
         raise CommandError(f"calibrate_geometry: {exc}") from exc
+    finally:
+        model.update(calibration_running=False)
     if do_apply:
         calibration.apply_result(result)
+        model.update(calib_encoder_zero=zeros, calib_motor_cal=motors)
     out = calibration.result_dict(result)
     out["applied"] = do_apply
     out["preset"] = preset
     return out
+
+
+async def _cmd_reset_calibration(_args: dict[str, Any]) -> dict[str, Any]:
+    """Forget the geometry calibration (Machine config → Reset calibration):
+    the solved mount, corrections and geometry go back to their defaults, so
+    the rig is drawn and posed from the CAD model alone. The way out of a
+    calibration solved on other mechanics."""
+    busy = model.busy_reason()
+    if busy:
+        raise CommandError(f"reset_calibration: {busy}")
+    model.reset_calibration()
+    return {"calibrated": False}
 
 
 async def _cmd_set_endpoints(args: dict[str, Any]) -> dict[str, Any]:
@@ -488,24 +501,59 @@ async def _cmd_save_scan_notes(args: dict[str, Any]) -> dict[str, Any]:
 
 # ── hardware commands (via the ESP proxy) ──────────────────────────────────
 
+_EL_TRAVEL = f"{EL_MIN:g}…{EL_MAX:+g}°"
+
+
+def _angle(args: dict[str, Any], key: str) -> float | None:
+    """A finite angle from the payload, or None when the key is absent/null
+    (that axis does not move)."""
+    value = args.get(key)
+    if value is None:
+        return None
+    try:
+        deg = float(value)
+    except (TypeError, ValueError) as exc:
+        raise CommandError(f"{key}: not a number: {value!r}") from exc
+    if not math.isfinite(deg):
+        raise CommandError(f"{key}: not a finite angle")
+    return deg
+
+
 async def _cmd_move(args: dict[str, Any]) -> dict[str, Any]:
-    az = args.get("az")
-    el = args.get("el")
-    return await esp.move_and_await(
-        azimuth_deg=None if az is None else float(az),
-        elevation_deg=None if el is None else float(el),
-    )
+    """Absolute move `{az?, el?}` (deg). EL must lie in its travel — the
+    firmware would answer 400, refuse it here with the range in the message."""
+    az = _angle(args, "az")
+    el = _angle(args, "el")
+    if az is None and el is None:
+        raise CommandError("move: give az and/or el")
+    if el is not None and not is_el_valid(el):
+        raise CommandError(f"move: el {el:g}° is outside the EL travel {_EL_TRAVEL}")
+    return await esp.move_and_await(azimuth_deg=az, elevation_deg=el)
 
 
 async def _cmd_jog(args: dict[str, Any]) -> dict[str, Any]:
-    """Bump one axis by a small delta. `{axis: 'az'|'el', delta_deg: float}`."""
+    """Bump one axis by a small delta. `{axis: 'az'|'el', delta_deg: float}`.
+
+    An EL jog that would leave the travel stops at the limit instead; one
+    that starts outside it (an unzeroed encoder reads anything) is refused
+    unless it ends inside."""
     axis = str(args.get("axis", "")).lower()
     if axis not in ("az", "el"):
         raise CommandError("jog: axis must be 'az' or 'el'")
-    delta = float(args.get("delta_deg", 0.0))
+    delta = _angle(args, "delta_deg") or 0.0
     if axis == "az":
         return await esp.move_and_await(azimuth_deg=model.az + delta)
-    return await esp.move_and_await(elevation_deg=model.el + delta)
+    target = model.el + delta
+    if not is_el_valid(target):
+        if not is_el_valid(model.el):
+            raise CommandError(
+                f"jog: EL reads {model.el:.1f}°, outside the travel {_EL_TRAVEL} — "
+                "zero the EL encoder (Machine config → Step 2)"
+            )
+        target = clamp_el(target)
+        if abs(target - model.el) < 0.05:
+            raise CommandError(f"jog: EL is at its {target:+g}° limit")
+    return await esp.move_and_await(elevation_deg=target)
 
 
 async def _cmd_motors(args: dict[str, Any]) -> dict[str, Any]:
@@ -516,24 +564,125 @@ async def _cmd_motors(args: dict[str, Any]) -> dict[str, Any]:
     return await esp.motors(bool(args["enabled"]))
 
 
+_ZERO_AXES = ("az", "el", "both")
+_ZERO_MODES = ("current", "explicit", "reset")
+
+
 async def _cmd_calibrate_encoder(args: dict[str, Any]) -> dict[str, Any]:
-    """Set the firmware encoder zero.
+    """Set or reset the firmware encoder zero (Machine config → Step 2).
 
-    Tells the ESP firmware to interpret the current encoder reading (or a
-    supplied raw degree value) as zero for the named axis. The same primitive
-    the operator hits after physically aligning the rig — so it also counts
-    as the rig's first-boot zero initialization.
+    `{axis: az|el|both, mode: current|explicit|reset}`: `current` takes the
+    present encoder reading as 0, `explicit` takes `az_raw_deg`/`el_raw_deg`,
+    `reset` restores the firmware's default zero. Setting the EL zero is what
+    makes the rig ready for absolute moves; resetting it undoes that — both
+    follow from the offsets the firmware answers with (encoder_init).
     """
-    import encoder_init
-
-    result = await esp.calibrate(
-        axis=str(args.get("axis", "both")),
-        mode=str(args.get("mode", "current")),
+    axis = str(args.get("axis", "both"))
+    mode = str(args.get("mode", "current"))
+    if axis not in _ZERO_AXES:
+        raise CommandError(f"calibrate_encoder: axis must be one of {_ZERO_AXES}")
+    if mode not in _ZERO_MODES:
+        raise CommandError(f"calibrate_encoder: mode must be one of {_ZERO_MODES}")
+    busy = model.busy_reason()
+    if busy:
+        raise CommandError(f"calibrate_encoder: {busy}")
+    return await esp.calibrate(
+        axis=axis,
+        mode=mode,
         az_raw_deg=args.get("az_raw_deg"),
         el_raw_deg=args.get("el_raw_deg"),
     )
-    encoder_init.mark_initialized("manual encoder zero")
-    return result
+
+
+async def _cmd_spin(args: dict[str, Any]) -> dict[str, Any]:
+    """Continuous rotation `{axis: az|el, dir: cw|ccw, step_hz}` — open loop,
+    at a driver step rate inside the axis' speed band (drive.AXES).
+
+    EL needs its zero: the proxy stops an EL spin short of the travel limits
+    from the encoder reading, which means nothing on an unzeroed encoder."""
+    axis = str(args.get("axis", ""))
+    direction = str(args.get("dir", "cw"))
+    if axis not in AXES:
+        raise CommandError("spin: axis must be 'az' or 'el'")
+    if direction not in ("cw", "ccw"):
+        raise CommandError("spin: dir must be 'cw' or 'ccw'")
+    band = AXES[axis]
+    try:
+        step_hz = int(args.get("step_hz", band.hz_default))
+    except (TypeError, ValueError) as exc:
+        raise CommandError(f"spin: bad step_hz: {exc}") from exc
+    if not band.hz_min <= step_hz <= band.hz_max:
+        raise CommandError(
+            f"spin: step_hz must be {band.hz_min}..{band.hz_max} Hz for {axis.upper()}"
+        )
+    busy = model.busy_reason()
+    if busy:
+        raise CommandError(f"spin: {busy}")
+    if axis == "el":
+        if not model.encoder_zero_initialized:
+            raise CommandError(
+                "spin: zero the EL encoder first (Machine config → Step 2) — the "
+                "travel guard reads it"
+            )
+        if not is_el_valid(model.el):
+            raise CommandError(f"spin: EL reads {model.el:.1f}°, outside the travel {_EL_TRAVEL}")
+    return await esp.spin(axis, direction, step_hz)
+
+
+async def _cmd_spin_stop(args: dict[str, Any]) -> dict[str, Any]:
+    """Stop continuous rotation: `{axis: az|el|both}` (default both).
+
+    Only axes the firmware reports spinning are sent: its /spin/stop with
+    nothing spinning still releases the motion mutex, which a running move
+    holds."""
+    axis = str(args.get("axis", "both"))
+    if axis not in _ZERO_AXES:
+        raise CommandError("spin_stop: axis must be 'az', 'el' or 'both'")
+    spinning = [a for a in ("az", "el")
+                if axis in (a, "both") and getattr(model, f"spinning_{a}")]
+    if not spinning:
+        return {"status": "ok", "message": "nothing spinning"}
+    return await esp.spin_stop("both" if len(spinning) == 2 else spinning[0])
+
+
+async def _cmd_motor_calibrate(args: dict[str, Any]) -> dict[str, Any]:
+    """Run the firmware's motor self-calibration on one axis (Machine config →
+    Step 1): `{axis: az|el, arm_removed: bool}`. It measures steps per degree,
+    direction and top speed, turning the axis full circle in every phase — so
+    EL only with the arm removed. Returns the firmware's 202 at once; the run
+    takes minutes and reports on GET /firmware/motor."""
+    axis = str(args.get("axis", ""))
+    if axis not in AXES:
+        raise CommandError("motor_calibrate: axis must be 'az' or 'el'")
+    arm_removed = args.get("arm_removed") is True
+    if axis == "el" and not arm_removed:
+        raise CommandError(
+            "motor_calibrate: EL turns full circles — remove the arm and confirm "
+            "arm_removed"
+        )
+    busy = model.busy_reason()
+    if busy:
+        raise CommandError(f"motor_calibrate: {busy}")
+    return await esp.motor_calibrate(axis, arm_removed)
+
+
+async def _cmd_motor_calibrate_cancel(_args: dict[str, Any]) -> dict[str, Any]:
+    """Stop a motor calibration in flight; the previous result stays."""
+    return await esp.motor_calibrate_cancel()
+
+
+async def _cmd_motor_compensation(args: dict[str, Any]) -> dict[str, Any]:
+    """`{axis: az|el, enabled: bool}` — apply the axis' measured
+    angle-deviation profile or not."""
+    axis = str(args.get("axis", ""))
+    if axis not in AXES:
+        raise CommandError("motor_compensation: axis must be 'az' or 'el'")
+    if not isinstance(args.get("enabled"), bool):
+        raise CommandError("motor_compensation: enabled must be true or false")
+    busy = model.busy_reason()
+    if busy:
+        raise CommandError(f"motor_compensation: {busy}")
+    return await esp.motor_compensation(axis, args["enabled"])
 
 
 async def _cmd_reboot_firmware(_args: dict[str, Any]) -> dict[str, Any]:
@@ -685,8 +834,9 @@ async def _cmd_start_scan(args: dict[str, Any]) -> dict[str, Any]:
     UI can configure + start in a single click without a set/start race — both
     happen in this one ordered handler), then launches the discrete loop.
     """
-    if model.scan_running:
-        raise CommandError("a scan is already running")
+    busy = model.busy_reason()
+    if busy:
+        raise CommandError(f"start_scan: {busy}")
     mp = args.get("motion_plan")
     if mp is not None:
         from models import MotionPlan
@@ -723,6 +873,11 @@ _COMMANDS: dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]] = {
     "move": _cmd_move,
     "jog": _cmd_jog,
     "motors": _cmd_motors,
+    "spin": _cmd_spin,
+    "spin_stop": _cmd_spin_stop,
+    "motor_calibrate": _cmd_motor_calibrate,
+    "motor_calibrate_cancel": _cmd_motor_calibrate_cancel,
+    "motor_compensation": _cmd_motor_compensation,
     "calibrate_encoder": _cmd_calibrate_encoder,
     "reboot_firmware": _cmd_reboot_firmware,
     # scan-loop / capture
@@ -745,17 +900,9 @@ _COMMANDS: dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]] = {
     "set_endpoints": _cmd_set_endpoints,
     "set_stereo_rig": _cmd_set_stereo_rig,
     "calibrate_geometry": _cmd_calibrate_geometry,
+    "reset_calibration": _cmd_reset_calibration,
     "test_calibration_accuracy": _cmd_test_calibration_accuracy,
 }
-
-# UI commands.ts still uses the older names from the parent project. Map
-# them to the current handlers so the UI stops spamming `unknown command`
-# every click — until commands.ts gets a contract-aligned rewrite.
-_COMMANDS.update({
-    "calibrate":  _COMMANDS["calibrate_encoder"],
-    "reboot_esp": _COMMANDS["reboot_firmware"],
-    "set_geometry": _COMMANDS["set_machine_config"],
-})
 
 
 def known_commands() -> list[str]:

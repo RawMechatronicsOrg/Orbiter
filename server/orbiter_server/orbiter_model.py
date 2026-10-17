@@ -16,11 +16,13 @@ import asyncio
 import json
 import logging
 import os
-from dataclasses import dataclass, field, fields
+from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Callable
 
 from config import settings
+from drive import AXES, axes_info
+from encoder_init import el_zero_set
 
 log = logging.getLogger("orbiter.model")
 
@@ -36,9 +38,12 @@ PERSISTED_FIELDS: frozenset[str] = frozenset({
     "charuco_squares_x", "charuco_squares_y",
     "charuco_square_length_mm", "charuco_marker_length_mm", "aruco_dict_id",
     # Set True once a ChArUco geometry calibration has been applied; the UI
-    # keys a "not calibrated" warning off it.
-    "calibrated", "calib_extrinsic", "calib_board_world",
-    # One-shot first-boot encoder zeroing (see encoder_init.py).
+    # keys a "not calibrated" warning off it. `calib_rig_id` records which
+    # mechanics (rig GLB) it was solved on, `calib_encoder_zero` with which
+    # encoder zeros.
+    "calibrated", "calib_extrinsic", "calib_board_world", "calib_rig_id",
+    "calib_encoder_zero", "calib_motor_cal",
+    # Whether the EL encoder zero has been set (see encoder_init.py).
     "encoder_zero_initialized",
     # EL-axis correction (tilt + transverse offset) from the hand-eye refine.
     "rocker_correction",
@@ -54,6 +59,41 @@ PERSISTED_FIELDS: frozenset[str] = frozenset({
     "move_hz_max_az", "move_hz_max_el",
     "show_axes", "scan_preview", "hide_back_facing", "mirror_photo_on_frustum",
 })
+
+
+# What a geometry calibration writes (calibration.apply_result) and so what
+# `reset_calibration` puts back to the defaults. `arm_radius_mm = 0` means
+# "use the CAD arm" (scene_graph.effective_arm_radius).
+CALIBRATION_FIELDS: tuple[str, ...] = (
+    "calibrated", "calib_rig_id", "calib_encoder_zero", "calib_motor_cal",
+    "calib_extrinsic", "calib_board_world",
+    "rocker_correction", "az_encoder_correction", "el_encoder_scale",
+    "calib_test_msg",
+    "arm_radius_mm", "camera_offset_mm", "camera_tilt_deg", "camera_pan_deg",
+    "turntable_axis",
+)
+
+
+# Inputs of the derived fields (`ModelState._derived`).
+_DERIVED_FROM: frozenset[str] = frozenset({
+    "calibrated", "calib_rig_id", "rig_id", "encoder_zero", "calib_encoder_zero",
+    "motor_cal", "calib_motor_cal",
+})
+
+
+def motor_signature(motor_cal: dict[str, Any] | None) -> dict[str, Any] | None:
+    """What of the firmware's motor calibration shapes the angles it reports
+    (it runs every reading through it): per axis the steps/° of the result
+    and whether its deviation profile is applied. None when unknown."""
+    if not motor_cal:
+        return None
+    return {
+        axis: {
+            "steps_per_deg": round(float((motor_cal.get(axis) or {}).get("steps_per_deg") or 0.0), 3),
+            "compensation": (motor_cal.get(axis) or {}).get("compensation"),
+        }
+        for axis in ("az", "el")
+    }
 
 
 def _default_motion_plan() -> dict[str, Any]:
@@ -113,6 +153,9 @@ class ModelState:
     move_target_el: float | None = None
     motion_state: str = "unknown"      # idle | moving | spinning | error | unknown
     motors_on: bool = False
+    # Per-axis continuous spin (firmware POST /spin), from the pose stream.
+    spinning_az: bool = False
+    spinning_el: bool = False
     # Raw /state.runner snapshot: {id, status, kind, result}.
     runner: dict[str, Any] | None = None
     # Firmware-reported encoder zero offsets (az/el raw degrees).
@@ -182,6 +225,25 @@ class ModelState:
     # calibration.apply_result). Persisted so the UI can show a "not
     # calibrated" warning on a fresh rig that has never been solved.
     calibrated: bool = False
+    # `rig_id` (see below) of the mechanics the calibration was solved on.
+    # None for a calibration that predates the stamp. When it differs from
+    # the running `rig_id` the solve describes other mechanics — see
+    # `calibration_status`.
+    calib_rig_id: str | None = None
+    # The firmware encoder zeros (`encoder_zero`) the calibration was solved
+    # with. Its angles are relative to them, so a re-zero invalidates it.
+    calib_encoder_zero: dict[str, float] | None = None
+    # `motor_signature` of the firmware motor calibration during the sweep:
+    # a new motor calibration or a toggled deviation profile shifts every
+    # angle the firmware reports, so it invalidates the solve too.
+    calib_motor_cal: dict[str, Any] | None = None
+    # Derived (see `_derived`): `none` (never calibrated), `current`, or
+    # `stale` with the reason — solved on other mechanics, before the stamps
+    # existed, or with other encoder zeros. Not persisted.
+    calibration_status: str = "none"
+    calibration_stale_reason: str = ""
+    # True while a ChArUco calibration sweep runs (commands; not persisted).
+    calibration_running: bool = False
     # Calibration internals persisted for the post-calibration "Test accuracy"
     # check: the hand-eye X (camera↔arm) and the board-in-world reference pose
     # Z_ref, each as {"rvec": [...], "t": [...]}. None until a calibration runs.
@@ -203,10 +265,10 @@ class ModelState:
     el_encoder_scale: float | None = None
     # Last "Test accuracy" result — a human string for the UI (runtime only).
     calib_test_msg: str = ""
-    # True once the encoder zeros have been initialized for this rig — by the
-    # first-boot auto-zero (encoder_init.py: AZ at current position, EL from
-    # the phone IMU) or by a manual zero/align from the UI. Until then the
-    # encoders may report arbitrary angles and absolute moves are unsafe.
+    # Whether the firmware holds an EL zero of its own — derived from the
+    # reported `encoder_zero` (encoder_init.el_zero_set); persisted only as
+    # the last known value while the device is away. Until it is set the EL
+    # encoder reads an arbitrary angle and the calibration sweep is refused.
     encoder_zero_initialized: bool = False
     # Operator-tunable EL correction (deg) added to `model.el` in every
     # pose/kinematic calculation. Lets the operator dial out a constant EL
@@ -218,13 +280,27 @@ class ModelState:
     # whole accumulated cloud by a constant.
     az_kinematic_offset_deg: float = 0.0
 
+    # Identity of the mechanics this server models: a hash of the rig GLB it
+    # loads (geom.rig_model.rig_identity). Set at startup; not persisted.
+    rig_id: str = ""
+
+    # The firmware's motor self-calibration summary (GET /state → motor_cal):
+    # {active, az: {valid, steps_per_deg, max_speed_dps, dir_sign}, el: ...}.
+    # None while the firmware has not reported one (older builds). A move on
+    # an axis without a valid result is refused (esp_proxy.move).
+    motor_cal: dict[str, Any] | None = None
+    # Per-axis drive facts + EL travel for the UI (drive.axes_info): steps
+    # per degree for the °/s readouts (from motor_cal when measured), the
+    # speed-knob band, the EL limits.
+    axes: dict[str, Any] = field(default_factory=axes_info)
+
     # ── motion speed (persisted) ───────────────────────────────────────────
     # Per-axis closed-loop top step rate (Hz) sent to the firmware with every
     # /move as az_hz_max / el_hz_max. The firmware clamps and falls back to its
     # compiled defaults (CL_HZ_MAX_AZ/EL) when these are 0. Operator-tunable via
-    # the Machine-config speed knobs; defaults match the doubled firmware caps.
-    move_hz_max_az: int = 2100
-    move_hz_max_el: int = 350
+    # the Machine-config speed knobs; defaults are the firmware caps.
+    move_hz_max_az: int = AXES["az"].hz_default
+    move_hz_max_el: int = AXES["el"].hz_default
 
     # ── scan plan + progress ───────────────────────────────────────────────
     # The MotionPlanner — the active scan-loop plan (discrete sweep).
@@ -315,7 +391,78 @@ class ModelState:
         for key, value in data.items():
             if key in PERSISTED_FIELDS:
                 setattr(state, key, value)
+        for key, value in state._derived(set(_DERIVED_FROM)).items():
+            setattr(state, key, value)
         return state
+
+    # ── geometry calibration ───────────────────────────────────────────────
+
+    def _calibration_verdict(self) -> tuple[str, str]:
+        if not self.calibrated:
+            return "none", ""
+        if not self.calib_rig_id or self.calib_rig_id != self.rig_id:
+            return "stale", (
+                f"solved on rig {self.calib_rig_id or 'unknown (unstamped)'}, this "
+                f"server models rig {self.rig_id or '?'}"
+            )
+        then, now = self.calib_encoder_zero or {}, self.encoder_zero or {}
+        moved = [
+            axis.upper() for axis in ("az", "el")
+            if isinstance(then.get(f"{axis}_zero_raw_deg"), (int, float))
+            and isinstance(now.get(f"{axis}_zero_raw_deg"), (int, float))
+            and abs(then[f"{axis}_zero_raw_deg"] - now[f"{axis}_zero_raw_deg"]) > 0.01
+        ]
+        if moved:
+            return "stale", f"the {' and '.join(moved)} encoder zero changed since it was solved"
+        then_mc, now_mc = self.calib_motor_cal, motor_signature(self.motor_cal)
+        if then_mc and now_mc:
+            changed = [
+                axis.upper() for axis in ("az", "el")
+                if abs(then_mc[axis]["steps_per_deg"] - now_mc[axis]["steps_per_deg"]) > 1e-3
+                or (then_mc[axis]["compensation"] is not None
+                    and now_mc[axis]["compensation"] is not None
+                    and then_mc[axis]["compensation"] != now_mc[axis]["compensation"])
+            ]
+            if changed:
+                return "stale", (f"the {' and '.join(changed)} motor calibration changed "
+                                 "since it was solved")
+        return "current", ""
+
+    def _derived(self, changed: set[str]) -> dict[str, Any]:
+        """Fields computed from others, for the ones `changed` affects."""
+        out: dict[str, Any] = {}
+        if "encoder_zero" in changed:
+            el_set = el_zero_set(self.encoder_zero)
+            if el_set is not None:
+                out["encoder_zero_initialized"] = el_set
+        if changed & _DERIVED_FROM:
+            out["calibration_status"], out["calibration_stale_reason"] = (
+                self._calibration_verdict())
+        return {k: v for k, v in out.items() if getattr(self, k) != v}
+
+    def busy_reason(self) -> str | None:
+        """What would make an operation that takes over the rig (spin, an
+        update, a motor calibration, a calibration reset) unsafe now."""
+        if self.scan_running:
+            return "a scan is running"
+        if self.calibration_running:
+            return "a geometry calibration is running"
+        if (self.motor_cal or {}).get("active"):
+            return "a motor calibration is running"
+        return None
+
+    def reset_calibration(self) -> None:
+        """Drop the geometry calibration and everything it solved, back to the
+        defaults: the rig is then drawn from the CAD model alone. Camera
+        intrinsics are left alone — they belong to the camera, not to the
+        mechanics."""
+        defaults = {f.name: f for f in fields(self)}
+
+        def default(name: str) -> Any:
+            f = defaults[name]
+            return f.default_factory() if f.default_factory is not MISSING else f.default
+
+        self.update(**{name: default(name) for name in CALIBRATION_FIELDS})
 
     # ── mutation + change notification ─────────────────────────────────────
 
@@ -335,6 +482,10 @@ class ModelState:
                 changed[key] = value
         if not changed:
             return
+        derived = self._derived(set(changed))
+        for key, value in derived.items():
+            setattr(self, key, value)
+        changed.update(derived)
         if any(k in PERSISTED_FIELDS for k in changed):
             try:
                 self.save()

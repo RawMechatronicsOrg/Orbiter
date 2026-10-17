@@ -6,7 +6,7 @@
  * a small fixed reticle marks the current attitude.
  */
 
-import { useMemo } from 'react';
+import { useEffect, useMemo } from 'react';
 import { Canvas } from '@react-three/fiber';
 import * as THREE from 'three';
 
@@ -39,8 +39,9 @@ export function navballTargetMarker(
   };
 }
 
-/** Equirectangular navball texture drawn procedurally onto a 2D canvas. */
-function makeNavballTexture(): THREE.Texture {
+/** Equirectangular navball texture drawn procedurally onto a 2D canvas.
+ *  Elevations below `elMin` (the EL travel limit) are shaded as forbidden. */
+function makeNavballTexture(elMin: number | undefined): THREE.Texture {
   const w = 2048;
   const h = 1024;
   const cv = document.createElement('canvas');
@@ -75,6 +76,24 @@ function makeNavballTexture(): THREE.Texture {
   ground.addColorStop(1, '#2e2014');
   ctx.fillStyle = ground;
   ctx.fillRect(0, h / 2, w, h / 2);
+
+  // Forbidden band: below the EL travel limit — the arm meets the cross rail.
+  if (elMin != null && elMin > -90) {
+    const y0 = yOfLat(elMin);
+    ctx.fillStyle = 'rgba(190,30,30,0.55)';
+    ctx.fillRect(0, y0, w, h - y0);
+    ctx.strokeStyle = 'rgba(255,120,120,0.35)';
+    ctx.lineWidth = 6;
+    for (let x = -h; x < w; x += 48) {
+      ctx.beginPath();
+      ctx.moveTo(x, h);
+      ctx.lineTo(x + (h - y0), y0);
+      ctx.stroke();
+    }
+    ctx.strokeStyle = '#f87171';
+    ctx.lineWidth = 4;
+    hLine(y0);
+  }
 
   // Minor grid — every 10°.
   ctx.strokeStyle = 'rgba(255,255,255,0.15)';
@@ -138,8 +157,9 @@ function makeNavballTexture(): THREE.Texture {
   return tex;
 }
 
-function NavBallSphere({ az, el }: { az: number; el: number }) {
-  const texture = useMemo(makeNavballTexture, []);
+function NavBallSphere({ az, el, elMin }: { az: number; el: number; elMin?: number }) {
+  const texture = useMemo(() => makeNavballTexture(elMin), [elMin]);
+  useEffect(() => () => texture.dispose(), [texture]);
   // Heading scrolls the ball around its vertical axis; elevation pitches it.
   return (
     <mesh rotation={[d2r(el), d2r(-az), 0]}>
@@ -152,6 +172,7 @@ function NavBallSphere({ az, el }: { az: number; el: number }) {
 export function NavBall({
   az,
   el,
+  elMin,
   targetAz,
   targetEl,
   phoneEl,
@@ -159,6 +180,8 @@ export function NavBall({
 }: {
   az: number;
   el: number;
+  /** Lower EL travel limit (deg) — shaded below on the ball. */
+  elMin?: number;
   targetAz?: number | null;
   targetEl?: number | null;
   /** Phone IMU: the phone's calibrated ESTIMATE of the rig elevation (deg) —
@@ -192,7 +215,7 @@ export function NavBall({
           camera={{ position: [0, 0, 2.7], fov: 45 }}
           gl={{ alpha: true }}
         >
-          <NavBallSphere az={az} el={el} />
+          <NavBallSphere az={az} el={el} elMin={elMin} />
         </Canvas>
       </div>
       <svg

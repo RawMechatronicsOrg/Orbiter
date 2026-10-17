@@ -9,9 +9,9 @@ photo sessions, and run ChArUco hand-eye geometry calibration.
 
 ## What it does
 
-- Proxies the ESP32 firmware (`/move`, `/calibrate`, `/motors`,
-  `/reboot`) over REST + a `/ws/log` WebSocket for live pose / task /
-  log frames.
+- Proxies the ESP32 firmware (`/move`, `/calibrate`, `/motors`, `/spin`,
+  `/reboot`, `/ota`, `/health`, `/test/encoder`) over REST + a `/ws/log`
+  WebSocket for live pose / task / log frames.
 - Owns the authoritative model state (`ModelState`) and broadcasts
   scene-graph + model diffs over `/ws/scene`.
 - Stores scan sessions on disk as a single JSON manifest per scan plus a
@@ -61,6 +61,12 @@ docker run --rm -p 8000:8000 \
 | `GET`  | `/captures/{cid}/...` | Capture pool (immutable). |
 | `GET`  | `/camera/stream.mjpeg` | Live MJPEG preview. |
 | `GET`  | `/camera/stream/status` | Camera connection status. |
+| `GET`  | `/firmware/health` | The firmware's `GET /health`, proxied. |
+| `GET`  | `/firmware/encoder` | The firmware's `GET /test/encoder`, proxied. |
+| `GET`  | `/firmware/motor` | The firmware's `GET /motor/calibration` (motor self-calibration run + per-axis results), proxied and mirrored into `model.motor_cal`. |
+| `POST` | `/firmware/ota` | Body = `firmware/build/orbiter.bin`, streamed to the firmware's `POST /ota`; its status is relayed. |
+| `GET`  | `/command` | The command names the server accepts. |
+| `POST` | `/command/{name}` | Run a command over HTTP (same handlers as the WS channel). |
 | `WS`   | `/ws/scene` | Scene + model diffs, command channel. |
 
 ## Environment variables
@@ -68,7 +74,7 @@ docker run --rm -p 8000:8000 \
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `ORBITER_STORAGE_DIR` | `./data` | Root for `scans/` + `captures/`. |
-| `ORBITER_ESP_IP` | `192.168.1.50` | ESP32 firmware host. |
+| `ORBITER_ESP_IP` | `orbiter.local` | ESP32 firmware host (mDNS auto-discovery or the UI override it). |
 | `ORBITER_CAMERA_URL` | empty | IP-Webcam HTTP base URL (e.g. `http://phone-ip:8080`). |
 | `ORBITER_PORT` | `8000` | Bound port. |
 | `ORBITER_CORS_ORIGINS` | localhost:5173/5174 | Comma-separated allowed origins. |

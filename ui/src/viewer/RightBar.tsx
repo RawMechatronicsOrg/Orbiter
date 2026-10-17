@@ -1,6 +1,6 @@
 /**
- * Right bar — Machine Config. Scene Explorer moved to a floating overlay
- * (SceneExplorerPanel) so the right column is free for upcoming panels.
+ * Right bar — Machine Config, then the encoder diagnostics and the firmware
+ * card. Scene Explorer moved to a floating overlay (SceneExplorerPanel).
  *
  * Resizable: drag the left edge to widen/narrow. Width is persisted to
  * localStorage so the layout sticks between sessions.
@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import type { Commands } from './commands';
 import { MachineConfig } from './MachineConfig';
+import { EncoderDiagCard, FirmwareCard } from './FirmwarePanel';
 import { cls } from './ui';
 
 const WIDTH_KEY = 'orbiter.rightbar.width';
@@ -99,6 +100,8 @@ export function RightBar({ commands }: { commands: Commands }) {
       />
       <div className={cls.bar}>
         <MachineConfig commands={commands} />
+        <EncoderDiagCard />
+        <FirmwareCard commands={commands} />
       </div>
     </div>
   );

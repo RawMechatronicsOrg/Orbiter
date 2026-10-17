@@ -45,6 +45,7 @@ from models import (
 )
 import camera_io
 from orbiter_model import model
+from scene_graph import effective_arm_radius
 
 log = logging.getLogger("orbiter.scan")
 
@@ -100,7 +101,8 @@ def _geom_params() -> GeomParams:
     # the solver verified, not the manual fallback model.
     return GeomParams(
         extrinsic=MountTransform.from_dict(getattr(model, "calib_extrinsic", None)),
-        arm_radius=max(model.arm_radius_mm, 1.0),
+        # 0 = not set: the CAD arm's reach, as the scene draws it.
+        arm_radius=max(effective_arm_radius(model), 1.0),
         camera_offset=model.camera_offset_mm,
         # Tilt zeroed — see scene_graph._geom_params for the rationale.
         camera_tilt=0.0,
@@ -594,8 +596,16 @@ async def start_scan() -> dict[str, Any]:
     global _scan_task
     if _scan_lock.locked():
         raise RuntimeError("a scan is already running")
-    if model.arm_radius_mm <= 0:
-        raise RuntimeError("set rig geometry (arm radius) before scanning")
+    if model.calibration_running:
+        raise RuntimeError("a geometry calibration is running")
+    if model.calibration_status == "stale":
+        # Its mount transform still drives every capture pose; scanning with it
+        # would record poses for a rig that is not on the bench.
+        raise RuntimeError(
+            f"the geometry calibration no longer matches the rig "
+            f"({model.calibration_stale_reason}) — recalibrate, or Reset "
+            "calibration in Machine config, before scanning"
+        )
 
     try:
         plan = MotionPlan.model_validate(model.motion_plan)

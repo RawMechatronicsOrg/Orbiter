@@ -1,37 +1,33 @@
 """Encoder-zero bookkeeping.
 
 The rig's encoder zeros are set **manually** from the UI (Machine config →
-Encoder zero → "Zero EL"): level the arm, click, and the firmware records the
-current elevation as 0. `encoder_zero_initialized` flips True on the first
-manual zero so `calibrate_geometry` knows the rig has a sane reference before
-it sweeps to absolute poses.
+Step 2 · Zero encoders): level the arm and press "Zero EL", and the firmware
+records the current elevation as 0; "Zero AZ" does the same for the platform
+heading. The zeros live in the firmware's NVS (`POST /calibrate`), and the
+firmware reports them in `GET /state` → `calibration`.
 
-(An earlier build auto-zeroed AZ at boot and aligned EL to the phone IMU.
-That was removed: the phone-derived EL zero proved unreliable and drove the
-arm to bogus elevations — `el ≈ -388°` — so the calibration sweep pointed the
-camera away from the board. Zeroing is explicit and manual now.)
+`model.encoder_zero_initialized` says whether the **elevation** zero is set,
+read from those reported offsets: an EL zero still at the firmware default
+has never been set (or was reset, or the NVS was erased). Only EL matters —
+the calibration sweep and every scan move to absolute elevations, and an
+unzeroed EL encoder reads an arbitrary angle (the arm would be driven toward
+the cross rail). The azimuth zero only names the platform heading 0°.
 """
 
 from __future__ import annotations
 
-import logging
+from typing import Any
 
-from orbiter_model import model
+#: The EL zero the firmware uses without a stored one, and the one
+#: `/calibrate mode=reset` restores (motion.c, CAL_DEFAULT_EL_RAW).
+FIRMWARE_DEFAULT_EL_ZERO_RAW = 138.296
 
-log = logging.getLogger("orbiter.encoder_init")
 
-
-def mark_initialized(reason: str) -> None:
-    """Flip the persisted first-zero flag (idempotent). Called when the
-    operator zeroes an encoder by hand — that is what makes the rig 'ready'
-    for a calibration sweep."""
-    if model.encoder_zero_initialized:
-        return
-    model.update(encoder_zero_initialized=True)
-    log.info("encoder zero initialized (%s)", reason)
-    try:
-        from ws_hub import hub
-        hub.emit_log({"level": "I", "source": "api", "tag": "enc0",
-                      "msg": f"encoder zero initialized ({reason})"})
-    except Exception:  # noqa: BLE001 — best-effort UI mirror
-        pass
+def el_zero_set(encoder_zero: dict[str, Any] | None) -> bool | None:
+    """Whether the firmware holds an EL zero of its own; None when it has
+    not reported its offsets (yet)."""
+    value = (encoder_zero or {}).get("el_zero_raw_deg")
+    if not isinstance(value, (int, float)):
+        return None
+    # The firmware reports the offsets with 3 decimals.
+    return abs(float(value) - FIRMWARE_DEFAULT_EL_ZERO_RAW) > 0.0005

@@ -4,9 +4,10 @@
  * sessions, scan storage, config). Single source of truth for `API_BASE`.
  */
 
-/** True when the UI is served by the Vite dev server (proxied API + WS). */
+/** True when the UI is served by the Vite dev server (proxied API + WS) —
+ *  on whatever port it runs, so a second dev UI can sit next to the first. */
 export function isViteDev(): boolean {
-  return new Set(['5173', '5174']).has(window.location.port);
+  return import.meta.env.DEV;
 }
 
 /** HTTP base URL — same origin in dev (Vite proxy), direct :8000 in production. */

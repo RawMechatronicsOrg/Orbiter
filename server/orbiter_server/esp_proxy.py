@@ -29,6 +29,8 @@ import httpx
 import websockets
 
 from config import settings
+from drive import axes_info, axis_calibrated
+from geom.angles import EL_MAX, EL_MIN
 from orbiter_model import ModelState, model
 
 log = logging.getLogger("orbiter.esp")
@@ -49,12 +51,37 @@ _POLL_INTERVAL_S = 0.25
 #: rebooted without a TCP FIN, network dropped, …). Forces a reconnect — the
 #: firmware emits `pose` at ~10 Hz, so a multi-second gap is never legitimate.
 _STREAM_IDLE_TIMEOUT_S = 5.0
+#: Read-only diagnostics (/health, /test/encoder) answer at once or not at all
+#: (the device is rebooting) — fail fast so a UI poll stays responsive.
+_DIAG_TIMEOUT_S = 3.0
+#: How long a diagnostic read waits for the HTTP lock before it gives up as
+#: "busy" — diagnostics must never queue up ahead of motion commands.
+_DIAG_LOCK_WAIT_S = 0.5
+#: POST /ota streams ~1-2 MB over the ESP's Wi-Fi, then the device verifies
+#: the image before it answers.
+_OTA_TIMEOUT_S = 120.0
+#: A spin is open loop and the firmware does not stop it at the EL travel
+#: limits (API.md, POST /spin), so the proxy does: an EL spin heading out of
+#: the travel is stopped this far before the limit — at least
+#: `_EL_SPIN_MARGIN_DEG`, more at speed (`_EL_SPIN_MARGIN_S` of travel).
+_EL_SPIN_MARGIN_DEG = 3.0
+_EL_SPIN_MARGIN_S = 0.4
+#: …and stopped outright when the EL reading stops changing for this long
+#: while it spins: a stalled stream, a frozen encoder read or a stalled motor
+#: all blind the limit check.
+_EL_SPIN_FROZEN_S = 0.6
+#: After a guard stop, frames still flagging the spin are ignored this long.
+_EL_GUARD_QUIET_S = 1.5
 
 LogCallback = Callable[[dict[str, Any]], None]
 
 
 class EspError(RuntimeError):
     """A firmware command was rejected or the device is unreachable."""
+
+
+class EspBusy(EspError):
+    """A diagnostic read gave way to commands holding the HTTP channel."""
 
 
 class EspProxy:
@@ -76,6 +103,19 @@ class EspProxy:
         self._last_pose_at = 0.0
         #: one-shot guard so the "degraded to REST poll" notice fires once.
         self._degraded_logged = False
+        self._hydrate_task: asyncio.Task[None] | None = None
+        #: True once a /state answer from the current device was applied —
+        #: until then `model.motor_cal` is unknown, not "not reported".
+        self._state_seen = False
+        #: EL spin guard state (see `_guard_el_spin`): last reading, when it
+        #: last changed, the margin for the running spin, the watchdog and
+        #: the pending stop.
+        self._last_el: float | None = None
+        self._el_changed_at = 0.0
+        self._el_spin_margin_deg = _EL_SPIN_MARGIN_DEG
+        self._el_guard_quiet_until = 0.0
+        self._el_watchdog: asyncio.Task[None] | None = None
+        self._el_stop_task: asyncio.Task[None] | None = None
 
     # ── lifecycle ───────────────────────────────────────────────────────────
 
@@ -124,6 +164,7 @@ class EspProxy:
 
     async def _retarget(self, new_ip: str) -> None:
         self._set_endpoints(new_ip)
+        self._state_seen = False
         old_client = self._client
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
@@ -181,6 +222,7 @@ class EspProxy:
                 ) as ws:
                     connected = True
                     backoff = 1.0
+                    self._hydrate_task = asyncio.create_task(self._hydrate())
                     if self._degraded_logged:
                         # Stream is back after a spell of REST-poll fallback.
                         self._degraded_logged = False
@@ -223,12 +265,16 @@ class EspProxy:
                 "esp_online": True,
                 "motion_state": frame.get("st", "unknown"),
                 "motors_on": bool(frame.get("motors", False)),
+                "spinning_az": bool(frame.get("sp_az", False)),
+                "spinning_el": bool(frame.get("sp_el", False)),
             }
             if "az" in frame:
                 patch["az"] = float(frame["az"])
             if "el" in frame:
                 patch["el"] = float(frame["el"])
             self.model.update(**patch)
+            if "el" in patch:
+                self._guard_el_spin(patch["el"])
 
         elif kind == "task":
             self.model.update(runner={
@@ -236,6 +282,10 @@ class EspProxy:
                 "status": frame.get("status"),
                 "result": frame.get("result"),
             })
+            result = frame.get("result")
+            if isinstance(result, dict) and "steps_per_deg" in result:
+                # A motor calibration ended: its new result is only in /state.
+                self._hydrate_task = asyncio.create_task(self._hydrate())
 
         elif kind == "log":
             cb = self.on_log
@@ -262,6 +312,18 @@ class EspProxy:
         data = resp.json()
         self._apply_state(data)
         return data
+
+    async def _hydrate(self) -> None:
+        """One `GET /state` each time the stream (re)connects. The encoder
+        zeros are not in the pose frames, and the /state poll stays dormant
+        while the stream is fresh — without this the UI would never see them."""
+        for attempt in range(3):
+            try:
+                await self.fetch_state()
+                return
+            except Exception as exc:  # noqa: BLE001 — retried, then the next connect
+                log.debug("ESP /state hydrate failed (%d/3): %s", attempt + 1, exc)
+                await asyncio.sleep(1.0)
 
     async def _poll_loop(self) -> None:
         """REST `/state` fallback. Dormant while the /ws/log `pose` stream is
@@ -315,6 +377,9 @@ class EspProxy:
             patch["motion_state"] = data["state"]
         if "motors_enabled" in data:
             patch["motors_on"] = bool(data["motors_enabled"])
+        for key in ("spinning_az", "spinning_el"):
+            if key in data:
+                patch[key] = bool(data[key])
         az = data.get("azimuth")
         if isinstance(az, dict) and "angle_deg" in az:
             patch["az"] = float(az["angle_deg"])
@@ -327,6 +392,11 @@ class EspProxy:
         enc = data.get(_FW_ENCODER_ZERO_KEY)
         if isinstance(enc, dict) and enc:
             patch["encoder_zero"] = enc
+        motor_cal = data.get("motor_cal")
+        if isinstance(motor_cal, dict):
+            patch.update(self._motor_cal_patch(
+                bool(motor_cal.get("active")), motor_cal.get("az"), motor_cal.get("el")))
+        self._state_seen = True
         runner = data.get("runner")
         if isinstance(runner, dict) and runner.get("id"):
             patch["runner"] = {
@@ -335,6 +405,124 @@ class EspProxy:
                 "result": runner.get("result"),
             }
         self.model.update(**patch)
+        if "el" in patch:
+            self._guard_el_spin(patch["el"])
+
+    def _motor_cal_patch(self, active: bool, az: Any, el: Any) -> dict[str, Any]:
+        """`motor_cal` + the `axes` derived from it, from either /state or
+        GET /motor/calibration (which carries more per axis). `compensation`
+        is only in the latter, so the last known value is kept."""
+        known = self.model.motor_cal or {}
+
+        def summary(name: str, axis: Any) -> dict[str, Any]:
+            axis = axis if isinstance(axis, dict) else {}
+            out = {key: axis.get(key) for key in
+                   ("valid", "steps_per_deg", "max_speed_dps", "dir_sign")}
+            out["compensation"] = axis.get(
+                "compensation", (known.get(name) or {}).get("compensation"))
+            return out
+
+        motor_cal = {"active": active, "az": summary("az", az), "el": summary("el", el)}
+        return {"motor_cal": motor_cal, "axes": axes_info(motor_cal)}
+
+    def apply_motor_calibration(self, report: dict[str, Any]) -> None:
+        """Mirror a `GET /motor/calibration` report into the model."""
+        run = report.get("run") if isinstance(report.get("run"), dict) else {}
+        self.model.update(**self._motor_cal_patch(
+            bool(run.get("active")), report.get("az"), report.get("el")))
+
+    def _check_motor_cal(self, axes: list[str]) -> None:
+        """Refuse a closed-loop move the firmware cannot drive yet. Until an
+        axis is motor-calibrated the firmware assumes a direction that the
+        bench measured wrong on both axes: the move runs away from its target
+        until it times out (on EL, toward the cross rail)."""
+        mc = self.model.motor_cal
+        if not mc:
+            return  # /state was read: a firmware without motor calibration
+        if mc.get("active"):
+            raise EspError("a motor calibration is running — wait for it or cancel it")
+        missing = [a.upper() for a in axes if not axis_calibrated(mc, a)]
+        if missing:
+            raise EspError(
+                f"{' and '.join(missing)} not motor-calibrated — a closed-loop move "
+                "would run away from its target. Calibrate the motor first "
+                "(Machine config → Step 1)."
+            )
+
+    def _guard_el_spin(self, el: float) -> None:
+        """Stop an EL spin that is heading out of the travel. Direction comes
+        from the reading trend — which way cw/ccw turns the arm is wiring."""
+        now = time.monotonic()
+        prev, self._last_el = self._last_el, el
+        if prev is None or el != prev:
+            self._el_changed_at = now
+        if not self.model.spinning_el:
+            return
+        if (self._el_watchdog is None or self._el_watchdog.done()) \
+                and now >= self._el_guard_quiet_until:
+            # A spin this proxy did not start, or whose /spin answer was lost:
+            # its speed is unknown, so assume the fastest the band allows.
+            el_axis = self.model.axes["el"]
+            fastest = el_axis["hz_max"] / el_axis["steps_per_deg"]
+            self._el_spin_margin_deg = max(
+                self._el_spin_margin_deg, _EL_SPIN_MARGIN_S * fastest)
+            self._el_watchdog = asyncio.get_running_loop().create_task(self._watch_el_spin())
+        if prev is None:
+            return
+        margin = self._el_spin_margin_deg
+        if el < prev and el <= EL_MIN + margin:
+            self._stop_el_spin_now(f"at {el:.1f}° — {EL_MIN:+g}° travel limit ahead")
+        elif el > prev and el >= EL_MAX - margin:
+            self._stop_el_spin_now(f"at {el:.1f}° — {EL_MAX:+g}° travel limit ahead")
+
+    def _stop_el_spin_now(self, why: str) -> None:
+        if time.monotonic() < self._el_guard_quiet_until:
+            return
+        if self._el_stop_task is not None and not self._el_stop_task.done():
+            return
+        self._el_guard_quiet_until = time.monotonic() + _EL_GUARD_QUIET_S
+        msg = f"EL spin stopped {why}"
+        log.warning(msg)
+        self._emit_log("W", "esp", msg)
+        self._el_stop_task = asyncio.get_running_loop().create_task(self._stop_el_spin())
+
+    async def _stop_el_spin(self) -> None:
+        """POST /spin/stop for EL on a client of its own, so it does not
+        wait behind a request holding the shared channel; the shared, retried
+        path is the fallback."""
+        try:
+            async with self._stop_client() as c:
+                resp = await c.post("/spin/stop", json={"axis": "el"})
+            resp.raise_for_status()
+            return
+        except httpx.HTTPError as exc:
+            log.warning("EL spin guard: direct /spin/stop failed (%s) — retrying", exc)
+        try:
+            await self.spin_stop("el")
+        except EspError as exc:
+            log.error("EL spin guard: /spin/stop failed: %s", exc)
+            self._emit_log("E", "esp", f"EL spin guard could not stop the axis: {exc}")
+
+    def _stop_client(self) -> httpx.AsyncClient:
+        """A one-off client for the guard's stop, outside the shared one."""
+        return httpx.AsyncClient(base_url=self.base_url, timeout=2.0)
+
+    async def _watch_el_spin(self) -> None:
+        """While EL spins, stop it when its reading freezes — the limit check
+        runs on readings, so without them the arm would spin on blind."""
+        self._el_changed_at = time.monotonic()
+        seen = False
+        while True:
+            await asyncio.sleep(0.1)
+            now = time.monotonic()
+            if self.model.spinning_el:
+                seen = True
+            elif seen:
+                return  # stopped; spin_stop also cancels this task
+            if now - self._el_changed_at > _EL_SPIN_FROZEN_S:
+                self._stop_el_spin_now(
+                    f"— no new EL reading for {now - self._el_changed_at:.1f} s")
+                return
 
     def _emit_log(self, level: str, tag: str, msg: str) -> None:
         cb = self.on_log
@@ -448,6 +636,45 @@ class EspProxy:
             raise EspError(data.get("message") or f"{path}: HTTP {resp.status_code}")
         return data
 
+    async def get_json(self, path: str) -> dict[str, Any]:
+        """A read-only firmware GET (`/health`, `/test/encoder`) with a short
+        timeout. Raises EspError when the device does not answer."""
+        if self._client is None:
+            raise EspError("ESP proxy not started")
+        try:
+            await asyncio.wait_for(self._http_lock.acquire(), _DIAG_LOCK_WAIT_S)
+        except asyncio.TimeoutError:
+            raise EspBusy(f"{path}: the firmware link is busy with commands") from None
+        try:
+            resp = await self._client.get(path, timeout=_DIAG_TIMEOUT_S)
+            resp.raise_for_status()
+            return resp.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise EspError(f"{path}: {type(exc).__name__}: {exc}") from exc
+        finally:
+            self._http_lock.release()
+
+    async def ota(self, image: bytes) -> tuple[int, dict[str, Any]]:
+        """Stream a firmware image to `POST /ota`. Returns the firmware's
+        status code and JSON as they are — 200 means written, verified and
+        rebooting; 400/409/413/500 carry its reason. Raises EspError only when
+        the device cannot be reached."""
+        if self._client is None:
+            raise EspError("ESP proxy not started")
+        try:
+            async with self._http_lock:
+                resp = await self._client.post(
+                    "/ota", content=image, timeout=_OTA_TIMEOUT_S,
+                    headers={"Content-Type": "application/octet-stream"},
+                )
+        except httpx.HTTPError as exc:
+            raise EspError(f"/ota: {type(exc).__name__}: {exc}") from exc
+        try:
+            data = resp.json() if resp.content else {}
+        except ValueError:
+            data = {"status": "error", "message": resp.text[:200]}
+        return resp.status_code, data
+
     async def wait_for_task(self, task_id: int, timeout_s: float) -> dict[str, Any]:
         """Wait until the task reaches a terminal status. `model.runner` is kept
         fresh by the /ws/log `task` frames or the /state poll fallback."""
@@ -479,6 +706,17 @@ class EspProxy:
         timeout_ms: int = 30_000,
     ) -> dict[str, Any]:
         """Submit a /move (202 + task_id). Does not wait — see `move_and_await`."""
+        if not self._state_seen:
+            # Whether the axes are motor-calibrated is unknown until /state
+            # was read — never assume they are.
+            try:
+                await self.fetch_state()
+            except Exception as exc:  # noqa: BLE001
+                raise EspError(
+                    f"firmware state unknown (GET /state failed: {exc}) — not moving"
+                ) from exc
+        self._check_motor_cal(
+            [a for a, v in (("az", azimuth_deg), ("el", elevation_deg)) if v is not None])
         body: dict[str, Any] = {"timeout_ms": timeout_ms}
         if azimuth_deg is not None:
             body["azimuth_deg"] = azimuth_deg
@@ -562,6 +800,45 @@ class EspProxy:
 
     async def motors(self, enabled: bool) -> dict[str, Any]:
         return await self._post("/motors", {"enabled": enabled})
+
+    async def spin(self, axis: str, direction: str, step_hz: int) -> dict[str, Any]:
+        """Continuous rotation of one axis at a driver step rate (open loop).
+        An EL spin is stopped short of the travel by `_guard_el_spin` and when
+        its reading freezes by `_watch_el_spin`."""
+        if axis == "el":
+            # Before the request: a lost answer must not leave the margin of
+            # an earlier, slower spin in force.
+            steps_per_deg = float(self.model.axes["el"]["steps_per_deg"])
+            self._el_spin_margin_deg = max(
+                _EL_SPIN_MARGIN_DEG, _EL_SPIN_MARGIN_S * step_hz / steps_per_deg)
+            self._el_guard_quiet_until = 0.0
+        result = await self._post("/spin", {"axis": axis, "dir": direction, "step_hz": step_hz})
+        if axis == "el" and (self._el_watchdog is None or self._el_watchdog.done()):
+            self._el_watchdog = asyncio.create_task(self._watch_el_spin())
+        return result
+
+    async def spin_stop(self, axis: str = "both") -> dict[str, Any]:
+        if axis in ("el", "both") and self._el_watchdog is not None:
+            self._el_watchdog.cancel()  # a deliberate stop is not a frozen reading
+        return await self._post("/spin/stop", {"axis": axis})
+
+    async def motor_calibrate(self, axis: str, arm_removed: bool) -> dict[str, Any]:
+        """Start the firmware's motor self-calibration of one axis (202 +
+        task_id; ~2-4 min, progress on GET /motor/calibration). Every phase
+        turns the axis full circle."""
+        result = await self._post("/motor/calibrate", {"axis": axis, "arm_removed": arm_removed})
+        # Busy from now on, not only once the next /state read says so.
+        mc = dict(self.model.motor_cal or {"az": {}, "el": {}})
+        mc["active"] = True
+        self.model.update(motor_cal=mc, axes=axes_info(mc))
+        return result
+
+    async def motor_calibrate_cancel(self) -> dict[str, Any]:
+        return await self._post("/motor/calibrate/cancel", {})
+
+    async def motor_compensation(self, axis: str, enabled: bool) -> dict[str, Any]:
+        """Apply (or not) the axis' measured angle-deviation profile."""
+        return await self._post("/motor/compensation", {"axis": axis, "enabled": enabled})
 
     async def reboot(self) -> dict[str, Any]:
         """Ask the firmware to restart. The device acks 200 then reboots

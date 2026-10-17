@@ -30,15 +30,29 @@ export interface StereoEye {
 
 export interface Commands {
   move(az?: number, el?: number): void;
+  /** Bump one axis by `deltaDeg` from its live reading. The server stops an
+   *  EL jog at the travel limit and refuses one starting far outside it. */
+  jog(axis: 'az' | 'el', deltaDeg: number): void;
   motors(enabled: boolean): void;
-  /** Zero / reset stepper encoders. Despite the name this is NOT the
-   *  geometry/intrinsics calibration (that lives in Machine config →
-   *  "Calibrate from board") — it's the firmware's encoder-position
-   *  zeroing routine. Kept under the original protocol name to stay
-   *  wire-compatible with the server. */
-  calibrate(axis: Axis, mode?: string): void;
-  rebootEsp(): void;
-  setGeometry(fields: Record<string, number>): void;
+  /** Continuous rotation of one axis at a driver step rate (Hz) inside the
+   *  band of `model.axes`. The server refuses an EL spin without the EL zero
+   *  and stops one heading out of the travel. */
+  spin(axis: 'az' | 'el', dir: 'cw' | 'ccw', stepHz: number): void;
+  spinStop(axis: Axis): void;
+  /** Firmware motor self-calibration of one axis (Machine config → Step 1).
+   *  EL turns full circles, so the server refuses it without `armRemoved`. */
+  motorCalibrate(axis: 'az' | 'el', armRemoved: boolean): void;
+  motorCalibrateCancel(): void;
+  /** Apply (or not) the axis' measured angle-deviation profile. */
+  motorCompensation(axis: 'az' | 'el', enabled: boolean): void;
+  /** Set or reset the firmware encoder zero (`calibrate_encoder`):
+   *  `current` takes the present reading as 0, `reset` restores the
+   *  firmware's default zero. Not the geometry calibration (Machine config →
+   *  "Calibrate from board"). */
+  zeroEncoder(axis: Axis, mode?: 'current' | 'reset'): void;
+  rebootFirmware(): void;
+  /** Rig geometry overrides and kinematic offsets (`set_machine_config`). */
+  setMachineConfig(fields: Record<string, number>): void;
   /** Update the persisted ChArUco board params. Only the keys present in
    *  `params` are applied server-side. */
   setBoardParams(params: {
@@ -52,10 +66,14 @@ export interface Commands {
    *  `preset` controls the pose count / accuracy tradeoff
    *  (fast ≈ 9 poses, normal ≈ 24, full ≈ 32). */
   calibrateGeometry(preset: 'fast' | 'normal' | 'full'): void;
+  /** Forget the geometry calibration — the rig goes back to the CAD-derived
+   *  geometry (camera intrinsics are kept). */
+  resetCalibration(): void;
   setMotionPlan(plan: Record<string, unknown>): void;
   /** Set the per-axis closed-loop top step rate (Hz) — the Machine-config
-   *  speed knobs. Either or both axes; the server clamps to a safe band and
-   *  forwards the value to the firmware with the next /move. */
+   *  speed knobs. Either or both axes; the server clamps to the band it
+   *  publishes in `model.axes` and forwards the value to the firmware with the
+   *  next /move. */
   setMoveSpeed(azHzMax?: number, elHzMax?: number): void;
   setRenderPref(prefs: Record<string, boolean>): void;
   /** Update the binocular pair config (Stereo tab). Only the keys present are
@@ -98,14 +116,24 @@ export function makeCommands(client: WsClient): Commands {
       });
       client.sendCommand('move', { az, el });
     },
+    jog: (axis, deltaDeg) => client.sendCommand('jog', { axis, delta_deg: deltaDeg }),
     motors: (enabled) => client.sendCommand('motors', { enabled }),
-    calibrate: (axis, mode = 'current') =>
-      client.sendCommand('calibrate', { axis, mode }),
-    rebootEsp: () => client.sendCommand('reboot_esp'),
-    setGeometry: (fields) => client.sendCommand('set_geometry', fields),
+    spin: (axis, dir, stepHz) =>
+      client.sendCommand('spin', { axis, dir, step_hz: Math.round(stepHz) }),
+    spinStop: (axis) => client.sendCommand('spin_stop', { axis }),
+    motorCalibrate: (axis, armRemoved) =>
+      client.sendCommand('motor_calibrate', { axis, arm_removed: armRemoved }),
+    motorCalibrateCancel: () => client.sendCommand('motor_calibrate_cancel'),
+    motorCompensation: (axis, enabled) =>
+      client.sendCommand('motor_compensation', { axis, enabled }),
+    zeroEncoder: (axis, mode = 'current') =>
+      client.sendCommand('calibrate_encoder', { axis, mode }),
+    rebootFirmware: () => client.sendCommand('reboot_firmware'),
+    setMachineConfig: (fields) => client.sendCommand('set_machine_config', fields),
     setBoardParams: (params) => client.sendCommand('set_board_params', params),
     calibrateGeometry: (preset) =>
       client.sendCommand('calibrate_geometry', { apply: true, preset }),
+    resetCalibration: () => client.sendCommand('reset_calibration'),
     setMotionPlan: (plan) =>
       client.sendCommand('set_motion_plan', { motion_plan: plan }),
     setMoveSpeed: (azHzMax, elHzMax) => {

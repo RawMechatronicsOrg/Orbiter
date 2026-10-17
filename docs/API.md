@@ -65,8 +65,10 @@ zero). Azimuth wraps to `[0°, 360°)`. Elevation is signed.
 
 ## `POST /move`
 
-Drive one or both axes to target angles. **Blocking** — the response is
-held open until both axes are within tolerance, or `timeout_ms` elapses.
+Drive one or both axes to target angles. **Asynchronous** — the firmware
+queues the move and answers `202` at once with a `task_id`; the move runs on
+the motion runner while the HTTP server stays free for `/state` and the
+`/ws/log` stream.
 
 **Request**
 ```json
@@ -81,38 +83,34 @@ held open until both axes are within tolerance, or `timeout_ms` elapses.
 |-------|------|----------|---------|-------|
 | `azimuth_deg` | float | no | unchanged | Any value. Firmware picks the shortest path on the circle. |
 | `elevation_deg` | float | no | unchanged | Must be in `[−25, +90]`. Out of range → 400. |
-| `timeout_ms` | int | no | 15000 | Returns `408` if not reached in time. |
+| `timeout_ms` | int | no | 15000 | The task ends with status `timeout` if the target is not reached in time. |
 | `az_hz_max` | int | no | 0 | Per-move AZ top step rate (Hz). `0`/absent = compiled default; clamped to a safe band in firmware. The UI speed knobs flow in here. |
 | `el_hz_max` | int | no | 0 | Per-move EL top step rate (Hz). Same semantics as `az_hz_max`. |
 
 Omitting an axis leaves it at its current position.
 
-**200** — target reached
+**202** — accepted
 ```json
-{
-  "status": "ok",
-  "azimuth_deg":   90.0,
-  "elevation_deg": 45.0,
-  "duration_ms":   1840
-}
+{ "status": "accepted", "task_id": 17, "kind": "move" }
 ```
 
-**408** — timeout; motors keep going
+The outcome arrives as a `task` frame on [`/ws/log`](#get-wslog-websocket)
+and in `GET /state` → `runner`, keyed by `task_id`:
+
 ```json
-{
-  "status": "timeout",
-  "azimuth_deg":   87.3,
-  "elevation_deg": 44.1,
-  "duration_ms":   10000
-}
+{ "kind": "task", "task_id": 17, "status": "done",
+  "result": { "azimuth_deg": 90.0, "elevation_deg": 45.0, "duration_ms": 1840 } }
 ```
 
-**409** — another move is already in progress
+`status` is `done`, `timeout` (not reached within `timeout_ms`) or `error`.
+
+**409** — another task is still running
 ```json
 { "status": "busy" }
 ```
 
-**400** — bad request (e.g. EL out of range).
+**400** — bad request: neither axis given, or `elevation_deg` outside the
+travel (`{"status":"error","message":"elevation_deg out of range -25..+90"}`).
 
 ### Arrival tolerance
 
@@ -125,26 +123,43 @@ Omitting an axis leaves it at its current position.
 
 ## `POST /spin`
 
-Continuous rotation. Useful for video sweeps or warm-up.
+Continuous rotation of one axis, open loop, at a driver step rate. Useful
+for video sweeps or warm-up.
 
 > **No range check on EL.** Unlike `/move`, a spin is not stopped at the
 > elevation limits: on the v2 mechanics the arm meets the cross rail at
-> −28.8°. Spin elevation only while watching it.
+> −28.8°. Spin elevation only while watching it. (The Orbiter server stops
+> an EL spin it started a few degrees before the limits, from the encoder
+> reading.)
 
 **Request**
 ```json
-{ "axis": "az", "rate_deg_per_s": 30.0 }
-{ "axis": "el", "rate_deg_per_s": 5.0 }
-{ "axis": "az", "rate_deg_per_s": 0 }     // stop
+{ "axis": "az", "dir": "cw",  "step_hz": 2100 }
+{ "axis": "el", "dir": "ccw", "step_hz": 350 }
 ```
+
+| Field | Type | Required | Default | Notes |
+|-------|------|----------|---------|-------|
+| `axis` | `"az"` \| `"el"` | yes | — | |
+| `dir` | `"cw"` \| `"ccw"` | no | `cw` | |
+| `step_hz` | int | no | 525 | Driver step rate (1/16 microsteps). `0` or above 10000 falls back to 525. At the v2 gearing 1 °/s is about 62 Hz on AZ and 89 Hz on EL. |
 
 **200**
 ```json
-{ "status": "ok", "spinning_az": true, "spinning_el": false }
+{ "status": "ok", "axis": "az", "dir": "cw", "step_hz": 2100 }
 ```
 
-EL spin is clamped at the physical limits — the firmware stops the axis
-automatically when it hits `−25°` or `+90°`.
+**409** — that axis is already spinning, or a move is running.
+
+The pose frames on `/ws/log` carry `sp_az` / `sp_el` while an axis spins.
+
+## `POST /spin/stop`
+
+```json
+{ "axis": "az" }      // or "el", "both"
+```
+
+**200** `{ "status": "ok" }`
 
 ---
 

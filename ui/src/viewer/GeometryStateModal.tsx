@@ -1,11 +1,9 @@
 /**
- * Geometry state modal — one screen with the live tunables (manual rig
- * geometry, kinematic offsets, render preferences). Read-only solver-output
- * sections (active_calibration, board_placement, etc.) were removed in v0.1
- * because the calibration pipeline isn't part of this slice yet.
+ * Geometry state modal — one screen with the geometry calibration (read-only
+ * solver output + Reset), the overrides of the CAD-derived geometry, the
+ * kinematic offsets and the render preferences.
  *
- * No new commands — uses the existing set_geometry / set_render_pref
- * dispatch.
+ * Commands: reset_calibration, set_machine_config, set_render_pref.
  */
 import { useState, useEffect } from 'react';
 import {
@@ -17,8 +15,33 @@ import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
 import { useViewerStore } from './modelStore';
 import type { Commands } from './commands';
+import { calibrationStatus } from './ui';
 
 type ModelLike = Record<string, unknown>;
+
+/** Compact readout of a solved value: numbers to 4 places, `{rvec, t}`
+ *  transforms as two vectors, absent values as a dash. */
+function fmtSolved(v: unknown): string {
+  if (v == null) return '—';
+  if (typeof v === 'number') return v.toFixed(4);
+  if (Array.isArray(v)) return `[${v.map((x) => fmtSolved(x)).join(', ')}]`;
+  if (typeof v === 'object') {
+    const o = v as Record<string, unknown>;
+    if ('rvec' in o || 't' in o) {
+      return `rvec ${fmtSolved(o.rvec)} · t ${fmtSolved(o.t)}`;
+    }
+  }
+  return String(v);
+}
+
+function ReadRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-baseline gap-2 text-[12px]">
+      <span className="w-44 shrink-0 font-mono text-inkdim">{label}</span>
+      <span className="break-all font-mono text-[11px] text-zinc-200">{value}</span>
+    </div>
+  );
+}
 
 function Field({
   label,
@@ -138,26 +161,80 @@ export function GeometryStateModal({
         </div>
 
         <div className="space-y-3 p-4">
-          {/* ── manual rig geometry ── */}
-          <Section title="Manual rig geometry">
+          {/* ── geometry calibration (read-only solver output) ── */}
+          <Section
+            title="Geometry calibration"
+            hint={
+              {
+                none: 'not calibrated',
+                current: 'matches this rig',
+                stale: `stale: ${String(model.calibration_stale_reason ?? '')}`,
+              }[calibrationStatus(model)]
+            }
+          >
+            <ReadRow label="calibrated" value={String(model.calibrated === true)} />
+            <ReadRow label="calib_rig_id" value={fmtSolved(model.calib_rig_id)} />
+            <ReadRow label="rig_id (this server)" value={fmtSolved(model.rig_id)} />
+            <ReadRow
+              label="calib_encoder_zero"
+              value={fmtSolved(
+                model.calib_encoder_zero &&
+                  Object.values(model.calib_encoder_zero as Record<string, number>),
+              )}
+            />
+            <ReadRow
+              label="encoder_zero (now)"
+              value={fmtSolved(
+                model.encoder_zero &&
+                  Object.values(model.encoder_zero as Record<string, number>),
+              )}
+            />
+            <ReadRow label="calib_extrinsic" value={fmtSolved(model.calib_extrinsic)} />
+            <ReadRow label="calib_board_world" value={fmtSolved(model.calib_board_world)} />
+            <ReadRow label="rocker_correction" value={fmtSolved(model.rocker_correction)} />
+            <ReadRow label="el_encoder_scale" value={fmtSolved(model.el_encoder_scale)} />
+            <ReadRow
+              label="az_encoder_correction"
+              value={fmtSolved(model.az_encoder_correction)}
+            />
+            <div className="pt-1">
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={model.calibrated !== true}
+                onClick={() => {
+                  if (
+                    window.confirm(
+                      'Reset the geometry calibration? The rig falls back to the ' +
+                        'CAD model; camera intrinsics are kept.',
+                    )
+                  ) {
+                    commands.resetCalibration();
+                  }
+                }}
+              >
+                Reset calibration
+              </Button>
+            </div>
+          </Section>
+
+          {/* ── overrides of the CAD-derived geometry ── */}
+          <Section
+            title="Geometry overrides"
+            hint="Over the rig GLB; a calibration writes these"
+          >
             <Field
               label="arm_radius_mm"
               value={num('arm_radius_mm')}
-              onCommit={(v) => commands.setGeometry({ arm_radius_mm: v })}
+              onCommit={(v) => commands.setMachineConfig({ arm_radius_mm: v })}
               step="1"
+              hint="0 = the CAD arm's reach"
             />
             <Field
               label="camera_offset_mm"
               value={num('camera_offset_mm')}
-              onCommit={(v) => commands.setGeometry({ camera_offset_mm: v })}
+              onCommit={(v) => commands.setMachineConfig({ camera_offset_mm: v })}
               step="1"
-            />
-            <Field
-              label="base_height_mm"
-              value={num('base_height_mm')}
-              onCommit={(v) => commands.setGeometry({ base_height_mm: v })}
-              step="1"
-              hint="Disc top to AZ-EL axis (mm)"
             />
           </Section>
 
@@ -170,7 +247,7 @@ export function GeometryStateModal({
               label="el_kinematic_offset_deg"
               value={num('el_kinematic_offset_deg')}
               onCommit={(v) =>
-                commands.setGeometry({ el_kinematic_offset_deg: v })
+                commands.setMachineConfig({ el_kinematic_offset_deg: v })
               }
               step="0.5"
             />
@@ -178,7 +255,7 @@ export function GeometryStateModal({
               label="az_kinematic_offset_deg"
               value={num('az_kinematic_offset_deg')}
               onCommit={(v) =>
-                commands.setGeometry({ az_kinematic_offset_deg: v })
+                commands.setMachineConfig({ az_kinematic_offset_deg: v })
               }
               step="0.5"
             />

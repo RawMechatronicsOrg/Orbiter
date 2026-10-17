@@ -66,13 +66,13 @@ export function TopBar({ commands }: { commands: Commands }) {
   const model = useViewerStore((s) => s.model);
   const espOnline = model.esp_online === true;
 
-  const rebootEsp = () => {
+  const rebootFirmware = () => {
     if (
       window.confirm(
         'Reboot ESP firmware now? The device will be offline for a few seconds.',
       )
     ) {
-      commands.rebootEsp();
+      commands.rebootFirmware();
     }
   };
 
@@ -99,7 +99,7 @@ export function TopBar({ commands }: { commands: Commands }) {
         variant="outline"
         size="xs"
         disabled={!espOnline}
-        onClick={rebootEsp}
+        onClick={rebootFirmware}
         title="Restart ESP32 firmware"
         className="hover:border-red-500 hover:text-red-300"
       >

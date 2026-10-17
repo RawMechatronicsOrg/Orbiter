@@ -3,7 +3,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useViewerStore } from './modelStore';
 import type { Commands } from './commands';
-import { cls } from './ui';
+import { cls, elTravel, parseNum, travelText } from './ui';
 import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
@@ -74,26 +74,58 @@ export function LeftBar({ commands }: { commands: Commands }) {
     );
   };
 
-  const planFromForm = useCallback(() => ({
-    mode: 'discrete' as const,
-    discrete: {
-      el_start_deg: parseFloat(discrete.el_start_deg) || 0,
-      el_max_deg: parseFloat(discrete.el_max_deg) || 0,
-      el_steps: parseInt(discrete.el_steps, 10) || 0,
-      az_step_deg: parseFloat(discrete.az_step_deg) || 1,
-      actions: actions.length ? actions : ['photo'],
-    },
-  }), [discrete, actions]);
+  // Ring elevations must lie in the EL travel the server publishes — it
+  // rejects a plan that reaches past it (models.DiscretePlan).
+  const travel = elTravel(model);
+  const fieldError = (k: keyof typeof discrete): string | null => {
+    const v = parseNum(discrete[k]);
+    if (v == null) return 'not a number';
+    if (k === 'el_steps') return Number.isInteger(v) && v >= 0 ? null : 'whole number ≥ 0';
+    if (k === 'az_step_deg') return v > 0 ? null : 'must be > 0';
+    if (travel && (v < travel.min || v > travel.max)) return `outside ${travelText(travel)}`;
+    return null;
+  };
+  const planValid = (Object.keys(discrete) as (keyof typeof discrete)[]).every(
+    (k) => fieldError(k) == null,
+  );
+
+  /** The plan from the form, or null while a field is invalid. */
+  const planFromForm = useCallback(() => {
+    const v = (k: keyof typeof discrete) => parseNum(discrete[k]);
+    const elStart = v('el_start_deg');
+    const elMax = v('el_max_deg');
+    const elSteps = v('el_steps');
+    const azStep = v('az_step_deg');
+    if (!planValid || elStart == null || elMax == null || elSteps == null || azStep == null) {
+      return null;
+    }
+    return {
+      mode: 'discrete' as const,
+      discrete: {
+        el_start_deg: elStart,
+        el_max_deg: elMax,
+        el_steps: elSteps,
+        az_step_deg: azStep,
+        actions: actions.length ? actions : ['photo'],
+      },
+    };
+  }, [discrete, actions, planValid]);
 
   // Auto-apply the plan whenever a field changes (debounced) so the scan
   // preview rebuilds live — no manual "Apply" step. Start scan also carries
   // the plan, so a sweep always runs the latest values regardless of timing.
+  // An invalid form is not sent; the field shows why.
   useEffect(() => {
-    const id = setTimeout(() => commands.setMotionPlan(planFromForm()), 400);
+    const plan = planFromForm();
+    if (!plan) return undefined;
+    const id = setTimeout(() => commands.setMotionPlan(plan), 400);
     return () => clearTimeout(id);
   }, [planFromForm, commands]);
 
-  const onStartScan = () => commands.startScan(planFromForm());
+  const onStartScan = () => {
+    const plan = planFromForm();
+    if (plan) commands.startScan(plan);
+  };
 
   return (
     <div className={`${cls.bar} w-[270px]`}>
@@ -158,17 +190,28 @@ export function LeftBar({ commands }: { commands: Commands }) {
 
         <CardContent>
           {(['el_start_deg', 'el_max_deg', 'el_steps', 'az_step_deg'] as const).map(
-            (k) => (
-              <label key={k} className="flex items-center gap-2">
-                <span className="shrink-0 w-24 text-[13px] text-inkdim">
-                  {FIELD_LABELS[k]}
-                </span>
-                <Input
-                  value={discrete[k]}
-                  onChange={(e) => setDiscrete({ ...discrete, [k]: e.target.value })}
-                />
-              </label>
-            ),
+            (k) => {
+              const err = fieldError(k);
+              return (
+                <div key={k}>
+                  <label className="flex items-center gap-2">
+                    <span className="shrink-0 w-24 text-[13px] text-inkdim">
+                      {FIELD_LABELS[k]}
+                    </span>
+                    <Input
+                      value={discrete[k]}
+                      aria-invalid={err != null}
+                      className={err ? 'border-red-500/70' : undefined}
+                      onChange={(e) => setDiscrete({ ...discrete, [k]: e.target.value })}
+                    />
+                  </label>
+                  {err && <div className="pl-[6.5rem] text-[11px] text-red-300">{err}</div>}
+                </div>
+              );
+            },
+          )}
+          {travel && (
+            <div className="text-[11px] text-inkmute">EL travel {travelText(travel)}</div>
           )}
 
           <div className="mt-1 text-[12px] uppercase tracking-[0.12em] text-inkdim">
@@ -200,8 +243,8 @@ export function LeftBar({ commands }: { commands: Commands }) {
             variant="success"
             className="mt-2 w-full"
             onClick={onStartScan}
-            disabled={!actions.length}
-            title="Apply the plan above and run the sweep"
+            disabled={!actions.length || !planValid}
+            title={planValid ? 'Apply the plan above and run the sweep' : 'Fix the plan fields first'}
           >
             ▶ Start scan
           </Button>
