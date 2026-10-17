@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import bisect
 import logging
+import threading
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -157,6 +158,9 @@ async def _take(
     geom = _geom_params()
     az_act, el_act = model.az, model.el
     pose = camera_pose_at(az_act, el_act, geom)
+    # The orientation the pixels will be stored in: a capture node's follows
+    # its sensor, IP Webcam's the operator's preset (`camera_io.capture_preset`).
+    preset = get_preset(await camera_io.capture_preset())
     raw: bytes | None = None
     if await camera_io.is_capture_node():
         shot_id = shot_id or camera_io.new_shot_id(f"{scan_id}-{index:04d}")
@@ -184,7 +188,6 @@ async def _take(
     # Re-express the quaternion in the stored-pixel frame so the manifest
     # matches the pixels — frustum renderers and the SfM priors exporter
     # both rely on that invariant.
-    preset = get_preset(model.camera_preset)
     if cam_quat is not None:
         cam_quat = stored_pixel_quat(cam_quat, preset.extra_cw_quarter_turns)
 
@@ -200,7 +203,7 @@ async def _take(
         timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         planned_az_deg=planned_az,
         planned_el_deg=planned_el,
-        camera_preset=model.camera_preset,
+        camera_preset=preset.name,
         action=action,
     )
     return _Taken(meta=meta, raw=raw, shot_id=shot_id)
@@ -405,8 +408,15 @@ def _build_manifest() -> Manifest:
     return base.model_copy(update=update)
 
 
+#: One manifest write at a time. Background stores, the sweep and the autosave
+#: each write from their own worker thread; two renames over the same
+#: manifest.json race (on a network share the loser gets "Access is denied").
+_manifest_write = threading.Lock()
+
+
 def _write_active_manifest() -> None:
-    storage.write_manifest(_build_manifest())
+    with _manifest_write:
+        storage.write_manifest(_build_manifest())
 
 
 async def persist_active_manifest_now() -> None:
@@ -612,9 +622,21 @@ def _record_failed_point(
         "timestamp": _now(),
     }
     model.update(scan_failed_points=[*model.scan_failed_points, entry])
-    log.error("scan point %d (az=%.1f el=%.1f) FAILED at %s after retries: %s "
-              "— skipping the point, sweep continues",
-              point.index, point.az_deg, point.el_deg, stage, entry["error"])
+    _ui_log("E", f"scan point {point.index} (az={point.az_deg:.1f} el={point.el_deg:.1f}) "
+                 f"FAILED at {stage} after retries: {entry['error']} "
+                 "— skipping the point, sweep continues")
+
+
+def _ui_log(level: str, msg: str) -> None:
+    """Mirror a scan line to the server log AND the UI LogPanel — a skipped
+    point or an aborted sweep must be seen while it happens. Best-effort: a
+    no-op without a running hub (unit tests). `level` ∈ {'I','W','E'}."""
+    {"W": log.warning, "E": log.error}.get(level, log.info)(msg)
+    try:
+        from ws_hub import hub
+        hub.emit_log({"level": level, "source": "api", "tag": "scan", "msg": msg})
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def _run_discrete(scan_id: str, plan: DiscretePlan) -> None:
@@ -713,8 +735,9 @@ async def _run_motion_plan(scan_id: str, plan: MotionPlan) -> None:
         log.info("scan %s started", scan_id)
         try:
             await _run_discrete(scan_id, plan.discrete)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             log.exception("scan %s failed", scan_id)
+            _ui_log("E", f"scan {scan_id} aborted: {exc}")
         finally:
             model.update(scan_running=False)
             # Belt-and-braces: make sure the torch is off when the loop returns.
@@ -749,6 +772,9 @@ async def start_scan() -> dict[str, Any]:
     if not check:
         raise RuntimeError("discrete plan is empty — check params")
 
+    if camera_io.camera_base() is None:
+        raise RuntimeError("camera_url is not configured — set the camera URL in "
+                           "Machine config → Connections")
     if await camera_io.is_capture_node():
         try:
             await camera_io.require_locked_node()

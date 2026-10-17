@@ -131,6 +131,16 @@ class ModelState:
     phone_lens_pitch_deg: float | None = None
     phone_roll_deg: float | None = None
     phone_sensor_online: bool = False
+    # The phone camera as `camera_io.monitor` last saw it (not persisted):
+    #   * camera_kind — none (no URL) | offline | ipwebcam | capture_node,
+    #   * camera_node — the capture node's state, mode (locked / metering),
+    #     profile and shots on the phone (`camera_io._node_summary`); None
+    #     unless camera_kind is capture_node,
+    #   * camera_quarter_turns — clockwise quarter-turns the capture pipeline
+    #     applies to this camera's frames; the live preview turns the same.
+    camera_kind: str = "none"
+    camera_node: dict[str, Any] | None = None
+    camera_quarter_turns: int = 0
 
     # ── rig build params (persisted) ───────────────────────────────────────
     arm_radius_mm: float = 0.0

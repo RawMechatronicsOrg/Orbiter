@@ -60,7 +60,8 @@ docker run --rm -p 8000:8000 \
 | `GET`  | `/scans/{sid}/photos/{idx}/...` | Thumbnails / full / meta. |
 | `GET`  | `/captures/{cid}/...` | Capture pool (immutable). |
 | `GET`  | `/camera/stream.mjpeg` | Live MJPEG preview. |
-| `GET`  | `/camera/stream/status` | Camera connection status. |
+| `GET`  | `/camera/stream/status` | Camera connection status: URL, frame size, last error. |
+| `POST` | `/camera/node/{lock\|profile\|unlock}` | Capture node only: lock / re-lock / unlock its manual profile. |
 | `WS`   | `/ws/scene` | Scene + model diffs, command channel. |
 
 ## Environment variables
@@ -69,7 +70,7 @@ docker run --rm -p 8000:8000 \
 |----------|---------|---------|
 | `ORBITER_STORAGE_DIR` | `./data` | Root for `scans/` + `captures/`. |
 | `ORBITER_ESP_IP` | `192.168.1.50` | ESP32 firmware host. |
-| `ORBITER_CAMERA_URL` | empty | IP-Webcam HTTP base URL (e.g. `http://phone-ip:8080`). |
+| `ORBITER_CAMERA_URL` | empty | The phone, `http://phone-ip:8080`: a CameraStreamer capture node (recognised automatically) or IP Webcam. |
 | `ORBITER_PORT` | `8000` | Bound port. |
 | `ORBITER_CORS_ORIGINS` | localhost:5173/5174 | Comma-separated allowed origins. |
 | `ORBITER_DEFAULT_CAMERA_PRESET` | `native` | Pixel-rotation preset for new captures. |

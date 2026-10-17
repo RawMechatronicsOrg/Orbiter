@@ -25,9 +25,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 import camera_adapter
+import camera_io
 import discovery
 import scan_task
-import camera_io
 from camera_stream import stream as camera_stream
 from config import settings
 from esp_proxy import esp
@@ -59,10 +59,12 @@ async def lifespan(_app: FastAPI):
     await phone_sensor.start()  # polls camera_url/sensors.json for IMU tilt
     scan_task.start_autosave()
     await camera_stream.start()
+    await camera_io.monitor.start()   # camera kind + capture-node state for the UI
     try:
         yield
     finally:
         await scan_task.stop_autosave()
+        await camera_io.monitor.stop()
         await camera_stream.stop()
         await camera_io.aclose()
         await phone_sensor.stop()

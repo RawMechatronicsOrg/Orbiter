@@ -1,11 +1,11 @@
-"""MJPEG live-frame reader for the IP-Webcam phone camera.
+"""MJPEG live-frame reader for the phone camera.
 
-Companion to `camera_io.py` (the still-image client). `camera_io` GETs
-`/photoaf.jpg` per shot; this module opens a long-lived `/video`
-connection and keeps the LATEST decoded JPEG frame in memory, dropping
-older frames whenever a new one arrives. The still-image path is
-untouched — both can run concurrently against the same phone since the
-Android IP-Webcam app multiplexes them.
+Companion to `camera_io.py` (the still-image client). This module opens a
+long-lived `/video` connection and keeps the LATEST decoded JPEG frame in
+memory, dropping older frames whenever a new one arrives. Both phone apps
+serve it — IP Webcam, and the CameraStreamer capture node (its analysis
+stream, sensor-native, the same field of view as the stills) — next to the
+stills, so preview and shots run concurrently.
 
 Consumer: `routes/stream.py::camera_mjpeg` — proxies the latest frame as
 a re-multiplexed MJPEG stream to the UI hover preview.
@@ -110,6 +110,9 @@ class CameraStreamReader:
         # disconnect — handy for the UI to render a connection light.
         self._connected: bool = False
         self._url_last: str | None = None
+        #: Why the last connection attempt failed (None while connected) —
+        #: the UI shows it under the preview instead of a bare red dot.
+        self._last_error: str | None = None
         #: (width, height) of the most recent frame — lets the UI size the live
         #: camera frustum to how frames actually arrive (portrait vs landscape).
         self._frame_wh: tuple[int, int] | None = None
@@ -142,6 +145,7 @@ class CameraStreamReader:
             "have_frame": self._latest is not None,
             "url": self._url_last,
             "frame_wh": list(self._frame_wh) if self._frame_wh else None,
+            "last_error": self._last_error,
         }
 
     def frame_aspect(self) -> float | None:
@@ -185,6 +189,7 @@ class CameraStreamReader:
                 # No camera configured — sleep and re-check periodically;
                 # operator may set ORBITER_CAMERA_URL at runtime via .env.
                 self._connected = False
+                self._last_error = None
                 await asyncio.sleep(_RETRY_MAX_S)
                 continue
             try:
@@ -201,10 +206,12 @@ class CameraStreamReader:
                                 url, response.status_code,
                             )
                             self._connected = False
+                            self._last_error = f"HTTP {response.status_code}"
                             await asyncio.sleep(backoff)
                             backoff = min(backoff * 2.0, _RETRY_MAX_S)
                             continue
                         self._connected = True
+                        self._last_error = None
                         backoff = _RETRY_INITIAL_S
                         log.info("camera_stream: connected to %s", url)
                         await self._consume(response)
@@ -213,6 +220,7 @@ class CameraStreamReader:
                 raise
             except Exception as exc:  # noqa: BLE001
                 self._connected = False
+                self._last_error = str(exc) or type(exc).__name__
                 log.warning("camera_stream: %s — %s", url, exc)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2.0, _RETRY_MAX_S)

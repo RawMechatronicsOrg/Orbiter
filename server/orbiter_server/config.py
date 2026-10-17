@@ -18,9 +18,10 @@ class Settings(BaseSettings):
     # Live state is streamed from the firmware's ws://<esp_ip>/ws/log.
     esp_ip: str = "192.168.1.50"
 
-    # Camera still-image URL (e.g. http://<phone-ip>:8080/photoaf.jpg). The
-    # server-side scan loop GETs this for each capture. Empty → a placeholder
-    # image is stored instead (pose data is still recorded).
+    # The phone's base URL (e.g. http://<phone-ip>:8080; any path is
+    # ignored) — the CameraStreamer capture node or IP Webcam, see camera_io.
+    # The env default only; the live value is the UI-editable model.camera_url.
+    # Empty → captures fail (no stand-in image) and a scan refuses to start.
     camera_url: str = ""
 
     # AZ-encoder harmonic correction — calibration "stage B" (1st+2nd harmonic

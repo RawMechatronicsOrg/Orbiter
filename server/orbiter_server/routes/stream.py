@@ -1,21 +1,24 @@
-"""HTTP endpoints for the live camera stream.
+"""HTTP endpoints for the phone camera.
 
   * `GET /camera/stream.mjpeg` — re-multiplexes the latest JPEG from
     `camera_stream` as a long-lived multipart/x-mixed-replace stream.
     Drop-in for an `<img src=...>` on the frontend; no JS decoder needed.
-  * `GET /camera/stream/status` — connectivity snapshot.
-
-Everything is read-only against the model.
+  * `GET /camera/stream/status` — connectivity snapshot (URL, last error).
+  * `POST /camera/node/{lock|profile|unlock}` — a profile operation on the
+    CameraStreamer capture node (`camera_io.node_control`); the body is passed
+    through. Its state reaches the UI as `model.camera_node`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Body, HTTPException
 from fastapi.responses import StreamingResponse
 
+import camera_io
 from camera_stream import stream
 
 log = logging.getLogger("orbiter.stream")
@@ -73,3 +76,16 @@ def camera_status() -> dict:
     """Upstream connection + frame counter. Lets the UI show a green/red
     light beside the live preview."""
     return stream.status()
+
+
+@router.post("/camera/node/{op}")
+async def camera_node_op(op: str, body: dict[str, Any] = Body(default_factory=dict)) -> dict:
+    """Lock (meter once and freeze), re-apply / patch the profile, or unlock
+    the capture node. Returns the phone's apply result; 502 with the phone's
+    reason when it refuses or does not answer."""
+    if op not in camera_io.NODE_OPS:
+        raise HTTPException(404, f"unknown operation {op!r}")
+    try:
+        return await camera_io.node_control(op, body)
+    except camera_io.CameraError as exc:
+        raise HTTPException(502, str(exc)) from exc
