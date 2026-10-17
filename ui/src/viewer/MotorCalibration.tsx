@@ -91,6 +91,8 @@ export function MotorCalibration({ commands }: { commands: Commands }) {
       return;
     }
     commands.motorCalibrate(axis, axis === 'el' ? armRemoved : false);
+    // One confirmation per run: the arm goes back on afterwards.
+    if (axis === 'el') setArmRemoved(false);
     window.setTimeout(read, 600);
   };
 

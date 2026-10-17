@@ -20,7 +20,7 @@ import scan_task
 from drive import AXES, clamp_hz
 from esp_proxy import esp
 from geom.angles import EL_MAX, EL_MIN, clamp_el, is_el_valid
-from orbiter_model import model
+from orbiter_model import model, motor_signature
 
 log = logging.getLogger("orbiter.cmd")
 
@@ -409,6 +409,10 @@ async def _cmd_calibrate_geometry(args: dict[str, Any]) -> dict[str, Any]:
     do_apply = bool(args.get("apply", True))
     preset = str(args.get("preset", "fast"))
     poses = calibration.poses_for_preset(preset)
+    # The angles the solve uses are relative to these — record them as the
+    # sweep starts (re-zeroing is refused while it runs).
+    zeros = dict(model.encoder_zero) or None
+    motors = motor_signature(model.motor_cal)
     model.update(calibration_running=True)
     try:
         result = await calibration.run_calibration(poses=poses)
@@ -418,6 +422,7 @@ async def _cmd_calibrate_geometry(args: dict[str, Any]) -> dict[str, Any]:
         model.update(calibration_running=False)
     if do_apply:
         calibration.apply_result(result)
+        model.update(calib_encoder_zero=zeros, calib_motor_cal=motors)
     out = calibration.result_dict(result)
     out["applied"] = do_apply
     out["preset"] = preset
@@ -578,6 +583,9 @@ async def _cmd_calibrate_encoder(args: dict[str, Any]) -> dict[str, Any]:
         raise CommandError(f"calibrate_encoder: axis must be one of {_ZERO_AXES}")
     if mode not in _ZERO_MODES:
         raise CommandError(f"calibrate_encoder: mode must be one of {_ZERO_MODES}")
+    busy = model.busy_reason()
+    if busy:
+        raise CommandError(f"calibrate_encoder: {busy}")
     return await esp.calibrate(
         axis=axis,
         mode=mode,
@@ -671,6 +679,9 @@ async def _cmd_motor_compensation(args: dict[str, Any]) -> dict[str, Any]:
         raise CommandError("motor_compensation: axis must be 'az' or 'el'")
     if not isinstance(args.get("enabled"), bool):
         raise CommandError("motor_compensation: enabled must be true or false")
+    busy = model.busy_reason()
+    if busy:
+        raise CommandError(f"motor_compensation: {busy}")
     return await esp.motor_compensation(axis, args["enabled"])
 
 

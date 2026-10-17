@@ -119,6 +119,8 @@ def fw(tmp_path, monkeypatch):
     monkeypatch.setattr(esp, "base_url", "http://esp.test")
     monkeypatch.setattr(esp, "_last_el", None)
     monkeypatch.setattr(esp, "_el_guard_quiet_until", 0.0)
+    monkeypatch.setattr(esp, "_el_spin_margin_deg", 3.0)
+    monkeypatch.setattr(esp, "_state_seen", False)
     monkeypatch.setattr(esp, "_stop_client", lambda: httpx.AsyncClient(
         transport=httpx.MockTransport(fake), base_url="http://esp.test"))
     yield fake
@@ -238,6 +240,20 @@ def test_an_el_spin_without_readings_is_stopped(fw) -> None:
     assert fw.posted("/spin/stop") == [{"axis": "el"}]
 
 
+def test_a_deliberate_stop_is_not_resent_by_the_watchdog(fw) -> None:
+    model.update(encoder_zero_initialized=True, el=10.0)
+
+    async def spin_and_stop() -> None:
+        await commands.dispatch("spin", {"axis": "el", "dir": "cw", "step_hz": 300})
+        model.update(spinning_el=True)
+        await commands.dispatch("spin_stop", {"axis": "el"})
+        model.update(spinning_el=False)
+        await asyncio.sleep(0.9)   # past the frozen-reading limit
+
+    asyncio.run(spin_and_stop())
+    assert fw.posted("/spin/stop") == [{"axis": "el"}]
+
+
 def test_motor_report_drives_the_axes(client) -> None:
     r = client.get("/firmware/motor")
     assert r.status_code == 200
@@ -264,7 +280,14 @@ def test_moves_wait_for_the_motor_calibration(fw) -> None:
     async def move(**kw: float) -> None:
         await esp.move(**kw)
 
-    asyncio.run(move(azimuth_deg=10.0))  # firmware reports no motor_cal: no check
+    # Nothing known yet and /state unreachable: no move on a guess.
+    fw.down = True
+    with pytest.raises(EspError, match="state unknown"):
+        asyncio.run(move(azimuth_deg=5.0))
+    fw.down = False
+    # The first move reads /state first (both axes calibrated there).
+    asyncio.run(move(azimuth_deg=10.0))
+    assert fw.requests[0][:2] == ("GET", "/state")
     esp.apply_motor_calibration(MOTOR)   # AZ calibrated, EL not
     asyncio.run(move(azimuth_deg=20.0))
     with pytest.raises(EspError, match="EL not motor-calibrated"):
@@ -279,8 +302,16 @@ def test_motor_calibration_commands(fw) -> None:
     with pytest.raises(commands.CommandError, match="remove the arm"):
         asyncio.run(commands.dispatch("motor_calibrate", {"axis": "el"}))
     asyncio.run(commands.dispatch("motor_calibrate", {"axis": "el", "arm_removed": True}))
-    asyncio.run(commands.dispatch("motor_calibrate", {"axis": "az"}))
+    # Accepted means running, before any /state read says so.
+    assert model.motor_cal["active"] is True
+    for name, args in (("motor_calibrate", {"axis": "az"}),
+                       ("motor_compensation", {"axis": "az", "enabled": False})):
+        with pytest.raises(commands.CommandError, match="motor calibration is running"):
+            asyncio.run(commands.dispatch(name, args))
     asyncio.run(commands.dispatch("motor_calibrate_cancel", {}))
+    esp.apply_motor_calibration(MOTOR)   # the run has ended
+    asyncio.run(commands.dispatch("motor_calibrate", {"axis": "az"}))
+    esp.apply_motor_calibration(MOTOR)
     with pytest.raises(commands.CommandError):
         asyncio.run(commands.dispatch("motor_compensation", {"axis": "az", "enabled": "yes"}))
     asyncio.run(commands.dispatch("motor_compensation", {"axis": "az", "enabled": False}))

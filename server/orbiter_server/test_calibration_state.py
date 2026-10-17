@@ -15,7 +15,7 @@ import commands
 import scan_task
 from config import settings
 from geom.rig_model import rig_identity
-from orbiter_model import CALIBRATION_FIELDS, ModelState, model
+from orbiter_model import CALIBRATION_FIELDS, ModelState, model, motor_signature
 
 
 @pytest.fixture(autouse=True)
@@ -93,6 +93,26 @@ def test_a_re_zeroed_encoder_makes_the_calibration_stale() -> None:
     assert "EL encoder zero changed" in state.calibration_stale_reason
     state.update(encoder_zero={"az_zero_raw_deg": 0.0, "el_zero_raw_deg": 126.2})
     assert state.calibration_status == "current"
+
+
+def test_a_changed_motor_calibration_makes_the_calibration_stale() -> None:
+    def mc(spd: float, comp: bool | None) -> dict:
+        axis = {"valid": True, "steps_per_deg": spd, "max_speed_dps": 40.0,
+                "dir_sign": 1, "compensation": comp}
+        return {"active": False, "az": dict(axis), "el": dict(axis)}
+
+    state = ModelState(rig_id="aaaa")
+    state.update(motor_cal=mc(61.08, True))
+    _calibrated(state, "aaaa")
+    state.update(calib_motor_cal=motor_signature(state.motor_cal))
+    assert state.calibration_status == "current"
+    state.update(motor_cal=mc(61.08, None))     # /state carries no compensation
+    assert state.calibration_status == "current"
+    state.update(motor_cal=mc(61.08, False))    # profile switched off
+    assert state.calibration_status == "stale"
+    assert "motor calibration changed" in state.calibration_stale_reason
+    state.update(motor_cal=mc(61.2, True))      # a new motor calibration
+    assert state.calibration_status == "stale"
 
 
 def test_busy_reason_covers_scan_calibration_and_motor_calibration() -> None:

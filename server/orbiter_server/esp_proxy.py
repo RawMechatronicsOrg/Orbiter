@@ -104,6 +104,9 @@ class EspProxy:
         #: one-shot guard so the "degraded to REST poll" notice fires once.
         self._degraded_logged = False
         self._hydrate_task: asyncio.Task[None] | None = None
+        #: True once a /state answer from the current device was applied —
+        #: until then `model.motor_cal` is unknown, not "not reported".
+        self._state_seen = False
         #: EL spin guard state (see `_guard_el_spin`): last reading, when it
         #: last changed, the margin for the running spin, the watchdog and
         #: the pending stop.
@@ -161,6 +164,7 @@ class EspProxy:
 
     async def _retarget(self, new_ip: str) -> None:
         self._set_endpoints(new_ip)
+        self._state_seen = False
         old_client = self._client
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
@@ -313,10 +317,13 @@ class EspProxy:
         """One `GET /state` each time the stream (re)connects. The encoder
         zeros are not in the pose frames, and the /state poll stays dormant
         while the stream is fresh — without this the UI would never see them."""
-        try:
-            await self.fetch_state()
-        except Exception as exc:  # noqa: BLE001 — the poll / next connect retries
-            log.debug("ESP /state hydrate failed: %s", exc)
+        for attempt in range(3):
+            try:
+                await self.fetch_state()
+                return
+            except Exception as exc:  # noqa: BLE001 — retried, then the next connect
+                log.debug("ESP /state hydrate failed (%d/3): %s", attempt + 1, exc)
+                await asyncio.sleep(1.0)
 
     async def _poll_loop(self) -> None:
         """REST `/state` fallback. Dormant while the /ws/log `pose` stream is
@@ -389,6 +396,7 @@ class EspProxy:
         if isinstance(motor_cal, dict):
             patch.update(self._motor_cal_patch(
                 bool(motor_cal.get("active")), motor_cal.get("az"), motor_cal.get("el")))
+        self._state_seen = True
         runner = data.get("runner")
         if isinstance(runner, dict) and runner.get("id"):
             patch["runner"] = {
@@ -400,16 +408,21 @@ class EspProxy:
         if "el" in patch:
             self._guard_el_spin(patch["el"])
 
-    @staticmethod
-    def _motor_cal_patch(active: bool, az: Any, el: Any) -> dict[str, Any]:
+    def _motor_cal_patch(self, active: bool, az: Any, el: Any) -> dict[str, Any]:
         """`motor_cal` + the `axes` derived from it, from either /state or
-        GET /motor/calibration (which carries more per axis)."""
-        def summary(axis: Any) -> dict[str, Any]:
-            axis = axis if isinstance(axis, dict) else {}
-            return {key: axis.get(key) for key in
-                    ("valid", "steps_per_deg", "max_speed_dps", "dir_sign")}
+        GET /motor/calibration (which carries more per axis). `compensation`
+        is only in the latter, so the last known value is kept."""
+        known = self.model.motor_cal or {}
 
-        motor_cal = {"active": active, "az": summary(az), "el": summary(el)}
+        def summary(name: str, axis: Any) -> dict[str, Any]:
+            axis = axis if isinstance(axis, dict) else {}
+            out = {key: axis.get(key) for key in
+                   ("valid", "steps_per_deg", "max_speed_dps", "dir_sign")}
+            out["compensation"] = axis.get(
+                "compensation", (known.get(name) or {}).get("compensation"))
+            return out
+
+        motor_cal = {"active": active, "az": summary("az", az), "el": summary("el", el)}
         return {"motor_cal": motor_cal, "axes": axes_info(motor_cal)}
 
     def apply_motor_calibration(self, report: dict[str, Any]) -> None:
@@ -425,7 +438,7 @@ class EspProxy:
         until it times out (on EL, toward the cross rail)."""
         mc = self.model.motor_cal
         if not mc:
-            return  # firmware without motor calibration: nothing to check
+            return  # /state was read: a firmware without motor calibration
         if mc.get("active"):
             raise EspError("a motor calibration is running — wait for it or cancel it")
         missing = [a.upper() for a in axes if not axis_calibrated(mc, a)]
@@ -439,10 +452,22 @@ class EspProxy:
     def _guard_el_spin(self, el: float) -> None:
         """Stop an EL spin that is heading out of the travel. Direction comes
         from the reading trend — which way cw/ccw turns the arm is wiring."""
+        now = time.monotonic()
         prev, self._last_el = self._last_el, el
         if prev is None or el != prev:
-            self._el_changed_at = time.monotonic()
-        if not self.model.spinning_el or prev is None:
+            self._el_changed_at = now
+        if not self.model.spinning_el:
+            return
+        if (self._el_watchdog is None or self._el_watchdog.done()) \
+                and now >= self._el_guard_quiet_until:
+            # A spin this proxy did not start, or whose /spin answer was lost:
+            # its speed is unknown, so assume the fastest the band allows.
+            el_axis = self.model.axes["el"]
+            fastest = el_axis["hz_max"] / el_axis["steps_per_deg"]
+            self._el_spin_margin_deg = max(
+                self._el_spin_margin_deg, _EL_SPIN_MARGIN_S * fastest)
+            self._el_watchdog = asyncio.get_running_loop().create_task(self._watch_el_spin())
+        if prev is None:
             return
         margin = self._el_spin_margin_deg
         if el < prev and el <= EL_MIN + margin:
@@ -485,13 +510,15 @@ class EspProxy:
     async def _watch_el_spin(self) -> None:
         """While EL spins, stop it when its reading freezes — the limit check
         runs on readings, so without them the arm would spin on blind."""
-        started = time.monotonic()
-        self._el_changed_at = started
+        self._el_changed_at = time.monotonic()
+        seen = False
         while True:
             await asyncio.sleep(0.1)
             now = time.monotonic()
-            if now - started > 1.0 and not self.model.spinning_el:
-                return  # stopped (and the flag has caught up)
+            if self.model.spinning_el:
+                seen = True
+            elif seen:
+                return  # stopped; spin_stop also cancels this task
             if now - self._el_changed_at > _EL_SPIN_FROZEN_S:
                 self._stop_el_spin_now(
                     f"— no new EL reading for {now - self._el_changed_at:.1f} s")
@@ -679,6 +706,15 @@ class EspProxy:
         timeout_ms: int = 30_000,
     ) -> dict[str, Any]:
         """Submit a /move (202 + task_id). Does not wait — see `move_and_await`."""
+        if not self._state_seen:
+            # Whether the axes are motor-calibrated is unknown until /state
+            # was read — never assume they are.
+            try:
+                await self.fetch_state()
+            except Exception as exc:  # noqa: BLE001
+                raise EspError(
+                    f"firmware state unknown (GET /state failed: {exc}) — not moving"
+                ) from exc
         self._check_motor_cal(
             [a for a, v in (("az", azimuth_deg), ("el", elevation_deg)) if v is not None])
         body: dict[str, Any] = {"timeout_ms": timeout_ms}
@@ -769,24 +805,33 @@ class EspProxy:
         """Continuous rotation of one axis at a driver step rate (open loop).
         An EL spin is stopped short of the travel by `_guard_el_spin` and when
         its reading freezes by `_watch_el_spin`."""
-        result = await self._post("/spin", {"axis": axis, "dir": direction, "step_hz": step_hz})
         if axis == "el":
+            # Before the request: a lost answer must not leave the margin of
+            # an earlier, slower spin in force.
             steps_per_deg = float(self.model.axes["el"]["steps_per_deg"])
             self._el_spin_margin_deg = max(
                 _EL_SPIN_MARGIN_DEG, _EL_SPIN_MARGIN_S * step_hz / steps_per_deg)
             self._el_guard_quiet_until = 0.0
-            if self._el_watchdog is None or self._el_watchdog.done():
-                self._el_watchdog = asyncio.create_task(self._watch_el_spin())
+        result = await self._post("/spin", {"axis": axis, "dir": direction, "step_hz": step_hz})
+        if axis == "el" and (self._el_watchdog is None or self._el_watchdog.done()):
+            self._el_watchdog = asyncio.create_task(self._watch_el_spin())
         return result
 
     async def spin_stop(self, axis: str = "both") -> dict[str, Any]:
+        if axis in ("el", "both") and self._el_watchdog is not None:
+            self._el_watchdog.cancel()  # a deliberate stop is not a frozen reading
         return await self._post("/spin/stop", {"axis": axis})
 
     async def motor_calibrate(self, axis: str, arm_removed: bool) -> dict[str, Any]:
         """Start the firmware's motor self-calibration of one axis (202 +
         task_id; ~2-4 min, progress on GET /motor/calibration). Every phase
         turns the axis full circle."""
-        return await self._post("/motor/calibrate", {"axis": axis, "arm_removed": arm_removed})
+        result = await self._post("/motor/calibrate", {"axis": axis, "arm_removed": arm_removed})
+        # Busy from now on, not only once the next /state read says so.
+        mc = dict(self.model.motor_cal or {"az": {}, "el": {}})
+        mc["active"] = True
+        self.model.update(motor_cal=mc, axes=axes_info(mc))
+        return result
 
     async def motor_calibrate_cancel(self) -> dict[str, Any]:
         return await self._post("/motor/calibrate/cancel", {})

@@ -42,7 +42,7 @@ PERSISTED_FIELDS: frozenset[str] = frozenset({
     # mechanics (rig GLB) it was solved on, `calib_encoder_zero` with which
     # encoder zeros.
     "calibrated", "calib_extrinsic", "calib_board_world", "calib_rig_id",
-    "calib_encoder_zero",
+    "calib_encoder_zero", "calib_motor_cal",
     # Whether the EL encoder zero has been set (see encoder_init.py).
     "encoder_zero_initialized",
     # EL-axis correction (tilt + transverse offset) from the hand-eye refine.
@@ -65,7 +65,7 @@ PERSISTED_FIELDS: frozenset[str] = frozenset({
 # `reset_calibration` puts back to the defaults. `arm_radius_mm = 0` means
 # "use the CAD arm" (scene_graph.effective_arm_radius).
 CALIBRATION_FIELDS: tuple[str, ...] = (
-    "calibrated", "calib_rig_id", "calib_encoder_zero",
+    "calibrated", "calib_rig_id", "calib_encoder_zero", "calib_motor_cal",
     "calib_extrinsic", "calib_board_world",
     "rocker_correction", "az_encoder_correction", "el_encoder_scale",
     "calib_test_msg",
@@ -77,7 +77,23 @@ CALIBRATION_FIELDS: tuple[str, ...] = (
 # Inputs of the derived fields (`ModelState._derived`).
 _DERIVED_FROM: frozenset[str] = frozenset({
     "calibrated", "calib_rig_id", "rig_id", "encoder_zero", "calib_encoder_zero",
+    "motor_cal", "calib_motor_cal",
 })
+
+
+def motor_signature(motor_cal: dict[str, Any] | None) -> dict[str, Any] | None:
+    """What of the firmware's motor calibration shapes the angles it reports
+    (it runs every reading through it): per axis the steps/° of the result
+    and whether its deviation profile is applied. None when unknown."""
+    if not motor_cal:
+        return None
+    return {
+        axis: {
+            "steps_per_deg": round(float((motor_cal.get(axis) or {}).get("steps_per_deg") or 0.0), 3),
+            "compensation": (motor_cal.get(axis) or {}).get("compensation"),
+        }
+        for axis in ("az", "el")
+    }
 
 
 def _default_motion_plan() -> dict[str, Any]:
@@ -217,6 +233,10 @@ class ModelState:
     # The firmware encoder zeros (`encoder_zero`) the calibration was solved
     # with. Its angles are relative to them, so a re-zero invalidates it.
     calib_encoder_zero: dict[str, float] | None = None
+    # `motor_signature` of the firmware motor calibration during the sweep:
+    # a new motor calibration or a toggled deviation profile shifts every
+    # angle the firmware reports, so it invalidates the solve too.
+    calib_motor_cal: dict[str, Any] | None = None
     # Derived (see `_derived`): `none` (never calibrated), `current`, or
     # `stale` with the reason — solved on other mechanics, before the stamps
     # existed, or with other encoder zeros. Not persisted.
@@ -394,6 +414,18 @@ class ModelState:
         ]
         if moved:
             return "stale", f"the {' and '.join(moved)} encoder zero changed since it was solved"
+        then_mc, now_mc = self.calib_motor_cal, motor_signature(self.motor_cal)
+        if then_mc and now_mc:
+            changed = [
+                axis.upper() for axis in ("az", "el")
+                if abs(then_mc[axis]["steps_per_deg"] - now_mc[axis]["steps_per_deg"]) > 1e-3
+                or (then_mc[axis]["compensation"] is not None
+                    and now_mc[axis]["compensation"] is not None
+                    and then_mc[axis]["compensation"] != now_mc[axis]["compensation"])
+            ]
+            if changed:
+                return "stale", (f"the {' and '.join(changed)} motor calibration changed "
+                                 "since it was solved")
         return "current", ""
 
     def _derived(self, changed: set[str]) -> dict[str, Any]:
