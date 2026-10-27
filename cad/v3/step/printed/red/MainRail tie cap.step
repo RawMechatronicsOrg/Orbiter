@@ -10,7 +10,7 @@ FILE_DESCRIPTION(
 
 FILE_NAME(
 /* name */ 'MainRail tie cap.step',
-/* time_stamp */ '2026-10-27T04:43:52+01:00',
+/* time_stamp */ '2026-10-27T11:38:19+01:00',
 /* author */ (''),
 /* organization */ (''),
 /* preprocessor_version */ 'ST-DEVELOPER v20.2',
@@ -2251,7 +2251,7 @@ SOLID_ANGLE_UNIT()
 #2187=PRODUCT_DEFINITION_SHAPE('',$,#2190);
 #2188=SHAPE_REPRESENTATION('',(#1325),#2180);
 #2189=PRODUCT_DEFINITION_CONTEXT('part definition',#2194,'design');
-#2190=PRODUCT_DEFINITION('2026-10-27-04-43-52-288','MainRail tie cap',#2191,
+#2190=PRODUCT_DEFINITION('2026-10-27-11-38-18-971','MainRail tie cap',#2191,
 #2189);
 #2191=PRODUCT_DEFINITION_FORMATION('',$,#2196);
 #2192=PRODUCT_RELATED_PRODUCT_CATEGORY('MainRail tie cap',
@@ -2261,7 +2261,7 @@ SOLID_ANGLE_UNIT()
 #2194=APPLICATION_CONTEXT(
 'Core Data for Automotive Mechanical Design Process');
 #2195=PRODUCT_CONTEXT('part definition',#2194,'mechanical');
-#2196=PRODUCT('2026-10-27-04-43-52-288','MainRail tie cap',$,(#2195));
+#2196=PRODUCT('2026-10-27-11-38-18-971','MainRail tie cap',$,(#2195));
 #2197=PRESENTATION_STYLE_ASSIGNMENT((#2199));
 #2198=PRESENTATION_STYLE_ASSIGNMENT((#2200));
 #2199=SURFACE_STYLE_USAGE(.BOTH.,#2201);

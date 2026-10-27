@@ -10,7 +10,7 @@ FILE_DESCRIPTION(
 
 FILE_NAME(
 /* name */ 'ElevationShaft.step',
-/* time_stamp */ '2026-10-27T04:43:50+01:00',
+/* time_stamp */ '2026-10-27T11:38:16+01:00',
 /* author */ (''),
 /* organization */ (''),
 /* preprocessor_version */ 'ST-DEVELOPER v20.2',
@@ -9988,7 +9988,7 @@ SOLID_ANGLE_UNIT()
 #8871=PRODUCT_DEFINITION_SHAPE('',$,#8874);
 #8872=SHAPE_REPRESENTATION('',(#3468),#8864);
 #8873=PRODUCT_DEFINITION_CONTEXT('part definition',#8878,'design');
-#8874=PRODUCT_DEFINITION('2026-10-27-04-43-50-373','ElevationShaft',#8875,
+#8874=PRODUCT_DEFINITION('2026-10-27-11-38-16-754','ElevationShaft',#8875,
 #8873);
 #8875=PRODUCT_DEFINITION_FORMATION('',$,#8880);
 #8876=PRODUCT_RELATED_PRODUCT_CATEGORY('ElevationShaft',
@@ -9998,7 +9998,7 @@ SOLID_ANGLE_UNIT()
 #8878=APPLICATION_CONTEXT(
 'Core Data for Automotive Mechanical Design Process');
 #8879=PRODUCT_CONTEXT('part definition',#8878,'mechanical');
-#8880=PRODUCT('2026-10-27-04-43-50-373','ElevationShaft',$,(#8879));
+#8880=PRODUCT('2026-10-27-11-38-16-754','ElevationShaft',$,(#8879));
 #8881=PRESENTATION_STYLE_ASSIGNMENT((#8883));
 #8882=PRESENTATION_STYLE_ASSIGNMENT((#8884));
 #8883=SURFACE_STYLE_USAGE(.BOTH.,#8885);

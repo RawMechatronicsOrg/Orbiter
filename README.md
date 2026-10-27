@@ -16,7 +16,7 @@ authoritative when you need depth.
 **New in v0.5** — the v3 mechanics, alpha
 
 - **`cad/v3/` — the third-generation mechanics** ([`cad/v3/README.md`](cad/v3/README.md)),
-  exported from the Fusion model, version 247. The v2 drives and frame stay, with
+  exported from the Fusion model, version 250. The v2 drives and frame stay, with
   the cross rail now at 90° to the main rail (a T-shaped base on three feet).
   New on the arm: a **gliding tube** that telescopes out of the orbit arm, a
   160 mm **swing arm** on two hinges, and at its end the **camera head** — a
@@ -27,7 +27,7 @@ authoritative when you need depth.
 - **A FreeCAD assembly with joints**: `cad/v3/freecad/Orbiter_assembly.FCStd`
   opens in the Assembly workbench of FreeCAD 1.0 with the frame grounded,
   revolute joints on both drive axes and on the three hinges, and a slider for
-  the gliding tube. Next to it: STL and STEP of the 43 printed parts, the bought
+  the gliding tube. Next to it: STL and STEP of the 47 printed parts, the bought
   parts as STL, the GLB, photoreal renders, and a print direction for every
   printed part.
 - **Status: alpha.** This is a more or less battle-ready release, the first one
@@ -376,7 +376,7 @@ The firmware does not use these numbers — it closes the loop on the encoders �
 
 ## 8. Printable parts & print profile
 
-The v3 rig has 43 printed files, 57 pieces (three of them are tools), about 1.15 kg of PLA at 100 % infill. The list with colour, quantity, thread, mass and role of each part is in [`cad/v3/README.md`](cad/v3/README.md#printed-parts); STL in `cad/v3/stl/printed/<colour>/`, STEP in `cad/v3/step/printed/<colour>/`, FreeCAD files in `cad/v3/freecad/`. [`cad/v3/print_plan.json`](cad/v3/print_plan.json) has a print direction for every part, picked by slicing the candidates; infill and supports per part are not written down yet. The v2 rig (25 files, 32 pieces, about 830 g) is in [`cad/v2/`](cad/v2/README.md#printed-parts).
+The v3 rig has 47 printed files, 61 pieces (three of them are tools), about 1.17 kg of PLA at 100 % infill. The list with colour, quantity, thread, mass and role of each part is in [`cad/v3/README.md`](cad/v3/README.md#printed-parts); STL in `cad/v3/stl/printed/<colour>/`, STEP in `cad/v3/step/printed/<colour>/`, FreeCAD files in `cad/v3/freecad/`. [`cad/v3/print_plan.json`](cad/v3/print_plan.json) has a print direction for every part, picked by slicing the candidates; infill and supports per part are not written down yet. The v2 rig (25 files, 32 pieces, about 830 g) is in [`cad/v2/`](cad/v2/README.md#printed-parts).
 
 The assembly the software reads is still the v2 one, [`cad/v2/assembly/Orbiter.glb`](cad/v2/assembly) (v3 has its own, [`cad/v3/assembly/Orbiter.glb`](cad/v3/assembly), for viewing until the software follows the v3 arm), exported from the Fusion model's Blender scene by [`cad/v2/export_glb.py`](cad/v2/export_glb.py). For structural changes (arm length, pulley ratio) change the CAD and export the GLB again — the server takes the axes, the platform and the arm from it.
 

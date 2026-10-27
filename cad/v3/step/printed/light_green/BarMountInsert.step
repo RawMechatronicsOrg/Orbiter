@@ -15,7 +15,7 @@ f the part.'),
 
 FILE_NAME(
 /* name */ 'BarMountInsert.step',
-/* time_stamp */ '2026-10-27T04:43:44+01:00',
+/* time_stamp */ '2026-10-27T11:38:11+01:00',
 /* author */ (''),
 /* organization */ (''),
 /* preprocessor_version */ 'ST-DEVELOPER v20.2',
@@ -7757,7 +7757,7 @@ SOLID_ANGLE_UNIT()
 #6892=PRODUCT_DEFINITION_SHAPE('',$,#6895);
 #6893=SHAPE_REPRESENTATION('',(#1887),#6885);
 #6894=PRODUCT_DEFINITION_CONTEXT('part definition',#6899,'design');
-#6895=PRODUCT_DEFINITION('2026-10-27-04-43-44-685','BarMountInsert',#6896,
+#6895=PRODUCT_DEFINITION('2026-10-27-11-38-10-763','BarMountInsert',#6896,
 #6894);
 #6896=PRODUCT_DEFINITION_FORMATION('',$,#6901);
 #6897=PRODUCT_RELATED_PRODUCT_CATEGORY('BarMountInsert',
@@ -7767,7 +7767,7 @@ SOLID_ANGLE_UNIT()
 #6899=APPLICATION_CONTEXT(
 'Core Data for Automotive Mechanical Design Process');
 #6900=PRODUCT_CONTEXT('part definition',#6899,'mechanical');
-#6901=PRODUCT('2026-10-27-04-43-44-685','BarMountInsert',
+#6901=PRODUCT('2026-10-27-11-38-10-763','BarMountInsert',
 'Splined insert for the elevation shaft bore. Straight-sided spline 12
  x 28.5 x 31.5, tooth width 3.5, mating the 12 x 29 x 32 hub in the sh
 aft with 0.25 radial / 0.20 per flank clearance. Local origin on the o

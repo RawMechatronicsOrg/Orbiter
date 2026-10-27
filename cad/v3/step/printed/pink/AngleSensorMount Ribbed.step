@@ -10,7 +10,7 @@ FILE_DESCRIPTION(
 
 FILE_NAME(
 /* name */ 'AngleSensorMount Ribbed.step',
-/* time_stamp */ '2026-10-27T04:43:44+01:00',
+/* time_stamp */ '2026-10-27T11:38:10+01:00',
 /* author */ (''),
 /* organization */ (''),
 /* preprocessor_version */ 'ST-DEVELOPER v20.2',
@@ -4267,7 +4267,7 @@ SOLID_ANGLE_UNIT()
 #4079=PRODUCT_DEFINITION_SHAPE('',$,#4082);
 #4080=SHAPE_REPRESENTATION('',(#2426),#4072);
 #4081=PRODUCT_DEFINITION_CONTEXT('part definition',#4086,'design');
-#4082=PRODUCT_DEFINITION('2026-10-27-04-43-44-352',
+#4082=PRODUCT_DEFINITION('2026-10-27-11-38-10-445',
 'AngleSensorMount Ribbed',#4083,#4081);
 #4083=PRODUCT_DEFINITION_FORMATION('',$,#4088);
 #4084=PRODUCT_RELATED_PRODUCT_CATEGORY('AngleSensorMount Ribbed',
@@ -4277,7 +4277,7 @@ SOLID_ANGLE_UNIT()
 #4086=APPLICATION_CONTEXT(
 'Core Data for Automotive Mechanical Design Process');
 #4087=PRODUCT_CONTEXT('part definition',#4086,'mechanical');
-#4088=PRODUCT('2026-10-27-04-43-44-352','AngleSensorMount Ribbed',$,(#4087));
+#4088=PRODUCT('2026-10-27-11-38-10-445','AngleSensorMount Ribbed',$,(#4087));
 #4089=PRESENTATION_STYLE_ASSIGNMENT((#4091));
 #4090=PRESENTATION_STYLE_ASSIGNMENT((#4092));
 #4091=SURFACE_STYLE_USAGE(.BOTH.,#4093);

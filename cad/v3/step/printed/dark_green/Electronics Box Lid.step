@@ -10,7 +10,7 @@ FILE_DESCRIPTION(
 
 FILE_NAME(
 /* name */ 'Electronics Box Lid.step',
-/* time_stamp */ '2026-10-27T04:43:50+01:00',
+/* time_stamp */ '2026-10-27T11:38:16+01:00',
 /* author */ (''),
 /* organization */ (''),
 /* preprocessor_version */ 'ST-DEVELOPER v20.2',
@@ -1802,7 +1802,7 @@ SOLID_ANGLE_UNIT()
 #1745=PRODUCT_DEFINITION_SHAPE('',$,#1748);
 #1746=SHAPE_REPRESENTATION('',(#1044),#1738);
 #1747=PRODUCT_DEFINITION_CONTEXT('part definition',#1752,'design');
-#1748=PRODUCT_DEFINITION('2026-10-27-04-43-49-914',
+#1748=PRODUCT_DEFINITION('2026-10-27-11-38-16-315',
 'Electronics Box Lid',#1749,#1747);
 #1749=PRODUCT_DEFINITION_FORMATION('',$,#1754);
 #1750=PRODUCT_RELATED_PRODUCT_CATEGORY('Electronics Box Lid',
@@ -1812,7 +1812,7 @@ SOLID_ANGLE_UNIT()
 #1752=APPLICATION_CONTEXT(
 'Core Data for Automotive Mechanical Design Process');
 #1753=PRODUCT_CONTEXT('part definition',#1752,'mechanical');
-#1754=PRODUCT('2026-10-27-04-43-49-914','Electronics Box Lid',$,(#1753));
+#1754=PRODUCT('2026-10-27-11-38-16-315','Electronics Box Lid',$,(#1753));
 #1755=PRESENTATION_STYLE_ASSIGNMENT((#1757));
 #1756=PRESENTATION_STYLE_ASSIGNMENT((#1758));
 #1757=SURFACE_STYLE_USAGE(.BOTH.,#1759);

@@ -1,5 +1,5 @@
 {
- "started": "2026-10-27T05:08:23",
+ "started": "2026-10-27T11:43:35",
  "freecad": "1.0.2",
  "components": {
   "AS5600 Module": {
@@ -15,7 +15,7 @@
    "solids": 8,
    "valid": true,
    "closed": true,
-   "seconds": 0.68,
+   "seconds": 0.83,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/electronics/AS5600 Module.FCStd"
   },
@@ -30,7 +30,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.09,
+   "seconds": 0.1,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/pink/AngleSensorMount Ribbed.FCStd"
   },
@@ -45,7 +45,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.16,
+   "seconds": 0.23,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/light_green/BarMountInsert.FCStd"
   },
@@ -62,7 +62,7 @@
    "solids": 13,
    "valid": true,
    "closed": true,
-   "seconds": 0.12,
+   "seconds": 0.15,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/bearing/Base BallSet.FCStd"
   },
@@ -79,7 +79,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 4.49,
+   "seconds": 2.46,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/bearing/Base InnerRing.FCStd"
   },
@@ -96,7 +96,7 @@
    "solids": 3,
    "valid": true,
    "closed": true,
-   "seconds": 6.33,
+   "seconds": 4.1,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/bearing/Base OuterRing.FCStd"
   },
@@ -111,7 +111,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.28,
+   "seconds": 0.3,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/red/BaseExtractor M10x0.75.FCStd"
   },
@@ -126,7 +126,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.23,
+   "seconds": 0.09,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/light_green/BaseFootPlug M75x2.FCStd"
   },
@@ -156,7 +156,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.24,
+   "seconds": 0.2,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/light_green/BasePlatformInsert Taper.FCStd"
   },
@@ -171,7 +171,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 3.46,
+   "seconds": 1.78,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/light_green/BasePulley GT2 112T.FCStd"
   },
@@ -201,7 +201,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.18,
+   "seconds": 0.2,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/pink/BaseSpindle.FCStd"
   },
@@ -218,7 +218,7 @@
    "solids": 13,
    "valid": true,
    "closed": true,
-   "seconds": 0.11,
+   "seconds": 0.12,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/bearing/Bearing BallSet.FCStd"
   },
@@ -235,7 +235,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 3.36,
+   "seconds": 2.02,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/bearing/Bearing InnerRing.FCStd"
   },
@@ -252,7 +252,7 @@
    "solids": 3,
    "valid": true,
    "closed": true,
-   "seconds": 6.57,
+   "seconds": 3.86,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/bearing/Bearing OuterRing.FCStd"
   },
@@ -267,7 +267,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.01,
+   "seconds": 0.0,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/red/BearingSpacer.FCStd"
   },
@@ -284,7 +284,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 1.11,
+   "seconds": 0.5,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/belt/Belt Base GT2 280.FCStd"
   },
@@ -301,7 +301,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 1.74,
+   "seconds": 0.68,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/belt/Belt Elevation.FCStd"
   },
@@ -316,7 +316,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.14,
+   "seconds": 0.2,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/dark_green/BottomHousin.FCStd"
   },
@@ -331,7 +331,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.25,
+   "seconds": 0.27,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/pink/BottomHousin(Mirror).FCStd"
   },
@@ -348,7 +348,7 @@
    "solids": 6,
    "valid": true,
    "closed": true,
-   "seconds": 8.55,
+   "seconds": 5.33,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/cable/Box Wiring (schematic).FCStd"
   },
@@ -364,7 +364,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 2.74,
+   "seconds": 1.21,
    "volume_ok": true,
    "board_part": true
   },
@@ -380,7 +380,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 2.43,
+   "seconds": 1.75,
    "volume_ok": true,
    "board_part": true
   },
@@ -396,7 +396,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.04,
+   "seconds": 0.06,
    "volume_ok": true,
    "board_part": true
   },
@@ -412,7 +412,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.04,
+   "seconds": 0.06,
    "volume_ok": true,
    "board_part": true
   },
@@ -428,7 +428,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.04,
+   "seconds": 0.06,
    "volume_ok": true,
    "board_part": true
   },
@@ -443,7 +443,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.29,
+   "seconds": 0.4,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/dark_green/Clamp Hinge Block.FCStd"
   },
@@ -458,7 +458,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.15,
+   "seconds": 0.14,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/red/ClampNut M32x1.FCStd"
   },
@@ -490,7 +490,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.2,
+   "seconds": 0.15,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/aluminium_rail/CrossRail.FCStd"
   },
@@ -505,7 +505,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.03,
+   "seconds": 0.02,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/dark_green/CrossRail foot cap.FCStd"
   },
@@ -536,7 +536,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.14,
+   "seconds": 0.05,
    "volume_ok": true,
    "board_part": true
   },
@@ -552,7 +552,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.16,
+   "seconds": 0.06,
    "volume_ok": true,
    "board_part": true
   },
@@ -568,7 +568,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.16,
+   "seconds": 0.08,
    "volume_ok": true,
    "board_part": true
   },
@@ -584,7 +584,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.23,
+   "seconds": 0.07,
    "volume_ok": true,
    "board_part": true
   },
@@ -600,7 +600,7 @@
    "solids": 52,
    "valid": true,
    "closed": true,
-   "seconds": 4.35,
+   "seconds": 1.93,
    "volume_ok": true,
    "board_part": true
   },
@@ -630,7 +630,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.08,
+   "seconds": 0.04,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/dark_green/Electronics Box Lid.FCStd"
   },
@@ -645,7 +645,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.12,
+   "seconds": 0.05,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/dark_green/Electronics Box Shell.FCStd"
   },
@@ -660,7 +660,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.5,
+   "seconds": 0.22,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/pink/ElevationShaft.FCStd"
   },
@@ -677,7 +677,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 1.73,
+   "seconds": 0.81,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/other/GT2 16T Pulley.FCStd"
   },
@@ -694,7 +694,7 @@
    "solids": 12,
    "valid": true,
    "closed": true,
-   "seconds": 2.0,
+   "seconds": 2.49,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/other/Galaxy S24 (dummy).FCStd"
   },
@@ -711,7 +711,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.04,
+   "seconds": 0.02,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/aluminium_rail/Gliding Orbit Arm.FCStd"
   },
@@ -728,7 +728,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.86,
+   "seconds": 0.39,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/heat_set_insert/Heat-set insert M5x7.FCStd"
   },
@@ -743,7 +743,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.06,
+   "seconds": 0.04,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/dark_green/HexPlug.FCStd"
   },
@@ -760,7 +760,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.06,
+   "seconds": 0.05,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/fastener/Hinge Bolt M5x45.FCStd"
   },
@@ -775,7 +775,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.27,
+   "seconds": 0.24,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/light_green/Hinge Female 20 Body.FCStd"
   },
@@ -790,7 +790,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.15,
+   "seconds": 0.07,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/red/Hinge Knob HandNutM5.FCStd"
   },
@@ -805,7 +805,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.27,
+   "seconds": 0.11,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/pink/Hinge Male 20 Body.FCStd"
   },
@@ -820,7 +820,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.02,
+   "seconds": 0.01,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/dark_green/Hinge Wedge.FCStd"
   },
@@ -837,7 +837,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.23,
+   "seconds": 0.06,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/fastener/ISO 4032 M5 nut.FCStd"
   },
@@ -871,7 +871,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.35,
+   "seconds": 0.1,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/fastener/ISO 4762 M3x8.FCStd"
   },
@@ -888,7 +888,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.48,
+   "seconds": 0.2,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/fastener/ISO 4762 M5x10.FCStd"
   },
@@ -922,7 +922,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.12,
+   "seconds": 0.13,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/fastener/ISO 4762 M5x16.FCStd"
   },
@@ -956,7 +956,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.13,
+   "seconds": 0.15,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/fastener/ISO 4762 M5x30.FCStd"
   },
@@ -973,7 +973,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.12,
+   "seconds": 0.13,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/fastener/ISO 4762 M5x35.FCStd"
   },
@@ -990,7 +990,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.14,
+   "seconds": 0.13,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/fastener/ISO 4762 M5x40.FCStd"
   },
@@ -1007,7 +1007,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.39,
+   "seconds": 0.14,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/fastener/ISO 4762 M5x70.FCStd"
   },
@@ -1024,7 +1024,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.47,
+   "seconds": 0.17,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/fastener/ISO 7093 M5 washer 15x1.2.FCStd"
   },
@@ -1040,7 +1040,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.46,
+   "seconds": 0.13,
    "volume_ok": true,
    "board_part": true
   },
@@ -1056,7 +1056,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.52,
+   "seconds": 0.13,
    "volume_ok": true,
    "board_part": true
   },
@@ -1072,7 +1072,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.61,
+   "seconds": 0.21,
    "volume_ok": true,
    "board_part": true
   },
@@ -1088,7 +1088,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.08,
+   "seconds": 0.06,
    "volume_ok": true,
    "board_part": true
   },
@@ -1103,7 +1103,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.1,
+   "seconds": 0.04,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/dark_green/Laser Clamp.FCStd"
   },
@@ -1118,7 +1118,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.01,
+   "seconds": 0.0,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/light_green/Laser Mount Ball.FCStd"
   },
@@ -1133,7 +1133,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.23,
+   "seconds": 0.09,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/light_green/Laser Mount Clip.FCStd"
   },
@@ -1148,7 +1148,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.1,
+   "seconds": 0.09,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/pink/Laser Mount Nut.FCStd"
   },
@@ -1165,7 +1165,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 1.34,
+   "seconds": 0.62,
    "volume_ok": false,
    "fcstd": "freecad/parts/purchased/cable/Laser cable_ along OrbitArm.FCStd"
   },
@@ -1182,7 +1182,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.83,
+   "seconds": 0.32,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/cable/Laser cable_ along gliding arm.FCStd"
   },
@@ -1199,7 +1199,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 1.4,
+   "seconds": 0.69,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/cable/Laser cable_ along profile to laser.FCStd"
   },
@@ -1216,7 +1216,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.53,
+   "seconds": 0.68,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/cable/Laser cable_ along swing arm.FCStd"
   },
@@ -1233,7 +1233,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.59,
+   "seconds": 0.28,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/cable/Laser cable_ on clamp hinge block.FCStd"
   },
@@ -1250,7 +1250,7 @@
    "solids": 6,
    "valid": true,
    "closed": true,
-   "seconds": 1.86,
+   "seconds": 0.49,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/electronics/Line Laser 12x30 (schematic).FCStd"
   },
@@ -1267,7 +1267,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.43,
+   "seconds": 0.15,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/aluminium_rail/MainRail.FCStd"
   },
@@ -1282,7 +1282,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.1,
+   "seconds": 0.04,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/red/MainRail tie cap.FCStd"
   },
@@ -1297,7 +1297,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.02,
+   "seconds": 0.01,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/dark_green/MainRail tie wedge.FCStd"
   },
@@ -1314,7 +1314,7 @@
    "solids": 5,
    "valid": true,
    "closed": true,
-   "seconds": 0.53,
+   "seconds": 0.5,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/motor/NEMA17 24mm.FCStd"
   },
@@ -1330,7 +1330,7 @@
    "solids": 3,
    "valid": true,
    "closed": true,
-   "seconds": 0.33,
+   "seconds": 0.02,
    "volume_ok": true,
    "board_part": true
   },
@@ -1346,7 +1346,7 @@
    "solids": 5,
    "valid": true,
    "closed": true,
-   "seconds": 0.5,
+   "seconds": 0.06,
    "volume_ok": true,
    "board_part": true
   },
@@ -1362,7 +1362,7 @@
    "solids": 3,
    "valid": true,
    "closed": true,
-   "seconds": 0.11,
+   "seconds": 0.01,
    "volume_ok": true,
    "board_part": true
   },
@@ -1378,7 +1378,7 @@
    "solids": 12,
    "valid": true,
    "closed": true,
-   "seconds": 0.15,
+   "seconds": 0.06,
    "volume_ok": true,
    "board_part": true
   },
@@ -1394,7 +1394,7 @@
    "solids": 45,
    "valid": true,
    "closed": true,
-   "seconds": 1.18,
+   "seconds": 0.33,
    "volume_ok": true,
    "board_part": true
   },
@@ -1411,7 +1411,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.2,
+   "seconds": 0.07,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/aluminium_rail/OrbitArm.FCStd"
   },
@@ -1426,7 +1426,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.06,
+   "seconds": 0.03,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/dark_green/OrbitArm Seal.FCStd"
   },
@@ -1442,9 +1442,24 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 5.88,
+   "seconds": 4.62,
    "volume_ok": true,
    "board_part": true
+  },
+  "Phone Clamp Knurled Head": {
+   "category": "printed",
+   "bodies": 1,
+   "volume_fusion_cm3": 2.7459,
+   "source": "step/printed/pink/Phone Clamp Knurled Head.step",
+   "colour": "pink",
+   "volume_freecad_cm3": 2.7459,
+   "faces": 96,
+   "solids": 1,
+   "valid": true,
+   "closed": true,
+   "seconds": 0.11,
+   "volume_ok": true,
+   "fcstd": "freecad/parts/printed/pink/Phone Clamp Knurled Head.FCStd"
   },
   "Phone Clamp Lower": {
    "category": "printed",
@@ -1457,9 +1472,54 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.35,
+   "seconds": 0.1,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/dark_green/Phone Clamp Lower.FCStd"
+  },
+  "Phone Clamp Screw Bottom": {
+   "category": "printed",
+   "bodies": 1,
+   "volume_fusion_cm3": 1.1119,
+   "source": "step/printed/pink/Phone Clamp Screw Bottom.step",
+   "colour": "pink",
+   "volume_freecad_cm3": 1.1119,
+   "faces": 89,
+   "solids": 1,
+   "valid": true,
+   "closed": true,
+   "seconds": 0.42,
+   "volume_ok": true,
+   "fcstd": "freecad/parts/printed/pink/Phone Clamp Screw Bottom.FCStd"
+  },
+  "Phone Clamp Screw Top": {
+   "category": "printed",
+   "bodies": 1,
+   "volume_fusion_cm3": 1.1144,
+   "source": "step/printed/pink/Phone Clamp Screw Top.step",
+   "colour": "pink",
+   "volume_freecad_cm3": 1.1141,
+   "faces": 89,
+   "solids": 1,
+   "valid": true,
+   "closed": true,
+   "seconds": 0.44,
+   "volume_ok": true,
+   "fcstd": "freecad/parts/printed/pink/Phone Clamp Screw Top.FCStd"
+  },
+  "Phone Clamp Upper": {
+   "category": "printed",
+   "bodies": 1,
+   "volume_fusion_cm3": 12.1781,
+   "source": "step/printed/dark_green/Phone Clamp Upper.step",
+   "colour": "dark_green",
+   "volume_freecad_cm3": 12.1781,
+   "faces": 191,
+   "solids": 1,
+   "valid": true,
+   "closed": true,
+   "seconds": 0.78,
+   "volume_ok": true,
+   "fcstd": "freecad/parts/printed/dark_green/Phone Clamp Upper.FCStd"
   },
   "PinHeader_1x02_P254mm_Vertical": {
    "category": "electronics",
@@ -1473,7 +1533,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.12,
+   "seconds": 0.04,
    "volume_ok": true,
    "board_part": true
   },
@@ -1489,7 +1549,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.31,
+   "seconds": 0.06,
    "volume_ok": true,
    "board_part": true
   },
@@ -1505,7 +1565,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.54,
+   "seconds": 0.16,
    "volume_ok": true,
    "board_part": true
   },
@@ -1521,7 +1581,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.42,
+   "seconds": 0.1,
    "volume_ok": true,
    "board_part": true
   },
@@ -1537,7 +1597,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.45,
+   "seconds": 0.17,
    "volume_ok": true,
    "board_part": true
   },
@@ -1553,7 +1613,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 1.07,
+   "seconds": 0.41,
    "volume_ok": true,
    "board_part": true
   },
@@ -1568,7 +1628,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.03,
+   "seconds": 0.01,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/pink/Piston Cap.FCStd"
   },
@@ -1600,7 +1660,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.06,
+   "seconds": 0.05,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/fastener/Pivot Bolt M5x25.FCStd"
   },
@@ -1615,7 +1675,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.04,
+   "seconds": 0.05,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/red/Pivot Knob.FCStd"
   },
@@ -1632,7 +1692,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.12,
+   "seconds": 0.06,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/fastener/Pivot Nut M5 thin.FCStd"
   },
@@ -1649,7 +1709,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.18,
+   "seconds": 0.01,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/aluminium_rail/Profile 16x13 U.FCStd"
   },
@@ -1665,7 +1725,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.24,
+   "seconds": 0.04,
    "volume_ok": true,
    "board_part": true
   },
@@ -1681,7 +1741,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.22,
+   "seconds": 0.04,
    "volume_ok": true,
    "board_part": true
   },
@@ -1696,7 +1756,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.04,
+   "seconds": 0.01,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/light_green/Rail cap wedge.FCStd"
   },
@@ -1711,7 +1771,7 @@
    "solids": 1,
    "valid": false,
    "closed": true,
-   "seconds": 3.15,
+   "seconds": 1.18,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/light_green/ReplacablePulley.FCStd"
   },
@@ -1743,7 +1803,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.35,
+   "seconds": 0.37,
    "volume_ok": true,
    "board_part": true
   },
@@ -1759,7 +1819,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.19,
+   "seconds": 0.22,
    "volume_ok": true,
    "board_part": true
   },
@@ -1775,7 +1835,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.07,
+   "seconds": 0.1,
    "volume_ok": true,
    "board_part": true
   },
@@ -1791,7 +1851,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.13,
+   "seconds": 0.17,
    "volume_ok": true,
    "board_part": true
   },
@@ -1806,7 +1866,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.05,
+   "seconds": 0.04,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/red/Seal Lock Knob.FCStd"
   },
@@ -1869,7 +1929,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.31,
+   "seconds": 0.14,
    "volume_ok": true,
    "board_part": true
   },
@@ -1886,7 +1946,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.08,
+   "seconds": 0.01,
    "volume_ok": true,
    "fcstd": "freecad/parts/purchased/aluminium_rail/VertivalBar.FCStd"
   },
@@ -1901,7 +1961,7 @@
    "solids": 1,
    "valid": true,
    "closed": true,
-   "seconds": 0.05,
+   "seconds": 0.01,
    "volume_ok": true,
    "fcstd": "freecad/parts/printed/red/VertivalBar top cap.FCStd"
   }
@@ -1909,9 +1969,8 @@
  "source": {
   "application": "Autodesk Fusion 2705.1.30",
   "document": "Orbiter",
-  "document_version": 247,
-  "timeline_items": 947,
-  "note": "built from the v246 export; v247 changed only the physical material of the gliding and swing arm tubes"
+  "document_version": 250,
+  "timeline_items": 951
  },
  "assembly": {
   "fcstd": "freecad/Orbiter_assembly.FCStd",
@@ -1921,7 +1980,7 @@
    "Swing arm": 13,
    "Frame and drives": 182,
    "Azimuth rotor": 12,
-   "Phone clamp and laser": 9,
+   "Phone clamp and laser": 13,
    "Clamp hinge block": 8
   },
   "size_mm": [
@@ -2036,6 +2095,6 @@
   "Laser cable: along OrbitArm",
   "ReplacablePulley"
  ],
- "seconds": 200.3,
+ "seconds": 129.5,
  "finished": true
 }

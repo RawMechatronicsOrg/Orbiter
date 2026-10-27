@@ -10,5 +10,9 @@ the Fusion model was built from these exports.
 | [`gliding_arm_export_stl.py`](gliding_arm_export_stl.py) | the printable gliding-arm parts as STL in their print orientation |
 | [`electronics_box.py`](electronics_box.py) | the electronics box, its lid and the U-shaped rail clamp, modelled in the machine's coordinates (Y up); it also writes print-oriented STL |
 
+The phone clamp's upper jaw, the two screw halves and the knurled head (since Fusion version 250) are the solids
+of the HandScanner clamp remodel, `phone_clamp.py` in the hardware lab (not in this repository: it is drawn from
+the downloaded Tripod Mobile Phone Clamp V2 and builds on its mesh). Their STL and STEP are in `../stl` and `../step`.
+
 `gliding_arm_export_stl.py` imports `gliding_arm.py` as `gliding_arm`: rename it back to `export_stl.py` or run it
 from this folder. The comments with dates record the changes asked for during the design.

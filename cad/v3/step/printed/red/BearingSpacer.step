@@ -10,7 +10,7 @@ FILE_DESCRIPTION(
 
 FILE_NAME(
 /* name */ 'BearingSpacer.step',
-/* time_stamp */ '2026-10-27T04:43:47+01:00',
+/* time_stamp */ '2026-10-27T11:38:14+01:00',
 /* author */ (''),
 /* organization */ (''),
 /* preprocessor_version */ 'ST-DEVELOPER v20.2',
@@ -182,7 +182,7 @@ SOLID_ANGLE_UNIT()
 #131=PRODUCT_DEFINITION_SHAPE('',$,#134);
 #132=SHAPE_REPRESENTATION('',(#78),#124);
 #133=PRODUCT_DEFINITION_CONTEXT('part definition',#138,'design');
-#134=PRODUCT_DEFINITION('2026-10-27-04-43-47-742','BearingSpacer',#135,
+#134=PRODUCT_DEFINITION('2026-10-27-11-38-14-044','BearingSpacer',#135,
 #133);
 #135=PRODUCT_DEFINITION_FORMATION('',$,#140);
 #136=PRODUCT_RELATED_PRODUCT_CATEGORY('BearingSpacer','BearingSpacer',(#140));
@@ -191,7 +191,7 @@ SOLID_ANGLE_UNIT()
 #138=APPLICATION_CONTEXT(
 'Core Data for Automotive Mechanical Design Process');
 #139=PRODUCT_CONTEXT('part definition',#138,'mechanical');
-#140=PRODUCT('2026-10-27-04-43-47-742','BearingSpacer',$,(#139));
+#140=PRODUCT('2026-10-27-11-38-14-044','BearingSpacer',$,(#139));
 #141=PRESENTATION_STYLE_ASSIGNMENT((#143));
 #142=PRESENTATION_STYLE_ASSIGNMENT((#144));
 #143=SURFACE_STYLE_USAGE(.BOTH.,#145);

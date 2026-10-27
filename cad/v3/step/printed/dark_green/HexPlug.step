@@ -13,7 +13,7 @@ x 6 mm deep plus the six-lobe floor. Made as blank minus shaft, so the
 
 FILE_NAME(
 /* name */ 'HexPlug.step',
-/* time_stamp */ '2026-10-27T04:43:50+01:00',
+/* time_stamp */ '2026-10-27T11:38:17+01:00',
 /* author */ (''),
 /* organization */ (''),
 /* preprocessor_version */ 'ST-DEVELOPER v20.2',
@@ -2149,7 +2149,7 @@ SOLID_ANGLE_UNIT()
 #2083=PRODUCT_DEFINITION_SHAPE('',$,#2086);
 #2084=SHAPE_REPRESENTATION('',(#1262),#2076);
 #2085=PRODUCT_DEFINITION_CONTEXT('part definition',#2090,'design');
-#2086=PRODUCT_DEFINITION('2026-10-27-04-43-50-746','HexPlug',#2087,#2085);
+#2086=PRODUCT_DEFINITION('2026-10-27-11-38-17-166','HexPlug',#2087,#2085);
 #2087=PRODUCT_DEFINITION_FORMATION('',$,#2092);
 #2088=PRODUCT_RELATED_PRODUCT_CATEGORY('HexPlug','HexPlug',(#2092));
 #2089=APPLICATION_PROTOCOL_DEFINITION('international standard',
@@ -2157,7 +2157,7 @@ SOLID_ANGLE_UNIT()
 #2090=APPLICATION_CONTEXT(
 'Core Data for Automotive Mechanical Design Process');
 #2091=PRODUCT_CONTEXT('part definition',#2090,'mechanical');
-#2092=PRODUCT('2026-10-27-04-43-50-746','HexPlug',
+#2092=PRODUCT('2026-10-27-11-38-17-166','HexPlug',
 'Zero-clearance plug for the hex socket in the shaft end: 16 mm A/F he
 x 6 mm deep plus the six-lobe floor. Made as blank minus shaft, so the
  form is the socket itself. Modelled in assembly coordinates.',(#2091));

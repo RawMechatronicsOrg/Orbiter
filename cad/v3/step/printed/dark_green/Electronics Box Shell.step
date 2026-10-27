@@ -10,7 +10,7 @@ FILE_DESCRIPTION(
 
 FILE_NAME(
 /* name */ 'Electronics Box Shell.step',
-/* time_stamp */ '2026-10-27T04:43:50+01:00',
+/* time_stamp */ '2026-10-27T11:38:16+01:00',
 /* author */ (''),
 /* organization */ (''),
 /* preprocessor_version */ 'ST-DEVELOPER v20.2',
@@ -2906,7 +2906,7 @@ SOLID_ANGLE_UNIT()
 #2839=PRODUCT_DEFINITION_SHAPE('',$,#2842);
 #2840=SHAPE_REPRESENTATION('',(#1650),#2832);
 #2841=PRODUCT_DEFINITION_CONTEXT('part definition',#2846,'design');
-#2842=PRODUCT_DEFINITION('2026-10-27-04-43-50-082',
+#2842=PRODUCT_DEFINITION('2026-10-27-11-38-16-449',
 'Electronics Box Shell',#2843,#2841);
 #2843=PRODUCT_DEFINITION_FORMATION('',$,#2848);
 #2844=PRODUCT_RELATED_PRODUCT_CATEGORY('Electronics Box Shell',
@@ -2916,7 +2916,7 @@ SOLID_ANGLE_UNIT()
 #2846=APPLICATION_CONTEXT(
 'Core Data for Automotive Mechanical Design Process');
 #2847=PRODUCT_CONTEXT('part definition',#2846,'mechanical');
-#2848=PRODUCT('2026-10-27-04-43-50-082','Electronics Box Shell',$,(#2847));
+#2848=PRODUCT('2026-10-27-11-38-16-449','Electronics Box Shell',$,(#2847));
 #2849=PRESENTATION_STYLE_ASSIGNMENT((#2851));
 #2850=PRESENTATION_STYLE_ASSIGNMENT((#2852));
 #2851=SURFACE_STYLE_USAGE(.BOTH.,#2853);

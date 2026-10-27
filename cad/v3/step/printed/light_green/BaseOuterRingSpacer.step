@@ -10,7 +10,7 @@ FILE_DESCRIPTION(
 
 FILE_NAME(
 /* name */ 'BaseOuterRingSpacer.step',
-/* time_stamp */ '2026-10-27T04:43:45+01:00',
+/* time_stamp */ '2026-10-27T11:38:11+01:00',
 /* author */ (''),
 /* organization */ (''),
 /* preprocessor_version */ 'ST-DEVELOPER v20.2',
@@ -383,7 +383,7 @@ SOLID_ANGLE_UNIT()
 #316=PRODUCT_DEFINITION_SHAPE('',$,#319);
 #317=SHAPE_REPRESENTATION('',(#184),#309);
 #318=PRODUCT_DEFINITION_CONTEXT('part definition',#323,'design');
-#319=PRODUCT_DEFINITION('2026-10-27-04-43-45-816','BaseOuterRingSpacer',
+#319=PRODUCT_DEFINITION('2026-10-27-11-38-11-896','BaseOuterRingSpacer',
 #320,#318);
 #320=PRODUCT_DEFINITION_FORMATION('',$,#325);
 #321=PRODUCT_RELATED_PRODUCT_CATEGORY('BaseOuterRingSpacer',
@@ -393,7 +393,7 @@ SOLID_ANGLE_UNIT()
 #323=APPLICATION_CONTEXT(
 'Core Data for Automotive Mechanical Design Process');
 #324=PRODUCT_CONTEXT('part definition',#323,'mechanical');
-#325=PRODUCT('2026-10-27-04-43-45-816','BaseOuterRingSpacer',$,(#324));
+#325=PRODUCT('2026-10-27-11-38-11-896','BaseOuterRingSpacer',$,(#324));
 #326=PRESENTATION_STYLE_ASSIGNMENT((#328));
 #327=PRESENTATION_STYLE_ASSIGNMENT((#329));
 #328=SURFACE_STYLE_USAGE(.BOTH.,#330);

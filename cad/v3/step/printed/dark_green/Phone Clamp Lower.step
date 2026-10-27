@@ -10,7 +10,7 @@ FILE_DESCRIPTION(
 
 FILE_NAME(
 /* name */ 'Phone Clamp Lower.step',
-/* time_stamp */ '2026-10-27T04:43:52+01:00',
+/* time_stamp */ '2026-10-27T11:38:19+01:00',
 /* author */ (''),
 /* organization */ (''),
 /* preprocessor_version */ 'ST-DEVELOPER v20.2',
@@ -4408,7 +4408,7 @@ SOLID_ANGLE_UNIT()
 #4155=PRODUCT_DEFINITION_SHAPE('',$,#4158);
 #4156=SHAPE_REPRESENTATION('',(#1945),#4148);
 #4157=PRODUCT_DEFINITION_CONTEXT('part definition',#4162,'design');
-#4158=PRODUCT_DEFINITION('2026-10-27-04-43-52-665','Phone Clamp Lower',
+#4158=PRODUCT_DEFINITION('2026-10-27-11-38-19-733','Phone Clamp Lower',
 #4159,#4157);
 #4159=PRODUCT_DEFINITION_FORMATION('',$,#4164);
 #4160=PRODUCT_RELATED_PRODUCT_CATEGORY('Phone Clamp Lower',
@@ -4418,7 +4418,7 @@ SOLID_ANGLE_UNIT()
 #4162=APPLICATION_CONTEXT(
 'Core Data for Automotive Mechanical Design Process');
 #4163=PRODUCT_CONTEXT('part definition',#4162,'mechanical');
-#4164=PRODUCT('2026-10-27-04-43-52-665','Phone Clamp Lower',$,(#4163));
+#4164=PRODUCT('2026-10-27-11-38-19-733','Phone Clamp Lower',$,(#4163));
 #4165=PRESENTATION_STYLE_ASSIGNMENT((#4167));
 #4166=PRESENTATION_STYLE_ASSIGNMENT((#4168));
 #4167=SURFACE_STYLE_USAGE(.BOTH.,#4169);

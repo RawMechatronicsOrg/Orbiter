@@ -10,7 +10,7 @@ FILE_DESCRIPTION(
 
 FILE_NAME(
 /* name */ 'BottomHousin(Mirror).step',
-/* time_stamp */ '2026-10-27T04:43:48+01:00',
+/* time_stamp */ '2026-10-27T11:38:15+01:00',
 /* author */ (''),
 /* organization */ (''),
 /* preprocessor_version */ 'ST-DEVELOPER v20.2',
@@ -9450,7 +9450,7 @@ SOLID_ANGLE_UNIT()
 #8502=PRODUCT_DEFINITION_SHAPE('',$,#8505);
 #8503=SHAPE_REPRESENTATION('',(#3255),#8495);
 #8504=PRODUCT_DEFINITION_CONTEXT('part definition',#8509,'design');
-#8505=PRODUCT_DEFINITION('2026-10-27-04-43-48-386',
+#8505=PRODUCT_DEFINITION('2026-10-27-11-38-14-726',
 'BottomHousin(Mirror)',#8506,#8504);
 #8506=PRODUCT_DEFINITION_FORMATION('',$,#8511);
 #8507=PRODUCT_RELATED_PRODUCT_CATEGORY('BottomHousin(Mirror)',
@@ -9460,7 +9460,7 @@ SOLID_ANGLE_UNIT()
 #8509=APPLICATION_CONTEXT(
 'Core Data for Automotive Mechanical Design Process');
 #8510=PRODUCT_CONTEXT('part definition',#8509,'mechanical');
-#8511=PRODUCT('2026-10-27-04-43-48-386','BottomHousin(Mirror)',$,(#8510));
+#8511=PRODUCT('2026-10-27-11-38-14-726','BottomHousin(Mirror)',$,(#8510));
 #8512=PRESENTATION_STYLE_ASSIGNMENT((#8514));
 #8513=PRESENTATION_STYLE_ASSIGNMENT((#8515));
 #8514=SURFACE_STYLE_USAGE(.BOTH.,#8516);

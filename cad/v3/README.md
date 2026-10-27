@@ -2,7 +2,7 @@
 
 The Orbiter mechanics of release v0.5 as open files: STL for the slicer, STEP for exact geometry, a FreeCAD assembly
 with working joints, the GLB the 3D viewers read, and renders. Everything here was exported from one Fusion
-document, `Orbiter` version 247 (2026-10-27).
+document, `Orbiter` version 250 (2026-10-27).
 
 ![v3, the camera side](images/hero.jpg)
 
@@ -41,7 +41,7 @@ document, `Orbiter` version 247 (2026-10-27).
 
 | Path | Contents |
 |---|---|
-| [`stl/printed/<colour>/`](stl/printed) | 43 printed parts, STL in mm, mesh tolerance 0.005 mm, ready for a slicer |
+| [`stl/printed/<colour>/`](stl/printed) | 47 printed parts, STL in mm, mesh tolerance 0.005 mm, ready for a slicer |
 | [`step/printed/<colour>/`](step/printed) | the same parts as STEP, exact B-rep geometry from Fusion |
 | [`stl/purchased/<category>/`](stl/purchased) | bought parts as STL: tubes, bearings, belts, motors, pulleys, fasteners, heat-set inserts, AS5600 modules, the laser, the phone dummy, cables |
 | [`freecad/Orbiter_assembly.FCStd`](freecad) | the whole machine as a FreeCAD 1.0 Assembly with joints (below) |
@@ -89,9 +89,9 @@ and the hinges through each other; the travel that is free of collisions is in t
 
 ## Printed parts
 
-57 pieces from 43 files, about 1.15 kg of PLA at 100 % infill (a real print is lighter).
+61 pieces from 47 files, about 1.17 kg of PLA at 100 % infill (a real print is lighter).
 2 of the files are tools, not machine parts. At the print profile the parts were sliced with (12 perimeters,
-so almost every part prints solid) the machine is about 77 hours of printing. **new** marks the parts that
+so almost every part prints solid) the machine is about 79 hours of printing. **new** marks the parts that
 v2 did not have, **changed** a part that v2 had in another shape; the others are the v2 parts.
 
 | Part | Colour | Qty | Thread | Mass each, g | Down | Role |
@@ -129,7 +129,11 @@ v2 did not have, **changed** a part that v2 had in another shape; the others are
 | [`MainRail tie cap`](stl/printed/red/MainRail%20tie%20cap.stl) **changed** | red | 1 |  | 14 | −Y | H-shaped cap tying the main rail to the cross rail at 90 degrees, walls along the cross rail |
 | [`MainRail tie wedge`](stl/printed/dark_green/MainRail%20tie%20wedge.stl) | dark_green | 1 |  | 1 | +Z | nut wedge inside the tie cap |
 | [`OrbitArm Seal`](stl/printed/dark_green/OrbitArm%20Seal.stl) **new** | dark_green | 1 |  | 8 | −Z | seal in the OrbitArm open end: sleeve in the bore, 20x20 bore for the gliding tube, collar with the M5 lock boss |
+| [`Phone Clamp Knurled Head`](stl/printed/pink/Phone%20Clamp%20Knurled%20Head.stl) **new** | pink | 1 |  | 3 | −Y | knurled head on the clamp screw, snapped into the lower jaw |
 | [`Phone Clamp Lower`](stl/printed/dark_green/Phone%20Clamp%20Lower.stl) **new** | dark_green | 1 |  | 31 | −Y | phone clamp jaw with the channel for the 16x13 profile |
+| [`Phone Clamp Screw Bottom`](stl/printed/pink/Phone%20Clamp%20Screw%20Bottom.stl) **new** | pink | 1 |  | 1 | +Z | lower half of the clamp screw (printed split at its axis, pinned to the upper half) |
+| [`Phone Clamp Screw Top`](stl/printed/pink/Phone%20Clamp%20Screw%20Top.stl) **new** | pink | 1 |  | 1 | −Z | upper half of the clamp screw |
+| [`Phone Clamp Upper`](stl/printed/dark_green/Phone%20Clamp%20Upper.stl) **new** | dark_green | 1 |  | 15 | −Z | phone clamp sliding jaw: dovetail bar in the lower jaw, nut thread on the clamp screw |
 | [`Piston Cap`](stl/printed/pink/Piston%20Cap.stl) **new** | pink | 1 |  | 5 | +Z | piston plug on the inner end of the gliding tube: lid sliding in the OrbitArm bore, expanding insert in the 20x20 tube |
 | [`Piston Wedge`](stl/printed/dark_green/Piston%20Wedge.stl) **new** | dark_green | 1 |  | 1 | +Z | wedge of the piston plug, pulled into a nut by an M5x16 |
 | [`Pivot Knob`](stl/printed/red/Pivot%20Knob.stl) **new** | red | 1 |  | 2 | +Y | knob on the phone clamp tilt pivot bolt |

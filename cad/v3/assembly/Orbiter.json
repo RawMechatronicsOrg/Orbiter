@@ -1,5 +1,5 @@
 {
-  "source": "Fusion Orbiter v247",
+  "source": "Fusion Orbiter v250",
   "frame": "metres, Y up (glTF); azimuth axis = Z axis of the Blender scene, machine on z = 0",
   "azimuth_axis_shift_mm": [
     78.375,
@@ -48,7 +48,11 @@
         "Camera Head:1 / Phone Clamp (HandScanner):1 / Hinge Knob HandNutM5:2",
         "Camera Head:1 / Phone Clamp (HandScanner):1 / Laser cable: along profile to laser:1",
         "Camera Head:1 / Phone Clamp (HandScanner):1 / Laser cable: on clamp hinge block:1",
+        "Camera Head:1 / Phone Clamp (HandScanner):1 / Phone Clamp Knurled Head:1",
         "Camera Head:1 / Phone Clamp (HandScanner):1 / Phone Clamp Lower:1",
+        "Camera Head:1 / Phone Clamp (HandScanner):1 / Phone Clamp Screw Bottom:1",
+        "Camera Head:1 / Phone Clamp (HandScanner):1 / Phone Clamp Screw Top:1",
+        "Camera Head:1 / Phone Clamp (HandScanner):1 / Phone Clamp Upper:1",
         "Camera Head:1 / Phone Clamp (HandScanner):1 / Pivot Bolt M5x25:1",
         "Camera Head:1 / Phone Clamp (HandScanner):1 / Pivot Knob:1",
         "Camera Head:1 / Phone Clamp (HandScanner):1 / Pivot Nut M5 thin:1",
@@ -108,9 +112,9 @@
       ]
     }
   },
-  "parts": 261,
-  "faces_before": 1220522,
-  "faces_after": 478976,
+  "parts": 265,
+  "faces_before": 1290602,
+  "faces_after": 501528,
   "bounds_mm": [
     [
       -126.147,
@@ -124,5 +128,5 @@
     ]
   ],
   "decimation_bounds_deviation_mm": 0.0085,
-  "bytes": 8405316
+  "bytes": 8902784
 }

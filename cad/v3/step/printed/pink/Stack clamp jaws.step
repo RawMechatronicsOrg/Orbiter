@@ -10,7 +10,7 @@ FILE_DESCRIPTION(
 
 FILE_NAME(
 /* name */ 'Stack clamp jaws.step',
-/* time_stamp */ '2026-10-27T04:43:55+01:00',
+/* time_stamp */ '2026-10-27T11:38:23+01:00',
 /* author */ (''),
 /* organization */ (''),
 /* preprocessor_version */ 'ST-DEVELOPER v20.2',
@@ -482,7 +482,7 @@ SOLID_ANGLE_UNIT()
 #430=PRODUCT_DEFINITION_SHAPE('',$,#433);
 #431=SHAPE_REPRESENTATION('',(#265),#423);
 #432=PRODUCT_DEFINITION_CONTEXT('part definition',#437,'design');
-#433=PRODUCT_DEFINITION('2026-10-27-04-43-55-056','Stack clamp jaws',#434,
+#433=PRODUCT_DEFINITION('2026-10-27-11-38-23-311','Stack clamp jaws',#434,
 #432);
 #434=PRODUCT_DEFINITION_FORMATION('',$,#439);
 #435=PRODUCT_RELATED_PRODUCT_CATEGORY('Stack clamp jaws',
@@ -492,7 +492,7 @@ SOLID_ANGLE_UNIT()
 #437=APPLICATION_CONTEXT(
 'Core Data for Automotive Mechanical Design Process');
 #438=PRODUCT_CONTEXT('part definition',#437,'mechanical');
-#439=PRODUCT('2026-10-27-04-43-55-056','Stack clamp jaws',$,(#438));
+#439=PRODUCT('2026-10-27-11-38-23-311','Stack clamp jaws',$,(#438));
 #440=PRESENTATION_STYLE_ASSIGNMENT((#442));
 #441=PRESENTATION_STYLE_ASSIGNMENT((#443));
 #442=SURFACE_STYLE_USAGE(.BOTH.,#444);
