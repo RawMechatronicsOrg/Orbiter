@@ -1,4 +1,4 @@
-# Orbiter v0.4
+# Orbiter v0.5
 
 A two-axis camera turntable for taking calibrated photo sets of small objects,
 controlled over Wi-Fi from a browser. Think of it as a **bench-top hemisphere
@@ -12,6 +12,36 @@ need, throw out the rest, adapt it to whatever you have on the shelf.
 This README is the consolidated single-page reference. Per-subsystem deep
 dives live in `docs/` and in each subsystem's own `README.md`; treat those as
 authoritative when you need depth.
+
+**New in v0.5** — the v3 mechanics, alpha
+
+- **`cad/v3/` — the third-generation mechanics** ([`cad/v3/README.md`](cad/v3/README.md)),
+  exported from the Fusion model, version 247. The v2 drives and frame stay, with
+  the cross rail now at 90° to the main rail (a T-shaped base on three feet).
+  New on the arm: a **gliding tube** that telescopes out of the orbit arm, a
+  160 mm **swing arm** on two hinges, and at its end the **camera head** — a
+  phone clamp with yaw and tilt, and a 12 × 30 line laser on a ball mount. A
+  printed **electronics box** for the control board hangs on the outer side of
+  the main rail, and the model carries schematic cables for the motors, the
+  encoders, the power input and the laser.
+- **A FreeCAD assembly with joints**: `cad/v3/freecad/Orbiter_assembly.FCStd`
+  opens in the Assembly workbench of FreeCAD 1.0 with the frame grounded,
+  revolute joints on both drive axes and on the three hinges, and a slider for
+  the gliding tube. Next to it: STL and STEP of the 43 printed parts, the bought
+  parts as STL, the GLB, photoreal renders, and a print direction for every
+  printed part.
+- **Status: alpha.** This is a more or less battle-ready release, the first one
+  that is a whole machine rather than parts of one, and alpha testing starts
+  with it. We will keep improving it, and the software and the electronics
+  will catch up:
+  - the **Factory F0.7 control board** in the box is a **draft** — not built,
+    not tested; do not order it from these files;
+  - the **software is unchanged since v0.4** (server, UI and workbench still
+    report 0.4.0) and models the v2 arm (`cad/v2/assembly/Orbiter.glb`);
+    following the v3 arm and the phone head is the next step;
+  - the cables in the model are schematic.
+
+![Orbiter v3](cad/v3/images/hero.jpg)
 
 **New in v0.4** — the v2 rig runs, end to end, on the bench
 
@@ -98,7 +128,7 @@ Orbiter is a **lab kit**, not a finished product. Expect rough edges; the pieces
 
 | Layer       | What it does                                                                                  |
 |-------------|-----------------------------------------------------------------------------------------------|
-| **CAD**     | v2 (current): STL, STEP, FreeCAD and the GLB the software reads, in `cad/v2/`. v1: the first rig's printed parts + assembly in `cad/` |
+| **CAD**     | v3 (current, alpha): STL, STEP, a FreeCAD assembly with joints, a GLB and renders, in `cad/v3/`. v2: the previous mechanics and the GLB the software reads, in `cad/v2/`. v1: the first rig's printed parts + assembly in `cad/` |
 | **Firmware**| ESP32 sketch that exposes the table as a **generic 2-axis IP actuator** with encoder feedback |
 | **Server**  | FastAPI service that owns scan-session state, drives the actuator, stores photos with poses   |
 | **UI**      | Browser app (Vite + React + react-three-fiber) — live 3D view + photo library on a hemisphere + the stereo rig settings |
@@ -123,7 +153,7 @@ The hardware is whatever was within arm's reach during prototyping: A4988 driver
 
 The minimum-viable path from "I have the parts" to "I have a session of photos":
 
-1. **Print the STLs** in `cad/v2/stl/printed/` ([§8](#8-printable-parts--print-profile)).
+1. **Print the STLs** in `cad/v3/stl/printed/` ([§8](#8-printable-parts--print-profile)). The software still models the v2 arm; the frame and the drives are the same in v2 and v3.
 2. **Wire up** the ESP32, drivers, motors, and encoders per [§6](#6-wiring--pin-map).
 3. **Flash the firmware** ([§10.1](#101-build--flash)), set Wi-Fi credentials and the board wiring via `idf.py menuconfig`, note the IP that appears in the boot log.
 4. **Calibrate the encoders** ([§10.3](#103-first-run-encoder-calibration)) — arm horizontal, platform facing forward, then `POST /calibrate {"axis":"el","mode":"current"}` and the same for AZ.
@@ -251,7 +281,7 @@ Photo bytes go to a global **immutable** `captures/` pool. Manifests reference t
 
 ### 5.2 Mechanical + fasteners
 
-The full list with quantities is [`cad/v2/parts.csv`](cad/v2/parts.csv).
+The full list with quantities is [`cad/v3/parts.csv`](cad/v3/parts.csv) (v3) and [`cad/v2/parts.csv`](cad/v2/parts.csv) (v2). The table below is the v2 rig, which is also the frame and the drives of v3; the v3 arm and box add the parts listed in [`cad/v3/README.md`](cad/v3/README.md#bought-parts).
 
 | Group                    | What                                              | Qty       | Notes                                                                  |
 |--------------------------|---------------------------------------------------|----------:|------------------------------------------------------------------------|
@@ -346,9 +376,9 @@ The firmware does not use these numbers — it closes the loop on the encoders �
 
 ## 8. Printable parts & print profile
 
-The v2 rig has 25 printed files, 32 pieces (three of them are tools), about 830 g of PLA at 100 % infill. The list with colour, quantity, thread, mass and role of each part is in [`cad/v2/README.md`](cad/v2/README.md#printed-parts); STL in `cad/v2/stl/printed/<colour>/`, STEP in `cad/v2/step/printed/<colour>/`, FreeCAD files in `cad/v2/freecad/`. There is no per-part print profile (orientation, infill, supports) for v2 yet.
+The v3 rig has 43 printed files, 57 pieces (three of them are tools), about 1.15 kg of PLA at 100 % infill. The list with colour, quantity, thread, mass and role of each part is in [`cad/v3/README.md`](cad/v3/README.md#printed-parts); STL in `cad/v3/stl/printed/<colour>/`, STEP in `cad/v3/step/printed/<colour>/`, FreeCAD files in `cad/v3/freecad/`. [`cad/v3/print_plan.json`](cad/v3/print_plan.json) has a print direction for every part, picked by slicing the candidates; infill and supports per part are not written down yet. The v2 rig (25 files, 32 pieces, about 830 g) is in [`cad/v2/`](cad/v2/README.md#printed-parts).
 
-The assembly the software reads is [`cad/v2/assembly/Orbiter.glb`](cad/v2/assembly), exported from the Fusion model's Blender scene by [`cad/v2/export_glb.py`](cad/v2/export_glb.py). For structural changes (arm length, pulley ratio) change the CAD and export the GLB again — the server takes the axes, the platform and the arm from it.
+The assembly the software reads is still the v2 one, [`cad/v2/assembly/Orbiter.glb`](cad/v2/assembly) (v3 has its own, [`cad/v3/assembly/Orbiter.glb`](cad/v3/assembly), for viewing until the software follows the v3 arm), exported from the Fusion model's Blender scene by [`cad/v2/export_glb.py`](cad/v2/export_glb.py). For structural changes (arm length, pulley ratio) change the CAD and export the GLB again — the server takes the axes, the platform and the arm from it.
 
 The first rig (printed frames, 608 bearings, 1:10 belts) stays in [`cad/`](cad/README.md) for reference.
 
@@ -356,7 +386,7 @@ The first rig (printed frames, 608 bearings, 1:10 belts) stays in [`cad/`](cad/R
 
 ## 9. Assembly
 
-There is no step-by-step guide for v2 yet. This is the order of operations; the CAD is the source of truth — open `cad/v2/assembly/Orbiter.glb` or `cad/v2/freecad/Orbiter_assembly.FCStd` to see how the pieces fit, and the section view in [`cad/v2/README.md`](cad/v2/README.md) for the drives.
+There is no step-by-step guide for v2 or v3 yet. This is the order of operations for the frame and the drives, the same in both; the CAD is the source of truth — open `cad/v3/freecad/Orbiter_assembly.FCStd` (with joints: drag the arm and it moves like the machine) or `cad/v3/assembly/Orbiter.glb` to see how the pieces fit, and the section view in [`cad/v2/README.md`](cad/v2/README.md) for the drives. The v3 arm, camera head and electronics box are described in [`cad/v3/README.md`](cad/v3/README.md).
 
 1. **Print everything.** Inspect for blobs / strings on the pulley teeth — they cost backlash if you don't clean them up.
 2. **Build the two drives**: two 6008 bearings per housing with the spacers between the rings, the spindle / shaft through them, clamped by the M32×1 nut (the printed AF32 wrench turns it). The output pulley goes on the splines.
@@ -877,7 +907,8 @@ Orbiter/
 ├── docs/                   ← per-subsystem deep dives + license
 │   └── LICENSE             ← CC-BY-4.0 (docs)
 ├── cad/                    ← CAD: the v1 rig (assembly + per-part STLs + screenshots)
-│   ├── v2/                 ← the current mechanics (STL, STEP, FreeCAD, assembly GLB)
+│   ├── v3/                 ← the current mechanics, alpha (STL, STEP, FreeCAD with joints, GLB, renders)
+│   ├── v2/                 ← the previous mechanics and the GLB the software reads
 │   └── LICENSE             ← CERN-OHL-S-2.0 (hardware)
 ├── firmware/               ← ESP-IDF project — the 2-axis IP actuator
 ├── server/                 ← FastAPI — scene state + ESP proxy + storage
@@ -894,7 +925,7 @@ Orbiter/
 | `server/`            | FastAPI app, `ModelState`, scene-graph builder, scan orchestration, COLMAP-priors exporter. |
 | `ui/`                | Single-page React app over the scene-graph WebSocket.                                  |
 | `native/`            | Desktop CV workbench for the binocular pair: `orbiter-native`, `orbiter-rigcheck`, `orbiter-recon`; docs in `native/docs/`. |
-| `cad/`               | `cad/v2/`: the current mechanics as STL, STEP, FreeCAD and the assembly GLB the server and viewer read. The rest: the v1 rig (`.glb`/`.fbx`/`.obj` assembly, per-part `.stl`, previews). |
+| `cad/`               | `cad/v3/`: the current mechanics (alpha) as STL, STEP, a FreeCAD assembly with joints, a GLB and renders. `cad/v2/`: the previous mechanics and the assembly GLB the server and viewer read. The rest: the v1 rig (`.glb`/`.fbx`/`.obj` assembly, per-part `.stl`, previews). |
 | `docker/`            | `docker-compose.yml` with three services and a `colmap` profile.                       |
 | `colmap/`            | Thin container over `colmap/colmap:latest` + an SfM-priors → COLMAP-text converter.    |
 | `docs/`              | Per-subsystem deep dives (architecture, hardware, firmware, API, assembly, COLMAP).    |

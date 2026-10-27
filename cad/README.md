@@ -3,9 +3,12 @@
 3D model files for the Orbiter turntable.
 
 This folder holds the **v1 rig**, the first generation, for reference.
-The current mechanics (aluminium tube frame, taper inserts, AS5600 on both
-axes) are in [`v2/`](v2/README.md): STL, STEP, FreeCAD and the assembly GLB
-(`v2/assembly/Orbiter.glb`) that the server and the 3D viewer read.
+The current mechanics are in [`v3/`](v3/README.md) (alpha): the v2 frame
+and drives with a telescoping arm, a swing arm, a phone and laser head and an
+electronics box, as STL, STEP, a FreeCAD assembly with joints, a GLB and
+renders. The second generation (aluminium tube frame, taper inserts, AS5600
+on both axes) is in [`v2/`](v2/README.md), with the assembly GLB
+(`v2/assembly/Orbiter.glb`) that the server and the 3D viewer still read.
 
 ## Files
 

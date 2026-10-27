@@ -1,0 +1,128 @@
+{
+  "source": "Fusion Orbiter v247",
+  "frame": "metres, Y up (glTF); azimuth axis = Z axis of the Blender scene, machine on z = 0",
+  "azimuth_axis_shift_mm": [
+    78.375,
+    164.109,
+    0.0
+  ],
+  "rotors": {
+    "ORB_ROTOR_base": {
+      "origin_mm": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": "Z",
+      "parts": [
+        "BottomBody:1 / BasePlatformInsert Taper:1",
+        "BottomBody:1 / BasePulley GT2 112T:1",
+        "BottomBody:1 / BaseSpindle:1",
+        "BottomBody:1 / Bearing 6008-2Z Base:1 / Base InnerRing:1",
+        "BottomBody:1 / Bearing 6008-2Z Base:2 / Base InnerRing:1",
+        "BottomBody:1 / BearingSpacer:2",
+        "BottomBody:1 / ClampNut M32x1:2",
+        "BottomBody:1 / Heat-set insert M5x7:8",
+        "BottomBody:1 / HexPlug:2",
+        "BottomBody:1 / ISO 4762 M5x25:1",
+        "BottomBody:1 / ISO 7093 M5 washer 15x1.2:5"
+      ]
+    },
+    "ORB_ROTOR_elevation": {
+      "origin_mm": [
+        230.538,
+        0.0,
+        127.178
+      ],
+      "axis": "X",
+      "parts": [
+        "Camera Head:1 / Laser Ball Mount (HandScanner):1 / Laser Clamp:1",
+        "Camera Head:1 / Laser Ball Mount (HandScanner):1 / Laser Mount Ball:1",
+        "Camera Head:1 / Laser Ball Mount (HandScanner):1 / Laser Mount Clip:1",
+        "Camera Head:1 / Laser Ball Mount (HandScanner):1 / Laser Mount Nut:1",
+        "Camera Head:1 / Laser Ball Mount (HandScanner):1 / Line Laser 12x30 (schematic):1",
+        "Camera Head:1 / Phone Clamp (HandScanner):1 / Clamp Hinge Block:1",
+        "Camera Head:1 / Phone Clamp (HandScanner):1 / Galaxy S24 (dummy):1",
+        "Camera Head:1 / Phone Clamp (HandScanner):1 / Heat-set insert M5x7:11",
+        "Camera Head:1 / Phone Clamp (HandScanner):1 / Hinge Bolt M5x45:2",
+        "Camera Head:1 / Phone Clamp (HandScanner):1 / Hinge Knob HandNutM5:2",
+        "Camera Head:1 / Phone Clamp (HandScanner):1 / Laser cable: along profile to laser:1",
+        "Camera Head:1 / Phone Clamp (HandScanner):1 / Laser cable: on clamp hinge block:1",
+        "Camera Head:1 / Phone Clamp (HandScanner):1 / Phone Clamp Lower:1",
+        "Camera Head:1 / Phone Clamp (HandScanner):1 / Pivot Bolt M5x25:1",
+        "Camera Head:1 / Phone Clamp (HandScanner):1 / Pivot Knob:1",
+        "Camera Head:1 / Phone Clamp (HandScanner):1 / Pivot Nut M5 thin:1",
+        "Camera Head:1 / Phone Clamp (HandScanner):1 / Profile 16x13 U:1",
+        "ElevationDrive:1 / BarMountInsert:1",
+        "ElevationDrive:1 / Bearing 6008-2Z:1 / Bearing InnerRing:1",
+        "ElevationDrive:1 / Bearing 6008-2Z:2 / Bearing InnerRing:1",
+        "ElevationDrive:1 / BearingSpacer:1",
+        "ElevationDrive:1 / ClampNut M32x1:1",
+        "ElevationDrive:1 / ElevationShaft:1",
+        "ElevationDrive:1 / Heat-set insert M5x7:7",
+        "ElevationDrive:1 / HexPlug:1",
+        "ElevationDrive:1 / ISO 4032 M5 nut:2",
+        "ElevationDrive:1 / ISO 4032 M5 nut:3",
+        "ElevationDrive:1 / ISO 4762 M5x30:1",
+        "ElevationDrive:1 / ISO 4762 M5x40:2",
+        "ElevationDrive:1 / ISO 4762 M5x40:3",
+        "ElevationDrive:1 / ISO 7093 M5 washer 15x1.2:1",
+        "ElevationDrive:1 / ISO 7093 M5 washer 15x1.2:2",
+        "ElevationDrive:1 / ISO 7093 M5 washer 15x1.2:3",
+        "ElevationDrive:1 / ISO 7093 M5 washer 15x1.2:4",
+        "ElevationDrive:1 / ISO 7093 M5 washer 15x1.2:6",
+        "ElevationDrive:1 / ReplacablePulley:1",
+        "OrbitArm:1",
+        "OrbitArm:1 / Gliding Orbit Arm:1",
+        "OrbitArm:1 / Gliding Orbit Arm:1 / Heat-set insert M5x7:10",
+        "OrbitArm:1 / Gliding Orbit Arm:1 / Hinge Bolt M5x45:1",
+        "OrbitArm:1 / Gliding Orbit Arm:1 / Hinge Knob HandNutM5:1",
+        "OrbitArm:1 / Gliding Orbit Arm:1 / Hinge Male 20:1 / Hinge Male 20 Body:1",
+        "OrbitArm:1 / Gliding Orbit Arm:1 / Hinge Male 20:1 / Hinge Wedge:1",
+        "OrbitArm:1 / Gliding Orbit Arm:1 / Hinge Male 20:1 / ISO 4032 M5 nut:13",
+        "OrbitArm:1 / Gliding Orbit Arm:1 / Hinge Male 20:1 / ISO 4762 M5x16:6",
+        "OrbitArm:1 / Gliding Orbit Arm:1 / Laser cable: along gliding arm:1",
+        "OrbitArm:1 / Gliding Orbit Arm:1 / Piston Plug:1 / ISO 4032 M5 nut:10",
+        "OrbitArm:1 / Gliding Orbit Arm:1 / Piston Plug:1 / ISO 4762 M5x16:5",
+        "OrbitArm:1 / Gliding Orbit Arm:1 / Piston Plug:1 / Piston Cap:1",
+        "OrbitArm:1 / Gliding Orbit Arm:1 / Piston Plug:1 / Piston Wedge:1",
+        "OrbitArm:1 / Gliding Orbit Arm:1 / Swing Arm:1 / Hinge Female 20:1 / Hinge Female 20 Body:1",
+        "OrbitArm:1 / Gliding Orbit Arm:1 / Swing Arm:1 / Hinge Female 20:1 / Hinge Wedge:2",
+        "OrbitArm:1 / Gliding Orbit Arm:1 / Swing Arm:1 / Hinge Female 20:1 / ISO 4032 M5 nut:14",
+        "OrbitArm:1 / Gliding Orbit Arm:1 / Swing Arm:1 / Hinge Female 20:1 / ISO 4762 M5x16:7",
+        "OrbitArm:1 / Gliding Orbit Arm:1 / Swing Arm:1 / Hinge Male 20:3 / Hinge Male 20 Body:1",
+        "OrbitArm:1 / Gliding Orbit Arm:1 / Swing Arm:1 / Hinge Male 20:3 / Hinge Wedge:1",
+        "OrbitArm:1 / Gliding Orbit Arm:1 / Swing Arm:1 / Hinge Male 20:3 / ISO 4032 M5 nut:13",
+        "OrbitArm:1 / Gliding Orbit Arm:1 / Swing Arm:1 / Hinge Male 20:3 / ISO 4762 M5x16:6",
+        "OrbitArm:1 / Gliding Orbit Arm:1 / Swing Arm:1 / Laser cable: along swing arm:1",
+        "OrbitArm:1 / Gliding Orbit Arm:1 / Swing Arm:1 / Swing Arm Tube:1",
+        "OrbitArm:1 / Heat-set insert M5x7:14",
+        "OrbitArm:1 / ISO 4762 M5x12:2",
+        "OrbitArm:1 / Laser cable: along OrbitArm:1",
+        "OrbitArm:1 / OrbitArm Axis Plug:1 / ISO 4032 M5 nut:9",
+        "OrbitArm:1 / OrbitArm Axis Plug:1 / ISO 4762 M5x16:4",
+        "OrbitArm:1 / OrbitArm Axis Plug:1 / Rail cap wedge:4",
+        "OrbitArm:1 / OrbitArm Axis Plug:1 / VertivalBar top cap:2",
+        "OrbitArm:1 / OrbitArm Seal:1",
+        "OrbitArm:1 / Seal Lock Knob:1"
+      ]
+    }
+  },
+  "parts": 261,
+  "faces_before": 1220522,
+  "faces_after": 478976,
+  "bounds_mm": [
+    [
+      -126.147,
+      -60.007,
+      -0.0
+    ],
+    [
+      282.899,
+      388.215,
+      260.642
+    ]
+  ],
+  "decimation_bounds_deviation_mm": 0.0085,
+  "bytes": 8405316
+}
